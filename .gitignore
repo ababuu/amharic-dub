@@ -31,6 +31,8 @@ htmlcov/
 # ---------------------------------------------------------------------------
 data/input/*
 !data/input/.gitkeep
+# Test videos are inputs the GPU runner needs, not generated artifacts.
+!data/input/*.mp4
 
 data/working/*
 !data/working/.gitkeep
@@ -55,13 +57,14 @@ torch_cache/
 # ---------------------------------------------------------------------------
 # Media and audio artifacts
 # ---------------------------------------------------------------------------
+# Generated audio and video never belong in git. MP4 inputs do: a small test clip
+# is what scripts/test_gpu.py runs, so `data/input/*.mp4` re-includes it below.
 *.wav
 *.mp3
 *.flac
 *.m4a
 *.aac
 *.ogg
-*.mp4
 *.mkv
 *.mov
 *.webm
