@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------------------
+# Amharic movie dubbing pipeline
+#
+# Target runtime: a RunPod A40 pod built from the official RunPod PyTorch image
+# (Python 3.12, PyTorch 2.8, CUDA 12.8, torchaudio 2.8, FFmpeg).
+#
+# requirements.txt mirrors [project.dependencies] below and is what is actually
+# installed on the worker:  pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+
+[project]
+name = "amharic-dub"
+version = "0.1.0"
+description = "Open-source Amharic movie dubbing pipeline"
+readme = "README.md"
+# Matches the Python 3.12 interpreter of the RunPod PyTorch image; the
+# PyTorch 2.8 / CUDA 12.8 wheels used below are unavailable on 3.13+.
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  # --- Deep learning runtime -------------------------------------------------
+  # Already provided by the RunPod PyTorch image; pinned so the ABI matches the
+  # packages listed below.
+  "torch==2.8.0",
+  "torchaudio==2.8.0",
+
+  # --- Pipeline models -------------------------------------------------------
+  # BandIt v2 Multi - cinematic audio source separation.
+  # Not published on PyPI; requirements.txt installs it from GitHub.
+  "bandit-infer",
+  # pyannote Community-1 - speaker diarization.
+  "pyannote.audio==4.0.7",
+  # faster-whisper large-v3 - transcription (CTranslate2 backend).
+  "faster-whisper",
+  # Chatterbox Multilingual v3 - speech synthesis. The Amharic adapter
+  # (gabar-tech/chatterbox-amharic) is applied on top and pins this revision of
+  # the package, which is the one it was verified against.
+  "chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox@5de7a54aa4e5e2baadb0182dde554908b48b85c2",
+  # The Amharic adapter is a LoRA delta, so PEFT loads it and safetensors holds
+  # its weights; huggingface_hub fetches the loader the adapter publishes.
+  "peft",
+  "safetensors",
+  "huggingface_hub",
+  # Seed-VC V2 - voice conversion (accent/emotion preserved, timbre replaced).
+  # Seed-VC is not a package: clone it and point SEED_VC_REPO_PATH at it. Only
+  # the libraries its V2 wrapper is instantiated with are listed here; the
+  # checkout's own requirements are not installed, because they pin an older
+  # PyTorch than this project uses.
+  "hydra-core",
+  "pyyaml",
+
+  # --- Dialogue adaptation / translation client -----------------------------
+  "openai",
+
+  # --- Audio I/O and numerics ----------------------------------------------
+  "soundfile",
+  "numpy",
+
+  # --- Configuration --------------------------------------------------------
+  "python-dotenv",
+
+  # --- Transitive pins needed for a working install -------------------------
+  # TorchCodec 0.7.x is the release line built against torch 2.8 (0.8+ targets
+  # torch 2.9). pyannote.audio only requires torchcodec>=0.7.0, so cap the upper
+  # bound to keep the ABI matched to torch 2.8.
+  "torchcodec>=0.7,<0.8",
+  # PyAV 19 removed the metadata_errors keyword that faster-whisper still passes
+  # to av.open(..., metadata_errors="ignore"), which raises at runtime. Hold
+  # PyAV on the 18.x line.
+  "av>=18.0,<19.0",
+]
+
+[dependency-groups]
+# Development / testing only.
+dev = [
+  "pytest>=8.0",
+]

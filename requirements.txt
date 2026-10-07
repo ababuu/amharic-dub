@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# Amharic dubbing pipeline - runtime dependencies
+#
+#     pip install -r requirements.txt
+#
+# Mirrors [project.dependencies] in pyproject.toml.
+#
+# The RunPod PyTorch worker image already provides Python 3.12, PyTorch 2.8,
+# torchaudio 2.8, CUDA 12.8 and FFmpeg. The two torch entries below are kept so
+# the ABI matches the packages underneath and are normally already satisfied.
+#
+# Model weights (BandIt, pyannote, faster-whisper, Chatterbox, Seed-VC) are
+# downloaded at runtime into MODEL_CACHE_DIR; they are never listed here.
+# ---------------------------------------------------------------------------
+
+# --- Deep learning runtime -------------------------------------------------
+torch==2.8.0
+torchaudio==2.8.0
+
+# --- Pipeline models -------------------------------------------------------
+# BandIt v2 Multi - cinematic audio source separation (not published on PyPI).
+bandit-infer @ git+https://github.com/openmirlab/bandit-infer@main
+# pyannote Community-1 - speaker diarization.
+pyannote.audio==4.0.7
+# faster-whisper large-v3 - transcription (CTranslate2 backend).
+faster-whisper
+# Chatterbox Multilingual v3 - speech synthesis. The gabar-tech Amharic adapter
+# is applied on top and pins this revision of the package.
+chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox@5de7a54aa4e5e2baadb0182dde554908b48b85c2
+# The Amharic adapter is a LoRA delta (peft) shipped as safetensors; the loader
+# that applies it is fetched from the Hub.
+peft
+safetensors
+huggingface_hub
+
+# Seed-VC V2 - voice conversion (replace timbre, keep accent and emotion).
+# Seed-VC is not a package: clone it and point SEED_VC_REPO_PATH at the checkout:
+#   git clone https://github.com/Plachtaa/seed-vc <SEED_VC_REPO_PATH>
+# Only the libraries its V2 wrapper is instantiated with are listed below; the
+# checkout's own requirements are not installed because they pin an older
+# PyTorch than this project uses.
+hydra-core
+pyyaml
+
+# --- Dialogue adaptation / translation client ------------------------------
+openai
+
+# --- Audio I/O and numerics ------------------------------------------------
+soundfile
+numpy
+
+# --- Configuration ---------------------------------------------------------
+python-dotenv
+
+# --- Transitive pins needed for a working install --------------------------
+# TorchCodec 0.7.x is the release line built against torch 2.8.
+torchcodec>=0.7,<0.8
+# PyAV 19 removed the metadata_errors keyword that faster-whisper still passes.
+av>=18.0,<19.0
+
+# --- Development / testing (not needed to run the pipeline) ----------------
+pytest>=8.0
