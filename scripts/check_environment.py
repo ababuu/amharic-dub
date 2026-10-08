@@ -17,6 +17,8 @@ GPU session is started:
   the placeholder copied from ``.env.example``
 * the Seed-VC checkout and the ``configs/v2/vc_wrapper.yaml`` the TTS stage runs
 * every third-party module the stages import at run time
+* every stage module of this project, so a broken import in the checkout is caught
+  here rather than halfway through a paid run
 
 The script never calls an external API and never downloads a model, so it is safe
 to run before anything is configured. Exit code is ``0`` when no blocking problem
@@ -74,6 +76,30 @@ RUNTIME_MODULES: dict[str, str] = {
     "huggingface_hub": "model downloads",
     "chatterbox": "speech synthesis",
 }
+
+#: The project's own modules, imported as well. The third-party list above cannot
+#: catch a broken import *inside* the project, so a typo or a bad import in a stage
+#: would otherwise surface on the GPU worker in the middle of a paid run rather than
+#: here. The stage modules guard their heavy dependencies, so this list imports
+#: cleanly even on a machine where torch is not installed.
+PROJECT_MODULES: tuple[str, ...] = (
+    "app.config",
+    "app.pipeline.amharic_text",
+    "app.pipeline.dialogue_context",
+    "app.pipeline.diarization",
+    "app.pipeline.evaluation",
+    "app.pipeline.mixing",
+    "app.pipeline.orchestrator",
+    "app.pipeline.prosody",
+    "app.pipeline.qc",
+    "app.pipeline.separation",
+    "app.pipeline.timing",
+    "app.pipeline.transcription",
+    "app.pipeline.translation",
+    "app.pipeline.tts",
+    "app.pipeline.video",
+    "app.pipeline.voice_profiles",
+)
 
 #: The Seed-VC file the TTS stage instantiates its converter from.
 SEED_VC_CONFIG = Path("configs") / "v2" / "vc_wrapper.yaml"
@@ -290,6 +316,16 @@ def check_runtime_imports() -> bool:
         except Exception as exc:  # noqa: BLE001 - report every failure, never stop
             failures.append((name, needed_by, f"{type(exc).__name__}: {exc}"))
 
+    project_failures: list[tuple[str, str]] = []
+    for name in PROJECT_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001 - report every failure, never stop
+            project_failures.append((name, f"{type(exc).__name__}: {exc}"))
+
+    for name, error in project_failures:
+        print(f"  FAIL  {name:<16} (project): {error}")
+
     if failures:
         for name, needed_by, error in failures:
             print(f"  FAIL  {name:<16} ({needed_by}): {error}")
@@ -298,10 +334,19 @@ def check_runtime_imports() -> bool:
             "[FAIL]"
         )
         print("        - run: bash scripts/install_dependencies.sh")
-        return False
+    else:
+        print(f"Runtime imports: all {len(RUNTIME_MODULES)} available  [OK]")
 
-    print(f"Runtime imports: all {len(RUNTIME_MODULES)} available  [OK]")
-    return True
+    if project_failures:
+        print(
+            f"Project modules: {len(project_failures)} of {len(PROJECT_MODULES)} "
+            "failed  [FAIL]"
+        )
+        print("        - this is a bug in the checkout, not a missing package")
+    else:
+        print(f"Project modules: all {len(PROJECT_MODULES)} import cleanly  [OK]")
+
+    return not failures and not project_failures
 
 
 def main(argv: list[str] | None = None) -> int:
