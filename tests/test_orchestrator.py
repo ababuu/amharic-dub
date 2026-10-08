@@ -530,6 +530,51 @@ def test_an_absent_bible_is_empty_rather_than_fatal(
     assert result.dialogue
 
 
+def test_nllb_adaptation_says_what_it_cannot_do(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """A translation backend has no use for the context, so the run says so.
+
+    NLLB cannot be handed a scene, a character or a request to shorten a line. The
+    orchestrator still derives the bible and passes it, because the call is the same
+    either way, so the report has to be explicit rather than implying work happened.
+    """
+
+    from app.pipeline.dialogue_context import Character, CharacterBible
+
+    settings = _settings(tmp_path, translation_backend="nllb")
+    CharacterBible(
+        {SPEAKER: Character(speaker_id=SPEAKER, name="Selam", register="informal")}
+    ).save(settings.dialogue_bible_path)
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+
+    reported = " ".join(messages)
+    assert "NLLB translates line by line" in reported
+    assert "dialogue bible" not in reported
+
+
+def test_the_bible_is_reported_as_applied_only_when_it_is(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """The instruction-following backend is the one that reads the bible."""
+
+    from app.pipeline.dialogue_context import Character, CharacterBible
+
+    settings = _settings(tmp_path, translation_backend="openai")
+    CharacterBible(
+        {SPEAKER: Character(speaker_id=SPEAKER, name="Selam", register="informal")}
+    ).save(settings.dialogue_bible_path)
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+
+    reported = " ".join(messages)
+    assert "dialogue bible: 1 character(s) applied" in reported
+    assert "NLLB translates line by line" not in reported
+
+
 def test_a_line_that_cannot_be_voiced_is_recorded_in_the_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -659,10 +659,17 @@ class Settings:
         return bool(self.huggingface_token)
 
     def missing_credentials(self) -> list[str]:
-        """Return the names of the credentials that are not configured yet."""
+        """Return the names of the credentials the *configured* run still needs.
+
+        The Hugging Face token is always needed, because the diarization pipeline it
+        authenticates is gated. The DeepSeek key belongs to the instruction-following
+        translation backend alone: under ``TRANSLATION_BACKEND=nllb`` the run never
+        reads it, so reporting it as missing would hold up a session that is ready to
+        go.
+        """
 
         missing: list[str] = []
-        if not self.deepseek_api_key:
+        if self.translation_backend == "openai" and not self.deepseek_api_key:
             missing.append("DEEPSEEK_API_KEY")
         if not self.huggingface_token:
             missing.append("HUGGINGFACE_TOKEN")

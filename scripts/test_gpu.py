@@ -13,26 +13,27 @@ stage actually produced, so the pipeline can be validated on the A40::
         -> transcription.transcribe           (spoken lines)
         -> translation.adapt_dialogue         (Amharic + performance metadata)
         -> voice_profiles.build_voice_profiles (per-speaker reference)
-        -> tts.synthesize_dialogue            (Chatterbox -> Seed-VC V2 clips)
+        -> tts.synthesize_dialogue            (Amharic speech clips)
 
-Output goes to ``data/output/tts-test/``: ``chatterbox/`` holds the intermediate
-Amharic takes, ``converted/`` the Seed-VC output, ``clips/`` the final clips to
-listen to (Seed-VC audio with the line's pauses), plus ``performance/`` (the
-original-performance references cut from the speech stem) and ``stages/`` (the
-extracted mix and the separated stems).
+Output goes to ``data/output/tts-test/``: ``takes/`` holds the raw engine output
+per line, ``clips/`` the final clips to listen to (the take with the line's
+pauses), plus ``performance/`` (the original-performance references cut from the
+speech stem) and ``stages/`` (the extracted mix and the separated stems).
 
 Notes
 -----
 * This is a runner, not a stage and not a test: it only calls the existing stage
   functions in their existing order, passing each stage's own outputs to the next
   one. No text, speaker id, timing or performance value is hard-coded here.
+* Which models the translation and synthesis stages use is the configuration's
+  decision, not this runner's: ``TRANSLATION_BACKEND`` picks the translator and
+  ``TTS_ENGINE`` the synthesis engine, and both are reported before the run. The
+  runner follows the same branch the orchestrator does, so a single-voice engine
+  skips the voice-profile stage entirely rather than building references nothing
+  reads.
 * The audio track is extracted by ``app.pipeline.video.extract_audio``, at the
   48 kHz that BandIt v2 Multi requires, so the runner and the orchestrator share
   one extractor instead of each keeping its own copy.
-* Voice identity comes from ``voice_profiles.VoiceProfile`` alone: the reference
-  is selected from the speaker's own dialogue in the separated speech stem, and
-  the TTS stage uses it as the Seed-VC target while the original actor audio of
-  each line is the Chatterbox performance prompt.
 * The run stops after speech synthesis **by design**: this runner reports what
   each GPU stage produced, and the stages after it need no GPU. To produce the
   deliverable, run ``python -m app.pipeline.orchestrator``, which continues
@@ -108,17 +109,29 @@ def report_settings(settings: Settings) -> None:
     _info("model cache", settings.model_cache_dir)
     _info("diarization model", settings.diarization_model)
     _info("transcription model", settings.transcription_model)
+    _info("translation backend", settings.translation_backend)
     _info("translation model", settings.translation_model)
+    _info("tts engine", settings.tts_engine)
     _info("tts model", settings.tts_model)
-    _info("seed-vc checkout", settings.seed_vc_repo_path)
+    if settings.tts_engine == "chatterbox":
+        _info("chatterbox model", settings.chatterbox_model)
+        _info("seed-vc checkout", settings.seed_vc_repo_path)
 
+    # The check is configuration-aware, so this names only what this run will
+    # actually read: the token always, the DeepSeek key only under the
+    # instruction-following backend.
     missing = settings.missing_credentials()
     if missing:
         raise RuntimeError(
             "missing credentials: "
             + ", ".join(missing)
-            + " - diarization needs HUGGINGFACE_TOKEN and adaptation needs "
-            "DEEPSEEK_API_KEY (copy .env.example to .env and fill them in)"
+            + " - the gated diarization pipeline needs HUGGINGFACE_TOKEN"
+            + (
+                ", and TRANSLATION_BACKEND=openai needs DEEPSEEK_API_KEY"
+                if settings.translation_backend == "openai"
+                else ""
+            )
+            + " (copy .env.example to .env and fill them in)"
         )
 
 
@@ -163,10 +176,10 @@ def report_lines(lines: list[transcription.TranscriptSegment]) -> None:
         )
 
 
-def report_dialogue(dialogue: list[AdaptedDialogue]) -> None:
+def report_dialogue(dialogue: list[AdaptedDialogue], settings: Settings) -> None:
     """Print the adapted Amharic lines with the performance the model chose."""
 
-    _rule("4. Adaptation - DeepSeek Amharic dialogue")
+    _rule(f"4. Adaptation - {settings.translation_backend} ({settings.translation_model})")
     _info("lines", len(dialogue))
     for index, line in enumerate(dialogue, start=1):
         print(
@@ -197,10 +210,23 @@ def report_profiles(profiles: dict[str, VoiceProfile]) -> None:
         _info("  why chosen", _shorten(profile.selection_reason or "(not recorded)"))
 
 
-def report_clips(clips: list[TtsClip], output_dir: Path) -> None:
+def _engine_label(settings: Settings) -> str:
+    """Return the synthesis chain a run with these settings uses, for reporting."""
+
+    if settings.tts_engine == "chatterbox":
+        return "Chatterbox Amharic -> Seed-VC V2"
+    return f"{settings.tts_engine} ({settings.tts_model})"
+
+
+def report_clips(
+    clips: list[TtsClip],
+    output_dir: Path,
+    *,
+    settings: Settings,
+) -> None:
     """Print every generated clip, its engine stages and its controls."""
 
-    _rule("6+7. Speech - Chatterbox Amharic -> Seed-VC V2")
+    _rule(f"6. Speech synthesis - {_engine_label(settings)}")
     _info("clips", len(clips))
     for clip in clips:
         controls = clip.performance
@@ -212,9 +238,13 @@ def report_clips(clips: list[TtsClip], output_dir: Path) -> None:
         )
         print(f"        amharic  {_shorten(clip.amharic)}", flush=True)
         print(f"        source   {_shorten(clip.dialogue.source_text)}", flush=True)
-        _info("  chatterbox take", f"{clip.take_path}")
+        # Both paths write a raw take and then a clip with the pauses rendered, so
+        # the two files are reported the same way and the engines that produced them
+        # are named: under a single-voice engine there is no conversion, and the
+        # take is the clip's only input.
+        _info(f"  take  [{clip.performance_engine}]", f"{clip.take_path}")
         _info("", _audio_summary(clip.take_path))
-        _info("  seed-vc clip", f"{clip.audio_path}")
+        _info(f"  clip  [{clip.style_engine}]", f"{clip.audio_path}")
         _info("", _audio_summary(clip.audio_path))
         _info(
             "  durations",
@@ -234,8 +264,10 @@ def report_clips(clips: list[TtsClip], output_dir: Path) -> None:
             f"emotion={controls.emotion!r} intensity={controls.intensity:.2f} "
             f"delivery={controls.delivery!r}",
         )
-        _info("  performance prompt", f"{clip.performance_reference_path}")
-        _info("  identity reference", f"{clip.voice_reference_path}")
+        if clip.performance_reference_path is not None:
+            _info("  performance prompt", f"{clip.performance_reference_path}")
+        if clip.voice_reference_path is not None:
+            _info("  identity reference", f"{clip.voice_reference_path}")
 
     _rule("Output")
     for directory in sorted(path for path in output_dir.iterdir() if path.is_dir()):
@@ -284,15 +316,27 @@ def run(source: Path, output_dir: Path, max_lines: int | None) -> int:
 
         stage = "adaptation"
         dialogue = translation.adapt_dialogue(lines, settings=settings)
-        report_dialogue(dialogue)
+        report_dialogue(dialogue, settings)
         if not dialogue:
             raise RuntimeError("adaptation produced no lines")
 
         stage = "voice profiles"
-        profiles = voice_profiles.build_voice_profiles(
-            turns, stems.speech, transcript=lines, settings=settings
-        )
-        report_profiles(profiles)
+        # Only a per-character engine reads an identity reference. A single-voice
+        # engine speaks every line the same way, so building profiles for it would
+        # burn minutes and a model download on references nothing reads - which is
+        # also why the orchestrator skips the stage.
+        single_voice = settings.tts_engine != "chatterbox"
+        profiles: dict[str, VoiceProfile] = {}
+        if single_voice:
+            _rule("5. Voice profiles - skipped")
+            _info(
+                "reason", f"{settings.tts_engine} is single-voice, one voice for all"
+            )
+        else:
+            profiles = voice_profiles.build_voice_profiles(
+                turns, stems.speech, transcript=lines, settings=settings
+            )
+            report_profiles(profiles)
 
         stage = "tts"
         if max_lines is not None and max_lines < len(dialogue):
@@ -301,7 +345,7 @@ def run(source: Path, output_dir: Path, max_lines: int | None) -> int:
         clips = tts.synthesize_dialogue(
             dialogue, stems.speech, profiles, output_dir=output_dir, settings=settings
         )
-        report_clips(clips, output_dir)
+        report_clips(clips, output_dir, settings=settings)
     except Exception as exc:  # noqa: BLE001 - the runner reports everything it hits
         print(f"\nFAILED during: {stage}")
         print(f"{type(exc).__name__}: {exc}")

@@ -57,6 +57,8 @@ RUNTIME_MODULES: dict[str, str] = {
     "torchcodec": "pyannote.audio",
     "dotenv": "configuration",
     "openai": "translation",
+    "sentencepiece": "NLLB-200 tokenizer",
+    "uroman": "MMS-TTS romanisation",
     "faster_whisper": "transcription",
     "pyannote.audio": "diarization",
     "bandit_infer": "separation",
@@ -89,6 +91,7 @@ PROJECT_MODULES: tuple[str, ...] = (
     "app.pipeline.diarization",
     "app.pipeline.evaluation",
     "app.pipeline.mixing",
+    "app.pipeline.nllb",
     "app.pipeline.orchestrator",
     "app.pipeline.prosody",
     "app.pipeline.qc",
@@ -245,21 +248,31 @@ def _env_example_placeholders() -> dict[str, str]:
 def check_credentials() -> bool:
     """Report the pipeline credentials, flagging unedited ``.env`` placeholders.
 
-    Both credentials are needed only by one stage each, but both are needed
-    before a GPU session is worth starting, so ``--full`` treats them as blocking.
+    Only the credentials the configured run needs are blocking: the Hugging Face
+    token always, because the gated diarization pipeline needs it, and the
+    DeepSeek key only when ``TRANSLATION_BACKEND`` is ``openai``. Failing on a key
+    the configured backend never reads would send someone hunting for a credential
+    they do not need while the real problem waits.
     """
 
     from app.config import get_settings
 
     settings = get_settings()
     placeholders = _env_example_placeholders()
+    deepseek_required = settings.translation_backend == "openai"
     configured = {
-        "DEEPSEEK_API_KEY": settings.deepseek_api_key,
-        "HUGGINGFACE_TOKEN": settings.huggingface_token,
+        "HUGGINGFACE_TOKEN": (settings.huggingface_token, True),
+        "DEEPSEEK_API_KEY": (settings.deepseek_api_key, deepseek_required),
     }
 
     healthy = True
-    for name, value in configured.items():
+    for name, (value, required) in configured.items():
+        if not required:
+            print(
+                f"{name}: not needed by TRANSLATION_BACKEND="
+                f"{settings.translation_backend}  [SKIP]"
+            )
+            continue
         if not value:
             print(f"{name}: not set  [FAIL]")
             healthy = False
@@ -280,11 +293,24 @@ def check_credentials() -> bool:
 
 
 def check_seed_vc() -> bool:
-    """Report whether the Seed-VC checkout the TTS stage runs is usable."""
+    """Report whether the Seed-VC checkout the TTS stage runs is usable.
+
+    Seed-VC converts a synthesized take into a target voice, which only the
+    prompt-and-convert engine does. Under a single-voice engine there is no
+    conversion step, so a missing checkout is reported as unused rather than as a
+    failure - the run does not touch it.
+    """
 
     from app.config import get_settings
 
-    repo = Path(get_settings().seed_vc_repo_path)
+    settings = get_settings()
+    if settings.tts_engine != "chatterbox":
+        print(
+            f"Seed-VC checkout: not used by TTS_ENGINE={settings.tts_engine}  [SKIP]"
+        )
+        return True
+
+    repo = Path(settings.seed_vc_repo_path)
     if not repo.is_dir():
         print(f"Seed-VC checkout: {repo}  [FAIL] (not a directory)")
         print("        - git clone https://github.com/Plachtaa/seed-vc " + str(repo))

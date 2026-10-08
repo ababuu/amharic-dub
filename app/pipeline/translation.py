@@ -868,6 +868,11 @@ def adapt_dialogue(
 ) -> list[AdaptedDialogue]:
     """Adapt transcribed dialogue into dubbing-ready Amharic.
 
+    Two kinds of backend produce the Amharic, and ``TRANSLATION_BACKEND`` picks
+    which: ``nllb`` translates, ``openai`` adapts. The difference decides which of
+    the parameters below can be honoured, because only an instruction-following
+    model can be *told* anything.
+
     Parameters
     ----------
     segments:
@@ -876,8 +881,8 @@ def adapt_dialogue(
         and timestamps verbatim.
     settings:
         Project settings override; defaults to :func:`app.config.get_settings`.
-        The API key, base URL, model, batch size and thinking toggle all come from
-        here - nothing is hard-coded in this module.
+        The backend, API key, base URL, model, batch size and thinking toggle all
+        come from here - nothing is hard-coded in this module.
     scenes:
         Scene boundaries from
         :func:`app.pipeline.dialogue_context.segment_scenes`. Derived from the
@@ -903,6 +908,18 @@ def adapt_dialogue(
         a word left in Roman letters cannot be pronounced. Sharing the same pass as
         the budget check, so a batch is never re-asked twice.
 
+    Notes
+    -----
+    ``scenes``, ``bible``, ``syllables_per_second``, ``budget_tolerance`` and the two
+    ``enforce_*`` flags describe a *conversation* with the model, so only
+    ``TRANSLATION_BACKEND=openai`` can act on them. NLLB translates one sentence at a
+    time with no prompt and no re-ask: it is handed a line, it returns Amharic, and
+    there is no way to ask for a shorter or character-consistent version. Those
+    parameters are therefore accepted and unused under ``nllb``, and the performance
+    metadata is filled with the neutral defaults rather than invented. A line that
+    comes back too long for its window is left as it is and shows up in the run's
+    timing and QC report, which is where overshoot is measured against real audio.
+
     Returns
     -------
     list[AdaptedDialogue]
@@ -911,12 +928,15 @@ def adapt_dialogue(
 
     Raises
     ------
-    MissingApiKeyError
-        ``DEEPSEEK_API_KEY`` is not configured.
+    NllbTranslationError
+        ``TRANSLATION_BACKEND=nllb`` and NLLB could not translate a line.
     InvalidTranscriptSegmentsError
         ``segments`` is not an iterable of ``TranscriptSegment``.
     ConfigurationError
-        A translation setting (currently the batch size) is unusable.
+        ``TRANSLATION_BACKEND`` is neither ``nllb`` nor ``openai``, or a setting
+        the chosen backend reads (currently the batch size) is unusable.
+    MissingApiKeyError
+        ``TRANSLATION_BACKEND=openai`` and ``DEEPSEEK_API_KEY`` is not configured.
     ApiClientError
         The DeepSeek client could not be constructed.
     ApiAuthenticationError, ApiRequestError

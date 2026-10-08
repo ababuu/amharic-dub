@@ -19,17 +19,17 @@ cloned voices, re-timed, and mixed back with the untouched music and effects.
 
 ```mermaid
 flowchart LR
-    V[Source video] --> SEP[Source separation<br/>BandIt v2 Multi]
-    SEP -->|dialogue| DIA[Speaker diarization<br/>pyannote Community-1]
-    DIA --> ASR[Transcription<br/>faster-whisper large-v3]
-    ASR --> TR[Adapt + translate to Amharic<br/>scene + character bible + syllable budget]
-    TR --> VP[Voice profiles<br/>best clean reference per speaker]
-    VP --> TTS[Speech synthesis + voice adaptation<br/>Chatterbox Amharic → Seed-VC V2]
-    TTS --> TIM[Timing alignment]
-    TIM --> MIX[Mixing]
+    V["Source video"] --> SEP["Source separation<br/>BandIt v2 Multi"]
+    SEP -->|dialogue| DIA["Speaker diarization<br/>pyannote Community-1"]
+    DIA --> ASR["Transcription<br/>faster-whisper large-v3"]
+    ASR --> TR["Adapt + translate to Amharic<br/>NLLB or an LLM with scene +<br/>character bible + syllable budget"]
+    TR --> VP["Voice profiles<br/>best clean reference per speaker<br/>per-character engines only"]
+    VP --> TTS["Speech synthesis<br/>MMS-TTS Amharic or<br/>Chatterbox Amharic &#8594; Seed-VC V2"]
+    TTS --> TIM["Timing alignment"]
+    TIM --> MIX["Mixing"]
     SEP -->|music + effects| MIX
-    MIX --> QC[Quality control<br/>fit, rate, crosstalk]
-    QC --> OUT[Dubbed video<br/>Bunny Stream]
+    MIX --> QC["Quality control<br/>fit, rate, crosstalk"]
+    QC --> OUT["Dubbed video<br/>Bunny Stream"]
 ```
 
 ## Tech stack
@@ -126,12 +126,12 @@ amharic-dub/
       separation.py           # BandIt v2 Multi separation (implemented)
       diarization.py          # pyannote Community-1 diarization (implemented)
       transcription.py        # faster-whisper large-v3 transcription (implemented)
-      translation.py          # DeepSeek Amharic dialogue adaptation (implemented)
+      translation.py          # Amharic dialogue adaptation (backend-selecting) (implemented)
       voice_profiles.py       # per-speaker voice references + clone-prompt cache (implemented)
       nllb.py                 # local NLLB-200 translation (default backend) (implemented)
       dialogue_context.py     # scenes, character bible, syllable budget (implemented)
       amharic_text.py         # Ethiopic syllables + homophone folding (implemented)
-      tts.py                  # Chatterbox Amharic + Seed-VC V2 synthesis (implemented)
+      tts.py                  # Amharic speech synthesis (MMS-TTS or Chatterbox + Seed-VC) (implemented)
       timing.py               # pitch-preserving fit to the original timings (implemented)
       mixing.py               # dialogue over ducked music + effects (implemented)
       qc.py                   # measures each run: fit, rate, crosstalk (implemented)
@@ -231,10 +231,15 @@ default resolved against the project root.
 | | Variables | Why |
 | --- | --- | --- |
 | Required | `HUGGINGFACE_TOKEN` | No fallback value; diarization cannot run without it |
-| Required only for the hosted API | `DEEPSEEK_API_KEY` | Needed when `TRANSLATION_BASE_URL` points at the hosted DeepSeek API. A local OpenAI-compatible server needs no key |
+| Required only for the hosted API | `DEEPSEEK_API_KEY` | Needed only under `TRANSLATION_BACKEND=openai` with `TRANSLATION_BASE_URL` pointing at the hosted DeepSeek API. The default backend (`nllb`) reads no key at all, and a local OpenAI-compatible server needs none either |
 | Required on a Pod | `HF_HOME` | Defaults to the container's `~/.cache/huggingface`, which is lost when the Pod stops |
 | Worth setting | `MODEL_CACHE_DIR`, `SEED_VC_REPO_PATH`, `DIALOGUE_BIBLE_PATH` | The first two default under the project root, so they follow the repository onto the volume. The bible is per-film consistency state worth keeping between runs |
 | Everything else | e.g. `TRANSCRIPTION_MODEL`, `TIMING_MAX_TEMPO`, `MIX_DUCK_DB` | Set only to change behaviour |
+
+Which credentials are *required* follows the configuration, and both
+`scripts/check_environment.py --full` and `scripts/validate_models.py` report
+against it: a key or a checkout the configured backends do not read is reported
+`[SKIP]`, not as a failure, so a pre-flight never fails on work the run will not do.
 
 **Running without a commercial API.** Adaptation talks to any OpenAI-compatible
 endpoint, so a self-hosted server replaces the hosted one by configuration alone -
@@ -279,19 +284,24 @@ PyTorch 2.8, CUDA 12.8 and FFmpeg) on an A40, with a **network volume mounted at
 `/workspace`**. The volume is what you actually want: without one, every session
 re-downloads many gigabytes of weights before doing any work.
 
-**2. Configure it through Pod environment variables, and clone both
-repositories.** Set these in the Pod's **Environment Variables** section (one
-`KEY=VALUE` per line, or a JSON object through the CLI) rather than exporting them
-in a shell later. A Pod environment variable exists before Python starts, which is
-what `HF_HOME` needs, and it survives reconnects:
+**2. Configure it through Pod environment variables, and clone the project.** Set
+these in the Pod's **Environment Variables** section (one `KEY=VALUE` per line, or
+a JSON object through the CLI) rather than exporting them in a shell later. A Pod
+environment variable exists before Python starts, which is what `HF_HOME` needs,
+and it survives reconnects:
 
 ```
-DEEPSEEK_API_KEY=...                 # required - dialogue adaptation
 HUGGINGFACE_TOKEN=hf_...             # required - gated pyannote Community-1 weights
 HF_HOME=/workspace/models_cache      # required on a Pod - see below
 MODEL_CACHE_DIR=/workspace/models_cache    # optional; defaults under the repo
-SEED_VC_REPO_PATH=/workspace/seed-vc       # optional; defaults under the repo
+DEEPSEEK_API_KEY=...                 # optional - only for TRANSLATION_BACKEND=openai
+SEED_VC_REPO_PATH=/workspace/seed-vc       # optional - only for TTS_ENGINE=chatterbox
 ```
+
+The default configuration (NLLB + MMS-TTS) is entirely local and needs no API key,
+so `HUGGINGFACE_TOKEN` is the only credential to set. Add `DEEPSEEK_API_KEY` only
+if you switch to `TRANSLATION_BACKEND=openai`, which is also the only setting that
+makes the run call out to a third party at all.
 
 Create the Hugging Face token with the **Read** role, or as a fine-grained token
 with read access to the gated repository. The pipeline only ever downloads from the
@@ -315,12 +325,14 @@ as a cache shared between checkouts. The other four variables can also go in a
 override a real environment variable; `.env` is git-ignored, so it is never
 committed. Changing a running Pod's variables requires restarting it.
 
-Then clone both repositories onto the volume:
+Then clone the project onto the volume. Seed-VC is a separate checkout, and is
+needed **only** for `TTS_ENGINE=chatterbox`, so the default engine does not need it:
 
 ```bash
 git clone <your fork> /workspace/amharic-dub
-git clone https://github.com/Plachtaa/seed-vc /workspace/seed-vc
 cd /workspace/amharic-dub
+# only for TTS_ENGINE=chatterbox:
+# git clone https://github.com/Plachtaa/seed-vc /workspace/seed-vc
 ```
 
 **3. Install.** Do not install with a plain `pip install -r requirements.txt`: the
@@ -350,19 +362,29 @@ python scripts/validate_models.py
 `scripts/check_environment.py` reports the Python version, the PyTorch version,
 CUDA availability, GPU name, available VRAM, and FFmpeg availability. It needs no
 credentials and downloads nothing, so it is safe to run first. With `--full` it
-becomes the session pre-flight: it also checks both credentials (flagging a value
-that is still the `.env.example` placeholder), the Seed-VC checkout and its
-`configs/v2/vc_wrapper.yaml`, and every module the stages import at run time.
+becomes the session pre-flight: it also checks the credentials the configured run
+actually needs (flagging a value that is still the `.env.example` placeholder), the
+Seed-VC checkout and its `configs/v2/vc_wrapper.yaml`, and every module the stages
+import at run time. What is required follows the configuration: the Hugging Face
+token always, the DeepSeek key only under `TRANSLATION_BACKEND=openai`, and the
+Seed-VC checkout only under `TTS_ENGINE=chatterbox`. Anything the configuration does
+not use is reported `[SKIP]` rather than `[FAIL]`.
 
 `scripts/validate_models.py` loads each model **on its own** - BandIt, pyannote,
-faster-whisper, the DeepSeek client, the Chatterbox adapter, the Seed-VC wrapper -
+faster-whisper, the configured translation backend, the configured synthesis engine -
 reports the result for each, and releases it before the next one, so a failure
 names exactly one component instead of surfacing halfway through a run after other
-weights have already been downloaded. `--only chatterbox` (or any comma-separated
-subset) re-checks a single component. Because every step but the runtime report
-downloads real weights, the script refuses to run on a machine where torch reports
-no CUDA device unless `--allow-cpu` is passed, so a development box cannot quietly
-fill its disk with checkpoints.
+weights have already been downloaded. The translation and synthesis steps go one
+step further than loading and push one probe line through the model, because a
+checkpoint that loads can still reject every input. `--only nllb` (or any
+comma-separated subset) re-checks a single component. As with the environment
+check, only the configured backend and engine are loaded: checking both pairs would
+download gigabytes a run never touches, and would leave the models it *does* use
+unvalidated. To check the other pair, set the variables:
+`TRANSLATION_BACKEND=openai TTS_ENGINE=chatterbox python scripts/validate_models.py`.
+Because every step but the runtime report downloads real weights, the script refuses
+to run on a machine where torch reports no CUDA device unless `--allow-cpu` is
+passed, so a development box cannot quietly fill its disk with checkpoints.
 
 **5. Run it.** On a small test clip first, then the film:
 
@@ -432,10 +454,10 @@ targets the A40 GPU; a CPU-only run needs
 `TRANSCRIPTION_COMPUTE_TYPE=int8` because CTranslate2 does not support fp16 on
 CPU. The pipeline never falls back from GPU to CPU on its own.
 
-Dialogue adaptation calls the DeepSeek API, so `DEEPSEEK_API_KEY` is required
-before running that stage. It is the only stage that needs network access to a
-third party; every model that runs locally has its weights cached under
-`MODEL_CACHE_DIR`.
+Dialogue adaptation runs locally by default: NLLB is a local checkpoint, so no key
+and no network access are needed. Only `TRANSLATION_BACKEND=openai` calls out to a
+third party, and only then is `DEEPSEEK_API_KEY` required. Every model that runs
+locally has its weights cached under `MODEL_CACHE_DIR`.
 
 Voice profiles are built from the **dialogue stem** produced by separation, never
 from the full movie mix, so each reference is free of music and effects. For every
@@ -465,7 +487,11 @@ takes reference audio directly, so `clone_prompt_path` may stay `None`.
 
 ### Speech synthesis (`tts.py`)
 
-Two engines run per line, in this order:
+The default engine runs alone: MMS-TTS Amharic speaks every line in one voice, so
+there is no conversion step - see [Choosing a speech engine](#choosing-a-speech-engine).
+
+`TTS_ENGINE=chatterbox` instead runs two engines per line, in this order, which is
+what preserves the original actor's performance:
 
 1. **Chatterbox Amharic** (`gabar-tech/chatterbox-amharic`, a LoRA adapter plus a
    Fidel tokenizer on Chatterbox Multilingual v3) speaks the Amharic text. It is

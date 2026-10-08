@@ -7,17 +7,30 @@ other models have already been downloaded. This script loads each model by itsel
 prints what happened, and releases it before moving on, so a failure names exactly
 one component.
 
+Which translation and synthesis models are checked follows the configuration:
+
+* ``TRANSLATION_BACKEND`` selects ``nllb`` (the default) or ``deepseek``.
+* ``TTS_ENGINE`` selects ``mms`` (the default), or ``chatterbox`` plus ``seed-vc``.
+
+Only the selected ones are loaded. Checking the other pair would download many
+gigabytes a run never touches and, worse, would leave the models it *does* use
+unchecked, so the pre-flight would pass and the run would still fail. To check the
+other configuration, set the environment variables::
+
+    TRANSLATION_BACKEND=openai TTS_ENGINE=chatterbox python scripts/validate_models.py
+
 ::
 
     python scripts/validate_models.py
-    python scripts/validate_models.py --only chatterbox
-    python scripts/validate_models.py --only bandit,seed-vc
+    python scripts/validate_models.py --only nllb
+    python scripts/validate_models.py --only bandit,mms
 
 Each step drives the stage's *own* loader (``separation``'s session, ``diarization``'s
-pipeline loader, ``transcription``'s model loader, ``translation``'s client,
+pipeline loader, ``transcription``'s model loader, ``translation``'s backend,
 ``tts``'s engines), so what is validated here is the same code path a real run
-takes. Nothing is synthesized and no stage is executed: this checks
-initialisation only. ``scripts/test_gpu.py`` is the end-to-end run.
+takes. The translation and synthesis steps go one step further than loading and run
+one probe line through the model, because a checkpoint that loads can still reject
+every input. ``scripts/test_gpu.py`` is the end-to-end run.
 
 Models are dropped and CUDA's cache is emptied between steps, so the whole
 validation fits on a single 48 GB card even though every model is loaded.
@@ -153,6 +166,65 @@ def load_whisper() -> None:
     _report("loaded", type(model).__name__)
 
 
+def load_nllb() -> None:
+    """Load the NLLB translation model and translate one short line.
+
+    Loading the weights only proves the download worked; translating proves the
+    tokenizer, the language codes and ``generate`` all agree, which is the part that
+    actually fails when a checkpoint and a library version disagree.
+    """
+
+    from app.pipeline import nllb
+
+    settings = nllb.get_settings()
+    _report("model", settings.translation_model)
+    _report("device", settings.device)
+    _report("languages", f"{nllb.SOURCE_LANGUAGE} -> {nllb.TARGET_LANGUAGE}")
+
+    translator = nllb.load_translator(settings=settings)
+    result = translator.translate("Hello.")
+    if not result.text.strip():
+        raise RuntimeError("NLLB returned an empty translation")
+    _report("loaded", "translated a probe line")
+
+
+def load_mms() -> None:
+    """Load MMS-TTS Amharic and synthesize one word.
+
+    Synthesis is the step worth validating here, because it exercises the two things
+    a load alone would not: the romanisation the checkpoint requires, and the
+    duration predictor producing a waveform at all.
+    """
+
+    from app.pipeline import tts
+
+    settings = tts.get_settings()
+    _report("model", settings.tts_model)
+    _report("device", settings.device)
+    _report("seed / rate", f"{settings.mms_seed} / {settings.mms_speaking_rate:g}")
+
+    if settings.tts_engine != "mms":
+        raise RuntimeError(
+            f"TTS_ENGINE is {settings.tts_engine!r}, so the MMS engine is not what a "
+            "run would use; validate 'chatterbox' and 'seed-vc' instead"
+        )
+
+    engine = tts.load_mms_engine(settings=settings)
+    romanized = engine.romanize("ሰላም")
+    _report("romanised", romanized)
+
+    import tempfile
+    from pathlib import Path as _Path
+
+    with tempfile.TemporaryDirectory() as directory:
+        written = engine.synthesize(
+            text="ሰላም", destination=_Path(directory) / "probe.wav"
+        )
+        if not written.is_file() or written.stat().st_size == 0:
+            raise RuntimeError("MMS-TTS wrote no audio for the probe line")
+    _report("loaded", f"synthesized at {engine.sample_rate} Hz")
+
+
 def load_deepseek() -> None:
     """Build the DeepSeek client and confirm the key is accepted.
 
@@ -163,6 +235,12 @@ def load_deepseek() -> None:
     from app.pipeline import translation
 
     settings = translation.get_settings()
+    if settings.translation_backend != "openai":
+        raise RuntimeError(
+            f"TRANSLATION_BACKEND is {settings.translation_backend!r}, so an "
+            "OpenAI-compatible endpoint is not what a run would use; validate "
+            "'nllb' instead"
+        )
     if not settings.deepseek_api_key:
         raise RuntimeError("DEEPSEEK_API_KEY is not set")
 
@@ -180,7 +258,8 @@ def load_chatterbox() -> None:
     from app.pipeline import tts
 
     settings = tts.get_settings()
-    _report("adapter", settings.tts_model)
+    _report("engine", settings.tts_engine)
+    _report("adapter", settings.chatterbox_model)
     _report("device", settings.device)
 
     engine = tts.load_chatterbox_engine(settings=settings)
@@ -205,16 +284,81 @@ def load_seed_vc() -> None:
     _report("convert style", str(engine.convert_style))
 
 
-#: Validation steps in pipeline order, cheapest first within reason.
+#: Steps that every configuration needs, in pipeline order.
 STEPS: tuple[tuple[str, str, object], ...] = (
     ("torch", "compute runtime", load_torch),
-    ("deepseek", "DeepSeek adaptation client", load_deepseek),
     ("bandit", "BandIt v2 Multi separation", load_bandit),
     ("pyannote", "pyannote Community-1 diarization", load_pyannote),
     ("whisper", "faster-whisper transcription", load_whisper),
-    ("chatterbox", "Chatterbox Amharic synthesis", load_chatterbox),
-    ("seed-vc", "Seed-VC V2 voice conversion", load_seed_vc),
 )
+
+#: Steps that depend on the configured backend and engine. Only the ones a run will
+#: actually use are loaded: validating the other pair would download many gigabytes
+#: the run never touches, and - worse - would leave the models it *does* use
+#: unchecked, so the pre-flight would pass and the run would still fail.
+CONFIGURED_STEPS: tuple[tuple[str, str, object, str], ...] = (
+    ("nllb", "NLLB-200 translation (TRANSLATION_BACKEND=nllb)", load_nllb, "nllb"),
+    (
+        "deepseek",
+        "instruction-following adaptation (TRANSLATION_BACKEND=openai)",
+        load_deepseek,
+        "openai",
+    ),
+    ("mms", "MMS-TTS Amharic synthesis (TTS_ENGINE=mms)", load_mms, "mms"),
+    (
+        "chatterbox",
+        "Chatterbox Amharic synthesis (TTS_ENGINE=chatterbox)",
+        load_chatterbox,
+        "chatterbox",
+    ),
+    (
+        "seed-vc",
+        "Seed-VC V2 voice conversion (TTS_ENGINE=chatterbox)",
+        load_seed_vc,
+        "chatterbox",
+    ),
+)
+
+
+#: How to make a step that the current configuration does not select part of it.
+ACTIVATION: dict[str, str] = {
+    "nllb": "set TRANSLATION_BACKEND=nllb",
+    "deepseek": "set TRANSLATION_BACKEND=openai",
+    "mms": "set TTS_ENGINE=mms",
+    "chatterbox": "set TTS_ENGINE=chatterbox",
+    "seed-vc": "set TTS_ENGINE=chatterbox",
+}
+
+
+def configured_steps() -> tuple[tuple[str, str, object], ...]:
+    """Return every step this configuration needs, in run order.
+
+    The selection is taken from the settings themselves - ``TRANSLATION_BACKEND`` and
+    ``TTS_ENGINE`` - so what is validated is what a run would load.
+    """
+
+    from app.pipeline import translation, tts
+
+    settings = translation.get_settings()
+    backend = settings.translation_backend
+    engine = tts.get_settings().tts_engine
+
+    selected: list[tuple[str, str, object]] = list(STEPS)
+    for name, description, loader, wanted in CONFIGURED_STEPS:
+        if name in ("nllb", "deepseek") and wanted != backend:
+            continue
+        if name in ("mms", "chatterbox", "seed-vc") and wanted != engine:
+            continue
+        selected.append((name, description, loader))
+    return tuple(selected)
+
+
+def all_step_names() -> set[str]:
+    """Return every step name that exists, configured or not."""
+
+    return {name for name, _, _ in STEPS} | {
+        name for name, _, _, _ in CONFIGURED_STEPS
+    }
 
 
 def _cuda_available() -> bool | None:
@@ -236,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "comma-separated subset to validate "
-            f"(one or more of: {', '.join(name for name, _, _ in STEPS)})"
+            f"(one or more of: {', '.join(name for name, _, _ in configured_steps())})"
         ),
     )
     parser.add_argument(
@@ -249,13 +393,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    selected = {name for name, _, _ in STEPS}
+    steps = configured_steps()
+
+    selected = {name for name, _, _ in steps}
     if args.only:
         requested = {part.strip() for part in args.only.split(",") if part.strip()}
-        unknown = sorted(requested - selected)
+        unknown = sorted(requested - selected - all_step_names())
         if unknown:
             print(f"unknown step(s): {', '.join(unknown)}", file=sys.stderr)
-            print(f"known steps: {', '.join(sorted(selected))}", file=sys.stderr)
+            print(
+                f"known steps: {', '.join(sorted(all_step_names()))}",
+                file=sys.stderr,
+            )
+            return 2
+        # A step that exists but belongs to the other configuration is worth
+        # distinguishing from a typo: the names are in this file's help and in the
+        # README, so being told *how* to select one is the difference between a dead
+        # end and a one-line fix.
+        other = sorted(requested - selected)
+        if other:
+            print(
+                f"not part of this configuration: {', '.join(other)}", file=sys.stderr
+            )
+            for name in other:
+                print(f"  {name}: {ACTIVATION[name]}", file=sys.stderr)
             return 2
         selected = requested
 
@@ -282,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Models are loaded one at a time and released before the next one.\n")
 
     results: list[tuple[str, bool, float, str]] = []
-    for name, description, loader in STEPS:
+    for name, description, loader in steps:
         if name not in selected:
             continue
         print(f"[{name}] {description}", flush=True)

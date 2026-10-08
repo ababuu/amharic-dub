@@ -7,9 +7,11 @@ The stage order is the one ``app/pipeline/__init__.py`` documents::
       -> separation.separate_stems      speech / music / effects
       -> diarization.diarize            speaker turns
       -> transcription.transcribe       spoken lines, per speaker
-      -> translation.adapt_dialogue     spoken Amharic + performance metadata
+      -> translation.adapt_dialogue     spoken Amharic (+ performance metadata when
+                                        the backend produces it)
       -> voice_profiles.build_voice_profiles   one identity reference per speaker
-      -> tts.synthesize_dialogue        Chatterbox Amharic -> Seed-VC V2 clips
+                                        (per-character engines only)
+      -> tts.synthesize_dialogue        Amharic speech clips
       -> timing.align_dialogue          each line fitted to its original window
       -> mixing.mix_track              dialogue over ducked music + effects
       -> video.mux_dub                  the Amharic mix back into the video
@@ -463,7 +465,16 @@ def run_pipeline(
             enforce_fidel_loanwords=resolved.translation_enforce_fidel_loanwords,
         )
     )
-    if bible:
+    if resolved.translation_backend == "nllb":
+        # NLLB is a sentence-level translation model: it is handed one line at a time
+        # and cannot be asked for a shorter rewrite, so the scene/character context,
+        # the syllable-budget re-ask and the script check have nothing to act on here.
+        # They are not silently skipped - the run says so.
+        report(
+            "  adaptation: NLLB translates line by line; scene/character context and "
+            "length enforcement are not applied"
+        )
+    elif bible:
         report(f"  dialogue bible: {len(bible)} character(s) applied")
     if not dialogue:
         raise EmptyStageError("adaptation produced no lines; nothing to synthesize")

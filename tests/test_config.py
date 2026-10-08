@@ -42,22 +42,38 @@ _ENV_VARS = (
     "DEEPSEEK_API_KEY",
     "HUGGINGFACE_TOKEN",
     "DIARIZATION_MODEL",
+    "DIARIZATION_MIN_SPEAKERS",
+    "DIARIZATION_MAX_SPEAKERS",
     "TRANSCRIPTION_MODEL",
     "TRANSCRIPTION_COMPUTE_TYPE",
     "TRANSCRIPTION_LANGUAGE",
+    "TRANSLATION_BACKEND",
     "TRANSLATION_MODEL",
     "TRANSLATION_BASE_URL",
     "TRANSLATION_BATCH_SIZE",
     "TRANSLATION_DISABLE_THINKING",
+    "TRANSLATION_NUM_BEAMS",
+    "TRANSLATION_MAX_NEW_TOKENS",
+    "TRANSLATION_ENFORCE_BUDGET",
+    "TRANSLATION_ENFORCE_FIDEL_LOANWORDS",
     "VOICE_PROFILE_DIR",
     "VOICE_REFERENCE_MIN_DURATION",
     "VOICE_REFERENCE_TARGET_DURATION",
     "VOICE_REFERENCE_MAX_DURATION",
+    "DIALOGUE_BIBLE_PATH",
     "TTS_MODEL",
+    "TTS_ENGINE",
+    "CHATTERBOX_MODEL",
+    "MMS_SAMPLE_RATE",
+    "MMS_SEED",
+    "MMS_SPEAKING_RATE",
     "SEED_VC_REPO_PATH",
     "SEED_VC_DIFFUSION_STEPS",
+    "SEED_VC_CONVERT_STYLE",
     "TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
     "TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
+    "TTS_MIN_LINE_SECONDS",
+    "TTS_CONTINUE_ON_FAILURE",
     "TTS_MAX_PAUSE_SECONDS",
     "TIMING_MIN_TEMPO",
     "TIMING_MAX_TEMPO",
@@ -99,7 +115,23 @@ def test_missing_credentials_do_not_break_construction(_clean_env: None) -> None
     assert settings.huggingface_token is None
     assert settings.has_deepseek_credentials is False
     assert settings.has_huggingface_credentials is False
-    assert settings.missing_credentials() == ["DEEPSEEK_API_KEY", "HUGGINGFACE_TOKEN"]
+    # The default backend is NLLB, which reads no credential, so only the token the
+    # gated diarization pipeline needs is reported.
+    assert settings.translation_backend == "nllb"
+    assert settings.missing_credentials() == ["HUGGINGFACE_TOKEN"]
+
+
+def test_missing_credentials_includes_the_key_the_backend_reads(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+
+    settings = Settings.from_env()
+
+    assert settings.missing_credentials() == [
+        "DEEPSEEK_API_KEY",
+        "HUGGINGFACE_TOKEN",
+    ]
 
 
 def test_environment_variables_override_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
