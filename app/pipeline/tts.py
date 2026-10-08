@@ -95,6 +95,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import importlib.util
+import inspect
 import json
 import math
 import sys
@@ -1774,6 +1775,32 @@ def _require_vits() -> tuple[Any, Any, Any]:
     return torch, AutoTokenizer, VitsModel
 
 
+def _accepts_speaking_rate(network: Any) -> bool:
+    """Say whether this build's forward pass takes a ``speaking_rate`` argument.
+
+    Which is not the same as the config having the attribute. ``VitsModel`` copies
+    ``config.speaking_rate`` into ``self.speaking_rate`` **in its constructor**, so
+    assigning to the config afterwards changes nothing at all - the duration
+    predictor reads the attribute captured at construction time. The rate is honoured
+    only as an argument to the forward call (``length_scale = 1.0 / speaking_rate``),
+    which is what this checks for, by signature rather than by version number so that
+    a build that gains or loses the argument is handled either way.
+
+    Only an explicit parameter counts: a ``**kwargs`` catch-all would swallow the
+    argument and leave the run silently speaking at the wrong rate, which is the
+    failure this exists to prevent.
+    """
+
+    target = getattr(network, "forward", None)
+    if target is None:
+        return False
+    try:
+        parameters = inspect.signature(target).parameters
+    except (TypeError, ValueError):  # a signature this build cannot report
+        return False
+    return "speaking_rate" in parameters
+
+
 def _require_uroman() -> Any:
     """Return the ``uroman`` romanizer class, or explain what is missing.
 
@@ -1848,6 +1875,7 @@ class MmsAmharicEngine(TextToSpeechEngine):
         self._network: Any | None = None
         self._uroman: Any | None = romanizer
         self._rate: int | None = None
+        self._rate_supported: bool = False
 
     @property
     def model(self) -> str:
@@ -1915,15 +1943,22 @@ class MmsAmharicEngine(TextToSpeechEngine):
             ) from exc
         self._network.eval()
 
-        # VITS exposes speaking rate through its config. Setting it when the
-        # attribute exists is how a line is made shorter or longer without
-        # time-stretching the result - so the model is asked for the right duration
-        # rather than the audio being stretched to reach it.
-        if hasattr(self._network.config, "speaking_rate"):
-            try:
-                self._network.config.speaking_rate = self._speaking_rate
-            except Exception:  # a frozen config is not worth failing a run over
-                pass
+        # Asking the model for a duration is what lets a line fit its window without
+        # being time-stretched afterwards. Doing so is a property of the installed
+        # build, not something to assume: an argument the forward pass does not take
+        # would be ignored, and the run would speak at the wrong rate with nothing to
+        # show for it. A build that cannot honour a *requested* rate therefore fails
+        # here; the default rate of 1.0 requests nothing, so it is never a reason to
+        # stop.
+        self._rate_supported = _accepts_speaking_rate(self._network)
+        if not self._rate_supported and self._speaking_rate != DEFAULT_MMS_SPEAKING_RATE:
+            raise EngineLoadError(
+                f"MMS_SPEAKING_RATE is {self._speaking_rate} but the installed "
+                "transformers build cannot control the duration predictor: "
+                f"{type(self._network).__name__}.forward takes no 'speaking_rate' "
+                "argument, so the request cannot be honoured. Upgrade transformers, "
+                "or set MMS_SPEAKING_RATE=1.0 to leave the model's own rhythm alone."
+            )
 
         self._rate = int(
             getattr(self._network.config, "sampling_rate", DEFAULT_MMS_SAMPLE_RATE)
@@ -1979,7 +2014,12 @@ class MmsAmharicEngine(TextToSpeechEngine):
             # give the same line a different length every time.
             torch.manual_seed(self._seed)
             with torch.no_grad():
-                waveform = network(**inputs).waveform
+                if self._rate_supported:
+                    waveform = network(
+                        **inputs, speaking_rate=self._speaking_rate
+                    ).waveform
+                else:
+                    waveform = network(**inputs).waveform
         except Exception as exc:
             raise SynthesisError(
                 f"MMS-TTS failed to synthesize {text!r}: {type(exc).__name__}: {exc}"

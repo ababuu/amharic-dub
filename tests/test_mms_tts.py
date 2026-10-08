@@ -55,10 +55,14 @@ class FakeWaveform:
         return self._samples
 
 
-class FakeNetwork:
-    """Stand-in for ``transformers.VitsModel``."""
+class _FakeVitsBase:
+    """The plumbing every ``VitsModel`` stand-in shares: construction, device, config.
 
-    instances: list["FakeNetwork"] = []
+    The two subclasses below differ only in whether ``forward`` declares
+    ``speaking_rate``, which is the property the engine probes for.
+    """
+
+    instances: list["_FakeVitsBase"] = []
     fail: Exception | None = None
     samples: np.ndarray = np.full(4800, 0.3, dtype=np.float32)
     speaking_rate_seen: float | None = None
@@ -70,7 +74,7 @@ class FakeNetwork:
         self.device = "cpu"
         self.moved_to = None
         self.calls: list[dict] = []
-        FakeNetwork.instances.append(self)
+        type(self).instances.append(self)
 
     @classmethod
     def from_pretrained(cls, name, cache_dir=None):
@@ -89,10 +93,35 @@ class FakeNetwork:
     def parameters(self):
         return iter([SimpleNamespace(device=self.device)])
 
-    def __call__(self, **kwargs):
-        self.calls.append(kwargs)
-        FakeNetwork.speaking_rate_seen = self.config.speaking_rate
-        return SimpleNamespace(waveform=FakeWaveform(FakeNetwork.samples))
+    def _record(self, inputs: dict) -> SimpleNamespace:
+        self.calls.append(dict(inputs))
+        type(self).speaking_rate_seen = inputs.get("speaking_rate")
+        return SimpleNamespace(waveform=FakeWaveform(type(self).samples))
+
+
+class FakeNetwork(_FakeVitsBase):
+    """A build whose forward takes ``speaking_rate``, as the real VitsModel does.
+
+    ``VitsModel`` copies ``config.speaking_rate`` into itself *in its constructor*, so
+    watching the config attribute would pass whether or not the rate was ever used;
+    this records the argument the forward call actually received instead.
+    """
+
+    def forward(self, *, speaking_rate=None, **inputs):
+        return self._record({**inputs, "speaking_rate": speaking_rate})
+
+    def __call__(self, **inputs):
+        return self.forward(**inputs)
+
+
+class FakeNetworkWithoutRate(_FakeVitsBase):
+    """A build whose forward takes no ``speaking_rate``: a ``**inputs`` catch-all."""
+
+    def forward(self, **inputs):
+        return self._record(inputs)
+
+    def __call__(self, **inputs):
+        return self.forward(**inputs)
 
 
 class FakeTokenizer:
@@ -164,18 +193,21 @@ class FakeUroman:
         return "romanised:" + text
 
 
-def _patch(monkeypatch: pytest.MonkeyPatch) -> None:
+def _patch(monkeypatch: pytest.MonkeyPatch, network=FakeNetwork) -> None:
     FakeNetwork.instances = []
     FakeNetwork.fail = None
     FakeNetwork.samples = np.full(4800, 0.3, dtype=np.float32)
     FakeNetwork.speaking_rate_seen = None
+    FakeNetworkWithoutRate.instances = []
+    FakeNetworkWithoutRate.speaking_rate_seen = None
+    FakeNetworkWithoutRate.fail = None
     FakeTokenizer.instances = []
     FakeTorch.device_calls = []
     FakeTorch.seeded = []
     FakeUroman.instances = []
     FakeUroman.fail = None
 
-    monkeypatch.setattr(tts, "_require_vits", lambda: (FakeTorch, FakeTokenizer, FakeNetwork))
+    monkeypatch.setattr(tts, "_require_vits", lambda: (FakeTorch, FakeTokenizer, network))
     monkeypatch.setattr(tts, "_require_uroman", lambda: FakeUroman)
 
 
@@ -368,7 +400,13 @@ def test_generation_is_seeded(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_the_speaking_rate_reaches_the_model(monkeypatch, tmp_path: Path) -> None:
-    """Asking for a rate is how a line is made to fit without being stretched."""
+    """Asking for a rate is how a line is made to fit without being stretched.
+
+    The rate has to arrive as a forward argument: ``VitsModel`` reads
+    ``config.speaking_rate`` into itself at construction, so setting the config
+    afterwards reaches nothing, and a test that watched the attribute would pass
+    while the model spoke at its own rhythm.
+    """
 
     _patch(monkeypatch)
     engine = MmsAmharicEngine(device="cpu", speaking_rate=1.2)
@@ -376,6 +414,48 @@ def test_the_speaking_rate_reaches_the_model(monkeypatch, tmp_path: Path) -> Non
     engine.synthesize(text="ሰላም", destination=tmp_path / "out.wav")
 
     assert FakeNetwork.speaking_rate_seen == 1.2
+
+
+def test_the_default_rate_is_still_passed_through(monkeypatch, tmp_path: Path) -> None:
+    """A build that takes the argument gets it every time, default included."""
+
+    _patch(monkeypatch)
+    engine = MmsAmharicEngine(device="cpu")
+
+    engine.synthesize(text="ሰላም", destination=tmp_path / "out.wav")
+
+    assert FakeNetwork.speaking_rate_seen == tts.DEFAULT_MMS_SPEAKING_RATE
+
+
+def test_a_rate_that_cannot_be_honoured_is_refused(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Better to fail than to speak at the wrong rate and say nothing.
+
+    A build without the argument would swallow it through ``**inputs``, so asking for
+    1.2 and silently getting 1.0 is the failure mode: it is reported at load time
+    instead.
+    """
+
+    _patch(monkeypatch, network=FakeNetworkWithoutRate)
+    engine = MmsAmharicEngine(device="cpu", speaking_rate=1.2)
+
+    with pytest.raises(EngineLoadError, match="speaking_rate"):
+        engine.synthesize(text="ሰላም", destination=tmp_path / "out.wav")
+
+
+def test_the_default_rate_never_needs_the_argument(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Nothing requested means nothing to honour, so an older build still runs."""
+
+    _patch(monkeypatch, network=FakeNetworkWithoutRate)
+    engine = MmsAmharicEngine(device="cpu")
+
+    engine.synthesize(text="ሰላም", destination=tmp_path / "out.wav")
+
+    assert FakeNetworkWithoutRate.speaking_rate_seen is None
+    assert (tmp_path / "out.wav").is_file()
 
 
 def test_the_model_is_loaded_once_for_many_lines(monkeypatch, tmp_path: Path) -> None:

@@ -205,9 +205,9 @@ DEFAULT_MMS_SAMPLE_RATE = 16_000
 DEFAULT_MMS_SEED = 0
 
 #: Speaking rate asked of the MMS duration predictor. ``1.0`` is the model's natural
-#: pace; VITS exposes this *before* synthesis, so a line can be made to fit its window
-#: by asking for a different speed rather than by time-stretching the result
-#: afterwards - which is what makes this engine less dependent on ``timing.py``.
+#: pace, and the value reaches the predictor through the forward call that reads it.
+#: It sets one delivery speed for the whole film rather than fitting each line: a line
+#: is still fitted to its own window by ``timing.py``.
 DEFAULT_MMS_SPEAKING_RATE = 1.0
 
 #: Name of the Seed-VC checkout inside ``MODEL_CACHE_DIR``. Seed-VC is not

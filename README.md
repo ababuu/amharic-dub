@@ -88,8 +88,12 @@ identity or performance reference, and `coverage` reports what the material
 exercised. Per-character voices require `TTS_ENGINE=chatterbox`.
 
 `MMS_SPEAKING_RATE` is asked of the model's duration predictor *before* synthesis,
-so a line can be made to fit its window without being time-stretched afterwards -
-which is why this engine leans on `timing.py` less than the Chatterbox path does.
+through the forward call that actually reads it, so the model is asked for a
+duration rather than the audio being stretched to reach one. It is a single
+delivery speed for the whole film, not a per-line fit: a rate of 1.2 makes every
+line roughly 16 % shorter and 0.8 roughly 16 % longer (measured), and each line
+still has to be fitted to its own window by `timing.py`. Per-line rate requests are
+the obvious next step here, and are not implemented.
 | Delivery (later)     | Bunny Stream                            |
 
 Target GPU: **NVIDIA RTX A40 (48 GB VRAM)**.
@@ -187,7 +191,7 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSLATION_MAX_NEW_TOKENS` | Longest NLLB output per chunk, in tokens | `512` |
 | `TTS_ENGINE`        | `mms` (single voice) or `chatterbox` (per character) | `mms` |
 | `MMS_SEED`          | Fixes the MMS duration predictor, so a line is the same length every run | `0` |
-| `MMS_SPEAKING_RATE` | Rate asked of the MMS duration predictor before synthesis | `1.0` |
+| `MMS_SPEAKING_RATE` | Delivery speed for the whole film, asked of the MMS duration predictor before synthesis (`1.2` is ~16% faster; measured, not assumed) | `1.0` |
 | `CHATTERBOX_MODEL`  | The Amharic adapter used when `TTS_ENGINE=chatterbox` | `gabar-tech/chatterbox-amharic` |
 | `TRANSLATION_BASE_URL` | OpenAI-compatible endpoint (only for `TRANSLATION_BACKEND=openai`) | `https://api.deepseek.com` |
 | `TRANSLATION_BATCH_SIZE` | Dialogue lines adapted per request           | `10`               |
