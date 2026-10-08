@@ -5,14 +5,13 @@ original music and sound effects. The soundtrack is split into dialogue, music,
 and effects; the dialogue is transcribed, translated/adapted, re-voiced with
 cloned voices, re-timed, and mixed back with the untouched music and effects.
 
-> **Status: scaffold + separation + diarization + transcription + adaptation +
-> voice profiles + speech synthesis.** This repository contains the project
-> structure, the configuration system, the BandIt v2 Multi source-separation
-> stage, the pyannote Community-1 speaker diarization stage, the faster-whisper
-> transcription stage, the DeepSeek dialogue-adaptation stage, the per-speaker
-> voice-profile stage, the Chatterbox Amharic + Seed-VC V2 speech-synthesis
-> stage, and a health-check script. The remaining AI pipeline stages are
-> placeholders that document their intended interfaces. See [Roadmap](#roadmap).
+> **Status: the pipeline is complete end to end and produces a dubbed MP4.** The
+> soundtrack is split into dialogue, music and effects; the dialogue is
+> diarized, transcribed, adapted into spoken Amharic, voiced per character, fitted
+> to the original timings, re-mixed under the untouched music and effects, and
+> muxed back into the video with the picture copied rather than re-encoded. A
+> single command drives all of it. See [Roadmap](#roadmap) for what is
+> deliberately left for later.
 
 ---
 
@@ -66,7 +65,9 @@ image**. That image already provides the heavy parts of the stack:
 Because of that, this repository deliberately contains **no container or
 deployment artifacts** (no Dockerfile, Compose file, or lockfile), and it does
 not install or pin a CUDA/PyTorch stack of its own. Only the application's own
-dependencies are installed, from `requirements.txt`.
+dependencies are installed, from `requirements.txt` - see
+[Quickstart](#quickstart---runpod-a40-worker) for why that is done through
+`scripts/install_dependencies.sh` rather than a plain `pip install`.
 
 ## Project structure
 
@@ -83,15 +84,19 @@ amharic-dub/
       translation.py          # DeepSeek Amharic dialogue adaptation (implemented)
       voice_profiles.py       # per-speaker voice references + clone-prompt cache (implemented)
       tts.py                  # Chatterbox Amharic + Seed-VC V2 synthesis (implemented)
-      timing.py
-      mixing.py
-      video.py
+      timing.py               # pitch-preserving fit to the original timings (implemented)
+      mixing.py               # dialogue over ducked music + effects (implemented)
+      video.py                # FFmpeg extraction + mux into a dubbed MP4 (implemented)
+      orchestrator.py         # runs every stage and produces the deliverable (implemented)
     models/                   # shared model loading/caching (placeholder)
     audio/                    # audio IO + DSP helpers (placeholder)
     utils/                    # logging, subprocess, manifests (placeholder)
   tests/                      # pytest suite
   scripts/
-    check_environment.py      # runtime health check (implemented)
+    check_environment.py      # runtime health check; --full is the session pre-flight
+    install_dependencies.sh   # worker install, including the Chatterbox --no-deps step
+    validate_models.py        # loads each model on its own and reports the result
+    test_gpu.py               # end-to-end run of the implemented stages
   data/
     input/                    # source videos (not committed)
     working/                  # intermediate artifacts (not committed), including
@@ -131,6 +136,10 @@ environment, so values configured on the RunPod pod always win.
 | `VOICE_REFERENCE_MIN_DURATION` | Shortest usable voice-cloning reference  | `3.0`              |
 | `VOICE_REFERENCE_TARGET_DURATION` | Preferred reference length            | `10.0`             |
 | `VOICE_REFERENCE_MAX_DURATION` | Longest reference kept (a longer continuous turn is scanned with a sliding window) | `15.0` |
+| `TIMING_MIN_TEMPO` | Slowest a line may be stretched to fit its window | `0.80` |
+| `TIMING_MAX_TEMPO` | Fastest a line may be stretched to fit its window | `1.25` |
+| `MIX_DIALOGUE_GAIN_DB` | Dialogue level in the final mix (signed dB)     | `0.0`              |
+| `MIX_DUCK_DB`       | How far music/effects are ducked under dialogue    | `6.0`              |
 | `DEVICE`            | `cuda` on a GPU worker, `cpu` for CPU-only checks   | `cuda`             |
 | `LOG_LEVEL`         | `DEBUG` / `INFO` / `WARNING` / `ERROR`              | `INFO`             |
 
@@ -143,16 +152,91 @@ cp .env.example .env   # then edit .env and fill in real values
 
 ## Quickstart - RunPod A40 worker
 
-Start a Pod from the official RunPod PyTorch image, then:
+The pipeline runs on a GPU worker; the repository is Git-based, so the runbook is
+clone, secrets, weights, validate, run. **Everything before the last step is the
+one-time setup**; after that a run is a single command.
+
+**1. Create the Pod.** From the official RunPod PyTorch image
+(`runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, which provides Python 3.12,
+PyTorch 2.8, CUDA 12.8 and FFmpeg) on an A40, with a **network volume mounted at
+`/workspace`**. The volume is what you actually want: without one, every session
+re-downloads many gigabytes of weights before doing any work.
+
+**2. Clone and configure.** Set the two secrets, and point the model caches at the
+volume. Exporting them in the environment is enough - they do not have to go into
+a file, and they must never be committed:
 
 ```bash
-pip install -r requirements.txt
-python scripts/check_environment.py
+git clone <your fork> /workspace/amharic-dub
+cd /workspace/amharic-dub
+export DEEPSEEK_API_KEY=...                 # dialogue adaptation
+export HUGGINGFACE_TOKEN=hf_...             # gated pyannote Community-1 weights
+export HF_HOME=/workspace/models_cache      # BEFORE any Hugging Face import
+export MODEL_CACHE_DIR=/workspace/models_cache
+git clone https://github.com/Plachtaa/seed-vc /workspace/seed-vc
+export SEED_VC_REPO_PATH=/workspace/seed-vc
+```
+
+`HUGGINGFACE_TOKEN` only works if that account has accepted the conditions on the
+[pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
+model page. `HF_HOME` is frozen when `huggingface_hub` is first imported, so it
+has to be exported before Python starts, not inside the script.
+
+**3. Install.** Do not install with a plain `pip install -r requirements.txt`: the
+Chatterbox entry pins `torch==2.6.0`, `torchaudio==2.6.0` and `numpy<2`, and
+resolving it would replace the CUDA-matched PyTorch 2.8 the image provides and
+downgrade NumPy below what pyannote needs. `scripts/install_dependencies.sh`
+installs everything except Chatterbox first, then Chatterbox with `--no-deps`, and
+finally imports every runtime module to prove the result is usable:
+
+```bash
+bash scripts/install_dependencies.sh
+```
+
+Everything Chatterbox's code actually imports is declared in `requirements.txt`
+instead, which is why the manifest lists `s3tokenizer`, `conformer`, `diffusers`
+and the Perth watermarker alongside `peft` and `safetensors`. `pip check` will
+still report Chatterbox's metadata as unsatisfied: that conflict is known and
+intentional, and nothing should be downgraded because of it.
+
+**4. Pre-flight, then validate the models stage by stage.**
+
+```bash
+python scripts/check_environment.py --full
+python scripts/validate_models.py
 ```
 
 `scripts/check_environment.py` reports the Python version, the PyTorch version,
-CUDA availability, GPU name, available VRAM, and FFmpeg availability. It needs
-no credentials and downloads nothing, so it is safe to run first.
+CUDA availability, GPU name, available VRAM, and FFmpeg availability. It needs no
+credentials and downloads nothing, so it is safe to run first. With `--full` it
+becomes the session pre-flight: it also checks both credentials (flagging a value
+that is still the `.env.example` placeholder), the Seed-VC checkout and its
+`configs/v2/vc_wrapper.yaml`, and every module the stages import at run time.
+
+`scripts/validate_models.py` loads each model **on its own** - BandIt, pyannote,
+faster-whisper, the DeepSeek client, the Chatterbox adapter, the Seed-VC wrapper -
+reports the result for each, and releases it before the next one, so a failure
+names exactly one component instead of surfacing halfway through a run after other
+weights have already been downloaded. `--only chatterbox` (or any comma-separated
+subset) re-checks a single component. Because every step but the runtime report
+downloads real weights, the script refuses to run on a machine where torch reports
+no CUDA device unless `--allow-cpu` is passed, so a development box cannot quietly
+fill its disk with checkpoints.
+
+**5. Run it.** On a small test clip first, then the film:
+
+```bash
+python scripts/test_gpu.py --video data/input/test.mp4   # per-stage report
+python -m app.pipeline.orchestrator data/input/test.mp4  # the deliverable
+python -m app.pipeline.orchestrator data/input/movie.mp4 # the film
+```
+
+`test_gpu.py` stops after speech synthesis on purpose - it validates the GPU stages
+and prints what each produced - while the orchestrator continues through timing,
+mixing and muxing and writes the dubbed MP4. The orchestrator reuses the clips the
+runner already wrote, so running both costs one round of synthesis, not two. For a
+first look at a long film, `--max-lines 5` voices only the first few lines and
+produces a partial dub.
 
 Model weights (BandIt, pyannote, faster-whisper, Chatterbox, Seed-VC) are **not**
 part of this repository. They are downloaded at runtime into `MODEL_CACHE_DIR`;
@@ -213,7 +297,14 @@ Two engines run per line, in this order:
    loaded through the loader the adapter repository ships
    (`amharic_tts.py` → `load_amharic_tts`), so training and inference see the
    same text front-end - including the Amharic normalization and sentence
-   splitting.
+   splitting. The adapter's loader downloads the base checkpoint from
+   `ResembleAI/chatterbox` at the revision the *adapter* pins, which is not the
+   revision `requirements.txt` installs the code from; the loader validates the
+   checkpoint against the installed build and raises if the two disagree, so a
+   mismatch is reported rather than producing a wrong voice. Note also that
+   `chatterbox-tts` is installed with `--no-deps` (see
+   [Quickstart](#quickstart---runpod-a40-worker)): the packages its code needs are
+   declared in `requirements.txt` instead.
 2. **Seed-VC V2** converts that take into the character's identity with
    `convert_style=True`, which keeps the take's accent and emotion and replaces
    only the timbre. Seed-VC is not a package, so clone it and point
@@ -267,6 +358,74 @@ Chatterbox adapter, its pinned base model and the loader file are snapshotted
 into `MODEL_CACHE_DIR`; Seed-VC's own downloads follow `HF_HOME` (see
 [Quickstart](#quickstart---runpod-a40-worker)).
 
+### Timing, mixing and muxing (`timing.py`, `mixing.py`, `video.py`)
+
+Alignment fits each line to the window of the line it replaces. Only the **speech**
+is time-stretched, with FFmpeg's pitch-preserving `atempo`; the rendered pauses
+keep their length, and a line's leading pause shifts the file rather than the line,
+so the speech still lands on its original start. A line that would need more than
+the `TIMING_MIN_TEMPO`/`TIMING_MAX_TEMPO` band is clamped and **reported** as not
+fitting - the run records by how much, in the manifest - because mangling a
+performance to fit a window is worse than being 0.4 s long. `atempo` accepts
+0.5-2.0, so a wider band is rejected rather than passed through.
+
+Mixing places every aligned line at its own timestamp into a continuous dialogue
+stem, then sums that with the **music and effects only**. The original English
+dialogue is never used: separation already removed it, and mixing the full
+original mix back in would reintroduce the language the pipeline exists to
+replace. Overlaps are kept - the original performances overlapped too, and moving
+a line would break its sync - and every overlap is reported with its speaker pair
+and duration. The bed is ducked under the dialogue by `MIX_DUCK_DB` with a ramped
+reduction, so it never gates or clicks, and only the bed is reduced. The mix is
+then held under a -1 dBFS ceiling; if that needs a global scale-down, the
+reduction and the peak that caused it are reported.
+
+Loudness normalization (EBU R128) is deliberately **not** applied: the mix is
+placed at a defined peak with defined dialogue and bed levels so it stays
+reproducible and auditable, and a programme-loudness pass belongs with the encode
+of the deliverable rather than with the mix.
+
+Muxing copies every video stream and encodes exactly one audio track: AAC at
+48 kHz stereo, tagged `language=amh`. The source's own audio streams are **not**
+mapped, which is what removes the English dialogue. Both inputs and the result are
+inspected with `ffprobe` rather than trusted - the video codec, the audio codec,
+rate and channel count, the stream counts and the duration are all verified, and
+any mismatch is reported rather than assumed away. This is the check missing from
+an earlier attempt that muxed a 48 kHz track into a video whose audio was around
+44.1 kHz and produced decode errors.
+
+### Running the whole pipeline (`orchestrator.py`)
+
+One command runs every stage in order and writes the deliverable:
+
+```bash
+python -m app.pipeline.orchestrator data/input/movie.mp4
+python -m app.pipeline.orchestrator movie.mp4 --out runs/movie --max-lines 5
+```
+
+The extracted track and the three stems go under `<run dir>/stages/`, the manifest
+is `<run dir>/manifest.json`, the mix artifacts are under `<run dir>/mix/`, and
+the dubbed video is `<run dir>/<source stem>_amharic.mp4`. The run directory
+defaults to `<OUTPUT_DIR>/<source stem>`. Voice profiles and the TTS artifacts
+stay in their configured `WORK_DIR` locations rather than moving per run, because
+both are content-addressed and are meant to be reused: re-running re-synthesizes
+only the lines whose text, timing or performance actually changed.
+
+`--max-lines N` synthesizes only the first `N` adapted lines. It is a cost control
+for the first run of a long film, and it produces a **partial dub**: every earlier
+stage still runs in full, the manifest records `partial: true`, and the report
+says so.
+
+The manifest records what each stage produced, including per-line stretch factors
+and fit residuals, the overlaps the mix found, the peak and any scale-down, and
+what was verified about the delivered file - so a run can be audited without
+re-listening to it.
+
+`scripts/test_gpu.py` is the same chain as a reporting runner. It stops after
+speech synthesis on purpose: it exists to validate the GPU stages on a new
+machine, and the stages after it need no GPU. Run the orchestrator afterwards to
+get the MP4 - it reuses the clips the runner already wrote.
+
 ### Configuration-only check (no GPU or API keys required)
 
 The configuration layer and its tests run on any machine with Python 3.12:
@@ -285,10 +444,11 @@ pytest tests/test_config.py
 - [x] `translation`: DeepSeek Amharic dialogue adaptation
 - [x] `voice_profiles`: per-speaker voice references and clone-prompt cache
 - [x] `tts`: Chatterbox Amharic synthesis + Seed-VC V2 voice adaptation
-- [ ] `video`: FFmpeg extract/mux helpers
-- [ ] `timing`: speaking-rate alignment
-- [ ] `mixing`: dialogue + music + effects re-mix
-- [ ] Orchestrator + pipeline entry point
+- [x] `timing`: pitch-preserving fit to the original windows
+- [x] `mixing`: dialogue over ducked music and effects
+- [x] `video`: FFmpeg extraction and mux into a dubbed MP4
+- [x] Orchestrator: one command from a video to the deliverable
+- [ ] EBU R128 loudness normalization on the delivered audio
 - [ ] Bunny Stream upload/streaming integration
 - [ ] (Later) production API + database
 

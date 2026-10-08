@@ -4,9 +4,9 @@ The pipeline is a linear sequence of independent stages. Each stage lives in its
 own module and communicates only through files in ``WORK_DIR`` plus a small
 manifest, so stages can be re-run, cached, and debugged in isolation.
 
-Planned stage order
--------------------
-1. ``video``         - extract audio from the source video, later mux the dub back.
+Stage order
+-----------
+1. ``video``         - extract the audio from the source video; mux the dub back later.
 2. ``separation``    - split the soundtrack into dialogue / music / effects stems.
 3. ``diarization``   - identify who spoke when.
 4. ``transcription`` - transcribe the dialogue stem with timestamps.
@@ -16,9 +16,14 @@ Planned stage order
 8. ``timing``        - align synthesized speech to the original timings.
 9. ``mixing``        - combine dubbed dialogue with the music/effects stems.
 
-TODO: implement a thin orchestrator (e.g. ``run_pipeline(source)``) that chains
-the stages above, emits progress, and resumes from cached artifacts. Do not add
-that orchestrator until at least one stage is implemented.
+Steps 1-9 are implemented and are chained by
+:func:`app.pipeline.orchestrator.run_pipeline`, which is the single entry point for
+a run:
+
+    python -m app.pipeline.orchestrator data/input/movie.mp4
+
+The deliverable is a dubbed MP4: the original picture, copied rather than
+re-encoded, with the Amharic dialogue track in place of the English one.
 """
 
 __all__: list[str] = []

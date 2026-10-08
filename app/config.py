@@ -133,6 +133,25 @@ DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION = 12.0
 #: dub.
 DEFAULT_TTS_MAX_PAUSE_SECONDS = 2.0
 
+#: How far a line's delivery may be time-stretched to fit the window of the
+#: original line, as a tempo factor. A factor below 1 slows the line down, above
+#: 1 speeds it up, and both are pitch-preserving. The band is deliberately narrow:
+#: a line that needs more than a quarter faster or a fifth slower is reported as
+#: not fitting rather than being mangled to fit. FFmpeg's ``atempo`` filter only
+#: accepts factors between 0.5 and 2.0, which bounds any configuration here.
+DEFAULT_TIMING_MIN_TEMPO = 0.80
+DEFAULT_TIMING_MAX_TEMPO = 1.25
+
+#: Level of the dubbed dialogue in the final mix, in dB relative to the clips the
+#: TTS stage produced. Never a boost by default: the dialogue was generated at a
+#: consistent level, so raising it here would only invite clipping.
+DEFAULT_MIX_DIALOGUE_GAIN_DB = 0.0
+
+#: How far the music and effects are ducked while dialogue is playing, in dB. The
+#: reduction is smoothed, so it follows the dialogue instead of gating it, and it
+#: is applied to the bed only - never to the dialogue itself.
+DEFAULT_MIX_DUCK_DB = 6.0
+
 
 def load_env_file(path: Optional[Path] = None) -> None:
     """Load a ``.env`` file without overriding existing environment variables.
@@ -236,6 +255,27 @@ def _read_float(name: str, default: float) -> float:
     return value
 
 
+def _read_signed_float(name: str, default: float) -> float:
+    """Return an environment value as a finite float of either sign, or ``default``.
+
+    Levels are naturally signed - a gain of ``0`` means "leave it alone" and a
+    negative one attenuates - so they cannot use :func:`_read_float`.
+    """
+
+    raw = _read_env(name)
+    if raw is None:
+        return default
+
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {raw!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     """Resolved, immutable runtime settings for the dubbing pipeline."""
@@ -278,6 +318,14 @@ class Settings:
         DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION
     )
     tts_max_pause_seconds: float = DEFAULT_TTS_MAX_PAUSE_SECONDS
+    #: Timing settings for :mod:`app.pipeline.timing`: the tempo band a line may
+    #: be stretched within to fit its original window.
+    timing_min_tempo: float = DEFAULT_TIMING_MIN_TEMPO
+    timing_max_tempo: float = DEFAULT_TIMING_MAX_TEMPO
+    #: Mix settings for :mod:`app.pipeline.mixing`: the dialogue level and how far
+    #: the music and effects are ducked under it.
+    mix_dialogue_gain_db: float = DEFAULT_MIX_DIALOGUE_GAIN_DB
+    mix_duck_db: float = DEFAULT_MIX_DUCK_DB
 
     # -- construction -------------------------------------------------------
     @classmethod
@@ -351,6 +399,12 @@ class Settings:
             tts_max_pause_seconds=_read_float(
                 "TTS_MAX_PAUSE_SECONDS", DEFAULT_TTS_MAX_PAUSE_SECONDS
             ),
+            timing_min_tempo=_read_float("TIMING_MIN_TEMPO", DEFAULT_TIMING_MIN_TEMPO),
+            timing_max_tempo=_read_float("TIMING_MAX_TEMPO", DEFAULT_TIMING_MAX_TEMPO),
+            mix_dialogue_gain_db=_read_signed_float(
+                "MIX_DIALOGUE_GAIN_DB", DEFAULT_MIX_DIALOGUE_GAIN_DB
+            ),
+            mix_duck_db=_read_signed_float("MIX_DUCK_DB", DEFAULT_MIX_DUCK_DB),
         )
 
     # -- helpers ------------------------------------------------------------
@@ -421,6 +475,10 @@ class Settings:
                 self.tts_performance_reference_max_duration
             ),
             "tts_max_pause_seconds": self.tts_max_pause_seconds,
+            "timing_min_tempo": self.timing_min_tempo,
+            "timing_max_tempo": self.timing_max_tempo,
+            "mix_dialogue_gain_db": self.mix_dialogue_gain_db,
+            "mix_duck_db": self.mix_duck_db,
         }
 
 
@@ -433,6 +491,8 @@ def get_settings() -> Settings:
 
 __all__ = [
     "DEFAULT_DIARIZATION_MODEL",
+    "DEFAULT_MIX_DIALOGUE_GAIN_DB",
+    "DEFAULT_MIX_DUCK_DB",
     "DEFAULT_SEED_VC_DIFFUSION_STEPS",
     "DEFAULT_SEED_VC_REPO_NAME",
     "DEFAULT_TRANSCRIPTION_COMPUTE_TYPE",
@@ -444,6 +504,8 @@ __all__ = [
     "DEFAULT_TTS_MODEL",
     "DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
     "DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
+    "DEFAULT_TIMING_MAX_TEMPO",
+    "DEFAULT_TIMING_MIN_TEMPO",
     "DEFAULT_VOICE_PROFILE_DIR",
     "DEFAULT_VOICE_REFERENCE_MAX_DURATION",
     "DEFAULT_VOICE_REFERENCE_MIN_DURATION",

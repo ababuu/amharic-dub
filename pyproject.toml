@@ -25,8 +25,9 @@ dependencies = [
 
   # --- Pipeline models -------------------------------------------------------
   # BandIt v2 Multi - cinematic audio source separation.
-  # Not published on PyPI; requirements.txt installs it from GitHub.
-  "bandit-infer",
+  # Not published on PyPI, so it is referenced by its repository, exactly as in
+  # requirements.txt; pip installs it from there.
+  "bandit-infer @ git+https://github.com/openmirlab/bandit-infer@main",
   # pyannote Community-1 - speaker diarization.
   "pyannote.audio==4.0.7",
   # faster-whisper large-v3 - transcription (CTranslate2 backend).
@@ -40,6 +41,23 @@ dependencies = [
   "peft",
   "safetensors",
   "huggingface_hub",
+  # chatterbox-tts is installed with --no-deps (see
+  # scripts/install_dependencies.sh), so the packages its code imports and that
+  # nothing else provides are declared here, read from its pinned sources:
+  # s3tokenizer (s3gen), conformer and diffusers (matcha), and the perth
+  # watermarker, which Chatterbox takes from its git master (1.1.0) because PyPI
+  # only carries 1.0.1. Its dependencies are all satisfied by this stack, so it
+  # never rewrites the pinned torch line. `einops`, `tqdm` and `scipy` are needed
+  # by those files too and are declared with Seed-VC below; `tokenizers`, `onnx`
+  # and `accelerate` arrive as dependencies of packages listed here.
+  "s3tokenizer",
+  "conformer==0.3.2",
+  # Held at the release Chatterbox was built against: its matcha/transformer.py
+  # uses LoRACompatibleLinear, which later releases kept only as a deprecated
+  # shim, and current diffusers requires huggingface-hub>=1.32.0, which would
+  # force a major upgrade of a library both the Chatterbox and Seed-VC paths use.
+  "diffusers==0.29.0",
+  "resemble-perth @ git+https://github.com/resemble-ai/Perth.git@master",
   # Seed-VC V2 - voice conversion (accent/emotion preserved, timbre replaced).
   # Seed-VC is not a package: clone it and point SEED_VC_REPO_PATH at it. Only
   # the libraries its V2 wrapper is instantiated with are listed here; the
@@ -47,13 +65,28 @@ dependencies = [
   # PyTorch than this project uses.
   "hydra-core",
   "pyyaml",
+  # hydra's config objects: `app.pipeline.tts` imports `DictConfig` directly.
+  "omegaconf",
+  # The rest of the V2 wrapper's import closure, read from its sources.
+  # `configs/v2/vc_wrapper.yaml` instantiates modules that import these at
+  # module scope, so the wrapper cannot be built without them.
+  "librosa",
+  "pydub",
+  "transformers",
+  "einops",
+  "scipy",
+  "munch",
+  "tqdm",
+  "matplotlib",
 
   # --- Dialogue adaptation / translation client -----------------------------
   "openai",
 
   # --- Audio I/O and numerics ----------------------------------------------
   "soundfile",
-  "numpy",
+  # NumPy 2.x is the verified baseline (the pyannote stack requires it); the
+  # upper bound only stops a transitive resolver from pulling a 3.x release.
+  "numpy>=2,<3",
 
   # --- Configuration --------------------------------------------------------
   "python-dotenv",

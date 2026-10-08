@@ -10,21 +10,73 @@ built from the official RunPod PyTorch image) or on a local machine:
 * GPU name and available VRAM (only if CUDA is available)
 * FFmpeg availability
 
-The script never calls an external API and needs no credentials, so it is safe
-to run before anything is configured. Exit code is ``0`` when no blocking
-problem is found and ``1`` otherwise.
+With ``--full`` it also runs the pre-flight checks that must pass before a paid
+GPU session is started:
+
+* the credentials the pipeline needs, including a warning when a value is still
+  the placeholder copied from ``.env.example``
+* the Seed-VC checkout and the ``configs/v2/vc_wrapper.yaml`` the TTS stage runs
+* every third-party module the stages import at run time
+
+The script never calls an external API and never downloads a model, so it is safe
+to run before anything is configured. Exit code is ``0`` when no blocking problem
+is found and ``1`` otherwise.
 """
 
 from __future__ import annotations
 
+import argparse
 import platform
 import shutil
 import subprocess
 import sys
+from pathlib import Path
+
+# Invoking this file directly puts ``scripts/`` on ``sys.path`` rather than the
+# project root, so the ``app`` package is made importable explicitly. It also
+# lets ``scripts/install_dependencies.sh`` reuse the import list below.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 MIN_PYTHON = (3, 12)
 BYTES_PER_GIB = 1024**3
 SEPARATOR = "-" * 60
+
+#: Top-level import name -> the part of the pipeline that needs it. Kept here,
+#: rather than in each script, so the installer's smoke check and this pre-flight
+#: can never disagree about what has to be importable.
+RUNTIME_MODULES: dict[str, str] = {
+    "torch": "runtime",
+    "torchaudio": "runtime",
+    "numpy": "runtime",
+    "soundfile": "audio I/O",
+    "av": "faster-whisper decoding",
+    "torchcodec": "pyannote.audio",
+    "dotenv": "configuration",
+    "openai": "translation",
+    "faster_whisper": "transcription",
+    "pyannote.audio": "diarization",
+    "bandit_infer": "separation",
+    "hydra": "Seed-VC",
+    "omegaconf": "Seed-VC",
+    "yaml": "Seed-VC",
+    "librosa": "Seed-VC / Chatterbox",
+    "pydub": "Seed-VC",
+    "transformers": "Seed-VC / Chatterbox",
+    "einops": "Seed-VC",
+    "scipy": "Seed-VC",
+    "munch": "Seed-VC",
+    "tqdm": "Seed-VC",
+    "matplotlib": "Seed-VC (BigVGAN)",
+    "peft": "Chatterbox Amharic adapter",
+    "safetensors": "Chatterbox Amharic adapter",
+    "huggingface_hub": "model downloads",
+    "chatterbox": "speech synthesis",
+}
+
+#: The Seed-VC file the TTS stage instantiates its converter from.
+SEED_VC_CONFIG = Path("configs") / "v2" / "vc_wrapper.yaml"
 
 
 def format_gib(num_bytes: float) -> str:
@@ -112,7 +164,6 @@ def check_torch() -> bool:
 
 def check_ffmpeg() -> bool:
     """Report whether FFmpeg is available on ``PATH``."""
-
     executable = shutil.which("ffmpeg")
     if executable is None:
         print("FFmpeg: not found on PATH  [FAIL]")
@@ -139,7 +190,131 @@ def check_ffmpeg() -> bool:
     return True
 
 
-def main() -> int:
+def _env_example_placeholders() -> dict[str, str]:
+    """Return the placeholder values shipped in ``.env.example``.
+
+    A ``.env`` copied from the example but never filled in would otherwise look
+    configured, so the pre-flight compares against these values instead of only
+    checking that a credential is non-empty. Unreadable files yield no
+    placeholders rather than an error: this is a helpful check, not a hard
+    prerequisite.
+    """
+
+    example = PROJECT_ROOT / ".env.example"
+    if not example.is_file():
+        return {}
+
+    placeholders: dict[str, str] = {}
+    for line in example.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, _, value = stripped.partition("=")
+        value = value.strip()
+        if value:
+            placeholders[name.strip()] = value
+    return placeholders
+
+
+def check_credentials() -> bool:
+    """Report the pipeline credentials, flagging unedited ``.env`` placeholders.
+
+    Both credentials are needed only by one stage each, but both are needed
+    before a GPU session is worth starting, so ``--full`` treats them as blocking.
+    """
+
+    from app.config import get_settings
+
+    settings = get_settings()
+    placeholders = _env_example_placeholders()
+    configured = {
+        "DEEPSEEK_API_KEY": settings.deepseek_api_key,
+        "HUGGINGFACE_TOKEN": settings.huggingface_token,
+    }
+
+    healthy = True
+    for name, value in configured.items():
+        if not value:
+            print(f"{name}: not set  [FAIL]")
+            healthy = False
+        elif value == placeholders.get(name):
+            print(f"{name}: still the .env.example placeholder  [FAIL]")
+            healthy = False
+        else:
+            print(f"{name}: set  [OK]")
+
+    if settings.huggingface_token and settings.huggingface_token != placeholders.get(
+        "HUGGINGFACE_TOKEN"
+    ):
+        print("        - a set token still fails if its account has not accepted the")
+        print("          conditions on the pyannote/speaker-diarization-community-1")
+        print("          model page")
+
+    return healthy
+
+
+def check_seed_vc() -> bool:
+    """Report whether the Seed-VC checkout the TTS stage runs is usable."""
+
+    from app.config import get_settings
+
+    repo = Path(get_settings().seed_vc_repo_path)
+    if not repo.is_dir():
+        print(f"Seed-VC checkout: {repo}  [FAIL] (not a directory)")
+        print("        - git clone https://github.com/Plachtaa/seed-vc " + str(repo))
+        return False
+
+    config = repo / SEED_VC_CONFIG
+    if not config.is_file():
+        print(f"Seed-VC checkout: {repo}  [FAIL] (no {SEED_VC_CONFIG})")
+        return False
+
+    print(f"Seed-VC checkout: {repo}  [OK]")
+    return True
+
+
+def check_runtime_imports() -> bool:
+    """Import every third-party module the stages need, and report the failures.
+
+    Every import here is top level and none of them downloads a model, so this is
+    the cheapest way to find a package that is missing *before* a stage reaches it
+    halfway through a run.
+    """
+
+    import importlib
+
+    failures: list[tuple[str, str, str]] = []
+    for name, needed_by in RUNTIME_MODULES.items():
+        try:
+            importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001 - report every failure, never stop
+            failures.append((name, needed_by, f"{type(exc).__name__}: {exc}"))
+
+    if failures:
+        for name, needed_by, error in failures:
+            print(f"  FAIL  {name:<16} ({needed_by}): {error}")
+        print(
+            f"Runtime imports: {len(failures)} of {len(RUNTIME_MODULES)} failed  "
+            "[FAIL]"
+        )
+        print("        - run: bash scripts/install_dependencies.sh")
+        return False
+
+    print(f"Runtime imports: all {len(RUNTIME_MODULES)} available  [OK]")
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Report the runtime prerequisites of the dubbing pipeline."
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="also check credentials, the Seed-VC checkout and every runtime import",
+    )
+    args = parser.parse_args(argv)
+
     print("Amharic dubbing pipeline - environment health check")
     print(SEPARATOR)
     print(f"Platform: {platform.system()} {platform.release()} ({platform.machine()})")
@@ -149,6 +324,12 @@ def main() -> int:
         "PyTorch": check_torch(),
         "FFmpeg": check_ffmpeg(),
     }
+
+    if args.full:
+        print(SEPARATOR)
+        checks["Credentials"] = check_credentials()
+        checks["Seed-VC"] = check_seed_vc()
+        checks["Runtime imports"] = check_runtime_imports()
 
     print(SEPARATOR)
     failures = [name for name, healthy in checks.items() if not healthy]

@@ -40,6 +40,9 @@ data/working/*
 data/output/*
 !data/output/.gitkeep
 
+# Run directories written by `--out` (the README's `runs/<name>` example).
+runs/
+
 # ---------------------------------------------------------------------------
 # Model weights and caches (downloaded at runtime, never committed)
 # ---------------------------------------------------------------------------

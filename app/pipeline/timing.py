@@ -1,22 +1,594 @@
 """Timing alignment for dubbed dialogue.
 
-Planned responsibility
-----------------------
-Make each synthesized Amharic clip fit the time window of the original line:
+Each synthesized clip is fitted to the window of the line it replaces:
 
-* estimate a speaking-rate factor and time-stretch (pitch-preserving) the clip;
-* insert small silence so lines do not overlap or start too early;
-* flag lines that simply cannot fit and send them back for re-translation.
+* the **speech** of the line is time-stretched, pitch-preserving, to the length of
+  the original line, so the dub lands on the same beats as the performance;
+* the **rendered pauses** are left alone - they are deliberate silence, not slack
+  to be absorbed - so a line's leading pause still precedes the line;
+* a line that would need more than the configured tempo band is **reported** as
+  not fitting rather than mangled to fit, and the run records by how much.
 
-Interfaces (to be implemented)
-------------------------------
-* Input : TTS clips + original utterance timings.
-* Output: time-aligned clips ready for :mod:`app.pipeline.mixing`.
+The result of this stage is one aligned WAV per line at the pipeline sample rate,
+plus where to place it in the timeline, which is exactly what
+:mod:`app.pipeline.mixing` consumes.
 
-TODO: use a pitch-preserving stretcher (FFmpeg ``atempo`` or a dedicated DSP
-      library) rather than naive resampling.
-TODO: keep an auditable report of stretch factors per line for QA.
-TODO: expose an alignment function. No stub implementation yet.
+Deliberate non-goals
+--------------------
+* **No resampling for change of speed.** Speed is changed with FFmpeg's
+  ``atempo``, which preserves pitch; resampling a clip to change its length would
+  shift every voice up or down, which is never wanted.
+* **No fitting across the tempo band.** Nothing here silently rewrites what the
+  dialogue model asked for: a clamped stretch is recorded on the clip.
+* **No padding to fill a window.** A short line keeps its natural delivery and is
+  placed at its original start; the gap that follows is silence, not stretched
+  speech.
+* **No touching of the clip files.** The clips remain the TTS stage's artifacts;
+  the aligned audio is written beside them.
 """
 
-__all__: list[str] = []
+from __future__ import annotations
+
+import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import soundfile as sf
+
+from app.config import Settings, get_settings
+from app.pipeline.tts import TtsClip
+from app.pipeline.voice_profiles import portable_path
+
+#: Every stage after separation works at BandIt's 48 kHz, so no stage has to
+#: resample another stage's output. ``tests/test_timing.py`` keeps this in step
+#: with ``separation.REQUIRED_SAMPLE_RATE`` and ``video.PIPELINE_SAMPLE_RATE``.
+PIPELINE_SAMPLE_RATE = 48_000
+
+#: Directory (under the work directory) holding the aligned clips.
+TIMING_DIRECTORY_NAME = "timing"
+
+#: Sub-directory of :data:`TIMING_DIRECTORY_NAME` holding the aligned lines.
+ALIGNED_DIRECTORY_NAME = "aligned"
+
+#: A residual this small is not worth a filter: it is below both the ear's sense
+#: of lip-sync and FFmpeg's own rounding of a tempo change.
+EXACT_FIT_TOLERANCE_SECONDS = 0.03
+
+#: ``atempo`` only accepts factors inside this range, so a configuration outside
+#: it is rejected instead of producing an unusable filter argument.
+ATEMPO_MIN = 0.5
+ATEMPO_MAX = 2.0
+
+
+class TimingError(RuntimeError):
+    """Base class for every error raised by this module."""
+
+
+class ConfigurationError(TimingError, ValueError):
+    """The tempo bounds contradict FFmpeg or each other."""
+
+
+class InvalidClipError(TimingError, ValueError):
+    """A clip is not the :class:`~app.pipeline.tts.TtsClip` this stage needs."""
+
+
+class MissingInputError(TimingError):
+    """A clip's audio file, or the configured output directory, is unusable."""
+
+
+class MissingFfmpegError(TimingError):
+    """FFmpeg is not on ``PATH``."""
+
+
+class StretchError(TimingError):
+    """FFmpeg failed to stretch a line, or produced something unusable."""
+
+
+class InvalidAudioError(TimingError):
+    """A clip, or a stretched result, is not usable audio."""
+
+
+@dataclass(frozen=True, slots=True)
+class AlignedClip:
+    """One line, stretched to fit and placed on the source timeline.
+
+    ``start`` is where the file begins, already accounting for the leading pause,
+    so ``start`` is earlier than the original line's own start by exactly
+    ``rendered_pause_before``. ``required_tempo`` is what an exact fit would have
+    needed and ``tempo`` is what was applied: the two differ only for a line that
+    did not fit, which is why both are kept.
+    """
+
+    index: int
+    clip: TtsClip
+    audio_path: Path
+    sample_rate: int
+    start: float
+    tempo: float
+    required_tempo: float
+    speech_duration: float
+    original_window: float
+    rendered_pause_before: float
+    rendered_pause_after: float
+    notes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
+            raise InvalidClipError(
+                f"index must be a non-negative integer, got {self.index!r}"
+            )
+        if not isinstance(self.clip, TtsClip):
+            raise InvalidClipError(
+                f"clip must be a TtsClip, got {type(self.clip).__name__}"
+            )
+
+        object.__setattr__(self, "audio_path", Path(self.audio_path))
+
+        if isinstance(self.sample_rate, bool) or not isinstance(self.sample_rate, int):
+            raise InvalidClipError(
+                f"sample_rate must be an integer, got {self.sample_rate!r}"
+            )
+        if self.sample_rate < 1:
+            raise InvalidClipError(
+                f"sample_rate must be positive, got {self.sample_rate}"
+            )
+
+        for name in ("start", "tempo", "required_tempo", "rendered_pause_before",
+                     "rendered_pause_after"):
+            value = getattr(self, name)
+            number = _finite(name, value)
+            if number < 0:
+                raise InvalidClipError(f"{name} must be >= 0, got {number}")
+            object.__setattr__(self, name, number)
+
+        for name in ("speech_duration", "original_window"):
+            number = _finite(name, getattr(self, name))
+            if number <= 0:
+                raise InvalidClipError(f"{name} must be positive, got {number}")
+            object.__setattr__(self, name, number)
+
+        if isinstance(self.notes, list):
+            object.__setattr__(self, "notes", tuple(self.notes))
+
+    @property
+    def speaker_id(self) -> str:
+        """The diarization speaker id this line belongs to."""
+
+        return self.clip.speaker_id
+
+    @property
+    def residual(self) -> float:
+        """How much longer than its window the delivered speech is, in seconds.
+
+        Negative means the line underruns its window, positive means it overruns.
+        """
+
+        return self.speech_duration - self.original_window
+
+    @property
+    def fits(self) -> bool:
+        """``True`` when the speech matches its window within the tolerance."""
+
+        return abs(self.residual) <= EXACT_FIT_TOLERANCE_SECONDS
+
+    @property
+    def duration(self) -> float:
+        """Length of the delivered file: speech plus its rendered pauses."""
+
+        return (
+            self.rendered_pause_before + self.speech_duration + self.rendered_pause_after
+        )
+
+    @property
+    def end(self) -> float:
+        """Where the delivered file stops on the source timeline."""
+
+        return self.start + self.duration
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe view of the aligned line."""
+
+        return {
+            "index": self.index,
+            "speaker_id": self.speaker_id,
+            "audio_path": portable_path(self.audio_path),
+            "sample_rate": self.sample_rate,
+            "start": self.start,
+            "end": self.end,
+            "original_start": self.clip.start,
+            "original_end": self.clip.end,
+            "original_window": self.original_window,
+            "tempo": self.tempo,
+            "required_tempo": self.required_tempo,
+            "speech_duration": self.speech_duration,
+            "residual": self.residual,
+            "fits": self.fits,
+            "rendered_pause_before": self.rendered_pause_before,
+            "rendered_pause_after": self.rendered_pause_after,
+            "duration": self.duration,
+            "notes": list(self.notes),
+        }
+
+
+def _finite(name: str, value: Any) -> float:
+    """Return ``value`` as a finite float, or raise :class:`InvalidClipError`."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidClipError(f"{name} must be a number, got {value!r}")
+    number = float(value)
+    if not np.isfinite(number):
+        raise InvalidClipError(f"{name} must be a finite number, got {value!r}")
+    return number
+
+
+def _run_ffmpeg(arguments: list[str]) -> None:
+    """Run ``ffmpeg`` with ``arguments`` and fail clearly when it does not work."""
+
+    executable = shutil.which("ffmpeg")
+    if executable is None:
+        raise MissingFfmpegError(
+            "ffmpeg was not found on PATH; aligning dubbed dialogue needs FFmpeg "
+            "(see the runtime requirements in README.md)"
+        )
+
+    process = subprocess.run(  # noqa: S603 - argv list, no shell involved
+        [executable, *arguments],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=False,
+    )
+    if process.returncode != 0:
+        detail = (process.stderr or "").strip().splitlines()
+        raise StretchError(
+            f"ffmpeg failed to stretch a dubbed line (exit code "
+            f"{process.returncode}): {detail[-1] if detail else 'no output'}"
+        )
+
+
+def _read_mono_file(path: Path, *, label: str) -> tuple[np.ndarray, int]:
+    """Read an audio file into a mono float32 array, with its sample rate."""
+
+    if not path.is_file():
+        raise MissingInputError(f"{label} was not found: {path}")
+
+    try:
+        data, sample_rate = sf.read(str(path), dtype="float32", always_2d=True)
+    except (OSError, RuntimeError) as exc:
+        raise InvalidAudioError(f"could not read {label} at {path}: {exc}") from exc
+
+    if data.size == 0 or data.shape[0] == 0:
+        raise InvalidAudioError(f"{label} at {path} contains no samples")
+    if sample_rate < 1:
+        raise InvalidAudioError(f"{label} at {path} has an invalid sample rate")
+
+    # The clips are mono, but a stereo one would still be usable: generated
+    # dialogue is placed as a single centred channel, so channels are averaged.
+    return np.ascontiguousarray(data.mean(axis=1, dtype=np.float32)), int(sample_rate)
+
+
+def _write_mono(path: Path, samples: np.ndarray, sample_rate: int, *, label: str) -> Path:
+    """Write ``samples`` as mono PCM-16 WAV and return the path."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        sf.write(
+            str(path), np.asarray(samples, dtype=np.float32), sample_rate,
+            format="WAV", subtype="PCM_16",
+        )
+    except (OSError, RuntimeError) as exc:
+        raise StretchError(f"could not write the {label} to {path}: {exc}") from exc
+    return path
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _speech_region(
+    clip: TtsClip, samples: np.ndarray, sample_rate: int
+) -> np.ndarray:
+    """Return the line's speech, without its rendered pauses, from the clip file.
+
+    The clip is ``[pause_before][speech][pause_after]``, so the speech is a slice
+    at a known offset. A clip whose file is shorter than its metadata claims is
+    used as far as it goes rather than rejected: the metadata comes from the TTS
+    stage's own measurement of the same file, so any disagreement is a fraction
+    of a sample.
+    """
+
+    first = int(round(clip.rendered_pause_before * sample_rate))
+    count = int(round(clip.speech_duration * sample_rate))
+    if count < 1:
+        raise InvalidClipError(
+            f"the clip for line {clip.index} has no speech to align "
+            f"({clip.speech_duration:.4f}s)"
+        )
+
+    region = samples[first : first + count]
+    if region.size == 0:
+        raise InvalidClipError(
+            f"the clip for line {clip.index} is shorter than its own leading pause"
+        )
+    return np.ascontiguousarray(region, dtype=np.float32)
+
+
+def _stretched_speech(
+    clip: TtsClip,
+    region: np.ndarray,
+    sample_rate: int,
+    tempo: float,
+    destination: Path,
+) -> tuple[np.ndarray, int]:
+    """Return the line's speech stretched by ``tempo``, at the pipeline rate.
+
+    The speech is written out and read back through FFmpeg, which does both jobs
+    in one pass: the tempo change (pitch-preserving, and only when one is needed)
+    and the sample-rate conversion to the pipeline rate.
+    """
+
+    source = _write_mono(destination, region, sample_rate, label="clip speech")
+    output = destination.with_name(f"{destination.stem}.stretched.wav")
+    arguments = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+    ]
+    if tempo != 1.0:
+        # atempo is the pitch-preserving stretcher; the length of the result is
+        # the input length divided by the factor.
+        arguments += ["-af", f"atempo={tempo:.6f}"]
+    arguments += [
+        "-ar",
+        str(PIPELINE_SAMPLE_RATE),
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        str(output),
+    ]
+
+    try:
+        _run_ffmpeg(arguments)
+    finally:
+        source.unlink(missing_ok=True)
+
+    try:
+        samples, rate = _read_mono_file(output, label="the stretched line")
+    finally:
+        output.unlink(missing_ok=True)
+
+    if rate != PIPELINE_SAMPLE_RATE:
+        raise InvalidAudioError(
+            f"ffmpeg returned {rate} Hz for a stretched line, expected "
+            f"{PIPELINE_SAMPLE_RATE} Hz"
+        )
+    if samples.size == 0:
+        raise StretchError(f"stretching line {clip.index} produced no audio")
+    return samples, rate
+
+
+def align_clip(
+    clip: TtsClip,
+    destination: str | Path,
+    *,
+    settings: Settings | None = None,
+) -> AlignedClip:
+    """Fit one clip to its original window and describe where to place it.
+
+    Parameters
+    ----------
+    clip:
+        A clip from :func:`app.pipeline.tts.synthesize_dialogue`.
+    destination:
+        File to write the aligned line to. Created, with its parents, when missing.
+    settings:
+        Project settings override; the tempo band comes from here.
+
+    Returns
+    -------
+    AlignedClip
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    minimum, maximum = _tempo_bounds(resolved)
+
+    if not isinstance(clip, TtsClip):
+        raise InvalidClipError(f"expected a TtsClip, got {type(clip).__name__}")
+
+    samples, sample_rate = _read_mono_file(
+        Path(clip.audio_path), label=f"the clip for line {clip.index}"
+    )
+    region = _speech_region(clip, samples, sample_rate)
+
+    window = clip.dialogue.duration
+    speech = clip.speech_duration
+    required = speech / window
+    within_tolerance = abs(speech - window) <= EXACT_FIT_TOLERANCE_SECONDS
+    tempo = 1.0 if within_tolerance else _clamp(required, minimum, maximum)
+
+    stretched, rate = _stretched_speech(
+        clip,
+        region,
+        sample_rate,
+        tempo,
+        Path(destination).with_name(f"{Path(destination).stem}.speech.wav"),
+    )
+
+    speech_duration = stretched.shape[0] / rate
+    residual = speech_duration - window
+
+    notes: list[str] = []
+    if within_tolerance:
+        # Close enough that a filter would only add its own rounding.
+        notes.append("already within the fit tolerance; no stretching applied")
+    elif abs(residual) > EXACT_FIT_TOLERANCE_SECONDS:
+        # Judged on the audio that was actually produced, not on the arithmetic
+        # that asked for it, so a clamp is only reported when it really shows.
+        notes.append(
+            f"an exact fit needed a tempo of {required:.3f}, outside "
+            f"[{minimum:g}, {maximum:g}]; clamped to {tempo:.3f}, so the line "
+            f"runs {abs(residual):.3f}s "
+            f"{'long' if residual > 0 else 'short'} of its window"
+        )
+
+    # A line at the very start of the film has nowhere to put its leading pause.
+    # The pause is trimmed rather than the line being pushed late, so the speech
+    # still lands on its original start.
+    lead = min(clip.rendered_pause_before, clip.dialogue.start)
+    if lead < clip.rendered_pause_before - 1e-9:
+        notes.append(
+            f"the {clip.rendered_pause_before:.3f}s leading pause was trimmed to "
+            f"{lead:.3f}s so the line could keep its original start of "
+            f"{clip.dialogue.start:.3f}s"
+        )
+    trail = clip.rendered_pause_after
+
+    pieces = [stretched]
+    if lead:
+        pieces.insert(0, np.zeros(int(round(lead * rate)), dtype=np.float32))
+    if trail:
+        pieces.append(np.zeros(int(round(trail * rate)), dtype=np.float32))
+
+    _write_mono(
+        Path(destination),
+        np.concatenate(pieces),
+        rate,
+        label="aligned line",
+    )
+
+    return AlignedClip(
+        index=clip.index,
+        clip=clip,
+        audio_path=Path(destination),
+        sample_rate=rate,
+        start=clip.dialogue.start - lead,
+        tempo=tempo,
+        required_tempo=required,
+        speech_duration=speech_duration,
+        original_window=window,
+        rendered_pause_before=lead,
+        rendered_pause_after=trail,
+        notes=tuple(notes),
+    )
+
+
+def _tempo_bounds(settings: Settings) -> tuple[float, float]:
+    """Return the validated ``(minimum, maximum)`` tempo band."""
+
+    minimum = _finite("TIMING_MIN_TEMPO", settings.timing_min_tempo)
+    maximum = _finite("TIMING_MAX_TEMPO", settings.timing_max_tempo)
+
+    if minimum < ATEMPO_MIN or maximum > ATEMPO_MAX:
+        raise ConfigurationError(
+            f"the tempo band [{minimum:g}, {maximum:g}] is outside the range "
+            f"FFmpeg's atempo filter supports, [{ATEMPO_MIN:g}, {ATEMPO_MAX:g}]"
+        )
+    if minimum > maximum:
+        raise ConfigurationError(
+            f"TIMING_MIN_TEMPO ({minimum:g}) must not exceed TIMING_MAX_TEMPO "
+            f"({maximum:g})"
+        )
+    return minimum, maximum
+
+
+def resolve_timing_directory(
+    output_dir: str | Path | None = None,
+    *,
+    settings: Settings | None = None,
+) -> Path:
+    """Return the directory that holds the aligned lines.
+
+    An explicit ``output_dir`` wins, so a run can keep its artifacts together;
+    otherwise the work directory is used.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    root = Path(output_dir) if output_dir is not None else Path(resolved.work_dir)
+    return root / TIMING_DIRECTORY_NAME / ALIGNED_DIRECTORY_NAME
+
+
+def align_dialogue(
+    clips: list[TtsClip] | tuple[TtsClip, ...],
+    *,
+    output_dir: str | Path | None = None,
+    settings: Settings | None = None,
+) -> list[AlignedClip]:
+    """Fit every clip to its original window, in the order it was given.
+
+    Parameters
+    ----------
+    clips:
+        Clips from :func:`app.pipeline.tts.synthesize_dialogue`.
+    output_dir:
+        Directory to keep the aligned lines in. Defaults to
+        ``<WORK_DIR>/timing/aligned``.
+    settings:
+        Project settings override; defaults to :func:`app.config.get_settings`.
+
+    Returns
+    -------
+    list[AlignedClip]
+        One entry per input clip, in the same order. An empty input returns an
+        empty list without touching FFmpeg.
+
+    Raises
+    ------
+    ConfigurationError
+        The tempo band is not usable.
+    InvalidClipError
+        An entry is not a :class:`~app.pipeline.tts.TtsClip`.
+    MissingInputError
+        A clip's audio file does not exist.
+    MissingFfmpegError, StretchError, InvalidAudioError
+        FFmpeg is missing, failed, or produced audio that is not the pipeline
+        format.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    _tempo_bounds(resolved)
+
+    ordered = list(clips)
+    if not ordered:
+        return []
+
+    directory = resolve_timing_directory(output_dir, settings=resolved)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    aligned: list[AlignedClip] = []
+    for clip in ordered:
+        if not isinstance(clip, TtsClip):
+            raise InvalidClipError(
+                f"expected a TtsClip, got {type(clip).__name__}"
+            )
+        destination = directory / f"{Path(clip.audio_path).stem}.wav"
+        aligned.append(align_clip(clip, destination, settings=resolved))
+
+    return aligned
+
+
+__all__ = [
+    "ALIGNED_DIRECTORY_NAME",
+    "ATEMPO_MAX",
+    "ATEMPO_MIN",
+    "EXACT_FIT_TOLERANCE_SECONDS",
+    "PIPELINE_SAMPLE_RATE",
+    "TIMING_DIRECTORY_NAME",
+    "AlignedClip",
+    "ConfigurationError",
+    "InvalidAudioError",
+    "InvalidClipError",
+    "MissingFfmpegError",
+    "MissingInputError",
+    "StretchError",
+    "TimingError",
+    "align_clip",
+    "align_dialogue",
+    "resolve_timing_directory",
+]

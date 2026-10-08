@@ -32,6 +32,34 @@ chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox@5de7a54aa4e5e2baa
 peft
 safetensors
 huggingface_hub
+# chatterbox-tts itself is installed with --no-deps (see
+# scripts/install_dependencies.sh), so the packages its code imports and nothing
+# else provides are declared here. Read from the pinned revision's sources:
+#   s3tokenizer  chatterbox/models/s3gen/s3gen.py
+#   conformer    chatterbox/models/s3gen/matcha/decoder.py
+#   diffusers    chatterbox/models/s3gen/matcha/{decoder,transformer}.py
+#   resemble-perth (import name `perth`)  chatterbox/mtl_tts.py - the watermarker
+#     the multilingual model is built with. Chatterbox pins its git master, which
+#     is version 1.1.0; PyPI only carries 1.0.1, so the PyPI release is not what
+#     the adapter was built against and must not be substituted for it. Installed
+#     with its own dependencies, which are all satisfied here: PyYAML>=6.0,
+#     librosa>=0.11.0, numpy>=1.24.0, pydub>=0.25.1, soundfile>=0.12.0 and
+#     torch/torchaudio>=2.1.0, so it never rewrites the pinned torch line. Being a
+#     moving branch, a future upstream change is a possible install failure.
+# einops, tqdm and scipy are needed by these files too and are declared with
+# Seed-VC below; everything else they need (tokenizers, onnx, accelerate) arrives
+# as a dependency of packages listed here.
+#
+# diffusers is held at the release Chatterbox was built against, for two verified
+# reasons: matcha/transformer.py imports `LoRACompatibleLinear`, which later
+# releases kept only as a deprecated shim, and current diffusers requires
+# huggingface-hub>=1.32.0, which would force a major upgrade of a library the
+# Chatterbox and Seed-VC code paths both call. 0.29.0 asks only for
+# huggingface-hub>=0.23.2, torch>=1.4 and safetensors>=0.3.1.
+s3tokenizer
+conformer==0.3.2
+diffusers==0.29.0
+resemble-perth @ git+https://github.com/resemble-ai/Perth.git@master
 
 # Seed-VC V2 - voice conversion (replace timbre, keep accent and emotion).
 # Seed-VC is not a package: clone it and point SEED_VC_REPO_PATH at the checkout:
@@ -41,13 +69,41 @@ huggingface_hub
 # PyTorch than this project uses.
 hydra-core
 pyyaml
+# `app.pipeline.tts` builds the wrapper through hydra, which needs omegaconf
+# directly (`tts.py` imports `DictConfig`).
+omegaconf
+
+# The remaining entries are the rest of the V2 wrapper's import closure, read
+# from the checkout's own sources. `configs/v2/vc_wrapper.yaml` instantiates
+# modules that import these at module scope, so without them the wrapper fails
+# to build - after the checkpoints have already been downloaded:
+#   librosa  modules/v2/vc_wrapper.py, modules/audio.py, modules/bigvgan/meldataset.py
+#   pydub    modules/v2/vc_wrapper.py (MP3 chunks; shells out to ffmpeg)
+#   transformers  modules/astral_quantization/default_model.py (whisper-small, hubert)
+#   einops   modules/v2/ar.py, modules/astral_quantization/bsq.py
+#   scipy    modules/audio.py, modules/bigvgan/utils.py
+#   munch    modules/commons.py
+#   tqdm     modules/v2/cfm.py, modules/v2/ar.py
+#   matplotlib  modules/bigvgan/utils.py (imported unconditionally by BigVGAN)
+librosa
+pydub
+transformers
+einops
+scipy
+munch
+tqdm
+matplotlib
 
 # --- Dialogue adaptation / translation client ------------------------------
 openai
 
 # --- Audio I/O and numerics ------------------------------------------------
 soundfile
-numpy
+# NumPy 2.x is the verified baseline: the pyannote stack needs it, and the
+# upper bound only keeps a transitive resolver from pulling a 3.x release.
+# Seed-VC's own checkout pins numpy 1.x, but its requirements are never
+# installed - see the Seed-VC block above.
+numpy>=2,<3
 
 # --- Configuration ---------------------------------------------------------
 python-dotenv

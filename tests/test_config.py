@@ -10,8 +10,12 @@ import pytest
 
 from app.config import (
     DEFAULT_DIARIZATION_MODEL,
+    DEFAULT_MIX_DIALOGUE_GAIN_DB,
+    DEFAULT_MIX_DUCK_DB,
     DEFAULT_SEED_VC_DIFFUSION_STEPS,
     DEFAULT_SEED_VC_REPO_NAME,
+    DEFAULT_TIMING_MAX_TEMPO,
+    DEFAULT_TIMING_MIN_TEMPO,
     DEFAULT_TRANSCRIPTION_COMPUTE_TYPE,
     DEFAULT_TRANSCRIPTION_MODEL,
     DEFAULT_TRANSLATION_BASE_URL,
@@ -53,6 +57,10 @@ _ENV_VARS = (
     "TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
     "TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
     "TTS_MAX_PAUSE_SECONDS",
+    "TIMING_MIN_TEMPO",
+    "TIMING_MAX_TEMPO",
+    "MIX_DIALOGUE_GAIN_DB",
+    "MIX_DUCK_DB",
     "DEVICE",
     "LOG_LEVEL",
 )
@@ -343,6 +351,80 @@ def test_malformed_boolean_setting_is_rejected(
 ) -> None:
     monkeypatch.setenv("TRANSLATION_DISABLE_THINKING", "maybe")
     with pytest.raises(ValueError, match="boolean flag"):
+        Settings.from_env()
+
+
+def test_timing_settings_are_configurable(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    monkeypatch.setenv("TIMING_MIN_TEMPO", "0.9")
+    monkeypatch.setenv("TIMING_MAX_TEMPO", "1.1")
+
+    settings = Settings.from_env()
+
+    assert settings.timing_min_tempo == 0.9
+    assert settings.timing_max_tempo == 1.1
+    payload = settings.as_dict()
+    assert payload["timing_min_tempo"] == 0.9
+    assert payload["timing_max_tempo"] == 1.1
+
+
+def test_timing_defaults_allow_both_directions(
+    _clean_env: None,
+) -> None:
+    settings = Settings.from_env()
+
+    assert settings.timing_min_tempo == DEFAULT_TIMING_MIN_TEMPO
+    assert settings.timing_max_tempo == DEFAULT_TIMING_MAX_TEMPO
+    assert settings.timing_min_tempo < 1.0 < settings.timing_max_tempo
+
+
+def test_a_malformed_tempo_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    monkeypatch.setenv("TIMING_MAX_TEMPO", "fast")
+    with pytest.raises(ValueError, match="must be a number"):
+        Settings.from_env()
+
+    monkeypatch.setenv("TIMING_MAX_TEMPO", "0")
+    with pytest.raises(ValueError, match="positive number"):
+        Settings.from_env()
+
+
+def test_mix_settings_accept_signed_levels(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    """A level has to be able to be zero or negative, unlike a duration."""
+
+    monkeypatch.setenv("MIX_DIALOGUE_GAIN_DB", "-3.5")
+    monkeypatch.setenv("MIX_DUCK_DB", "0")
+
+    settings = Settings.from_env()
+
+    assert settings.mix_dialogue_gain_db == -3.5
+    assert settings.mix_duck_db == 0.0
+    payload = settings.as_dict()
+    assert payload["mix_dialogue_gain_db"] == -3.5
+    assert payload["mix_duck_db"] == 0.0
+
+
+def test_mix_defaults_are_sane(_clean_env: None) -> None:
+    settings = Settings.from_env()
+
+    assert settings.mix_dialogue_gain_db == DEFAULT_MIX_DIALOGUE_GAIN_DB
+    assert settings.mix_duck_db == DEFAULT_MIX_DUCK_DB
+    assert settings.mix_duck_db > 0.0
+
+
+def test_a_malformed_mix_level_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    monkeypatch.setenv("MIX_DUCK_DB", "quiet please")
+    with pytest.raises(ValueError, match="must be a number"):
+        Settings.from_env()
+
+    monkeypatch.setenv("MIX_DUCK_DB", "inf")
+    with pytest.raises(ValueError, match="finite"):
         Settings.from_env()
 
 

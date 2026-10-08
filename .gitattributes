@@ -1,0 +1,7 @@
+# ---------------------------------------------------------------------------
+# Line-ending policy
+# ---------------------------------------------------------------------------
+# Shell scripts run on the Linux worker. CRLF endings break the shebang and make
+# `set -euo pipefail` fail with `$'\r': command not found`, so force LF for them
+# regardless of the machine the repository is edited on.
+*.sh text eol=lf

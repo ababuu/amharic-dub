@@ -26,22 +26,24 @@ Notes
 * This is a runner, not a stage and not a test: it only calls the existing stage
   functions in their existing order, passing each stage's own outputs to the next
   one. No text, speaker id, timing or performance value is hard-coded here.
-* ``app/pipeline/video.py`` is still a placeholder, so the audio track is pulled
-  out of the MP4 here with FFmpeg, at the 48 kHz that BandIt v2 Multi requires.
+* The audio track is extracted by ``app.pipeline.video.extract_audio``, at the
+  48 kHz that BandIt v2 Multi requires, so the runner and the orchestrator share
+  one extractor instead of each keeping its own copy.
 * Voice identity comes from ``voice_profiles.VoiceProfile`` alone: the reference
   is selected from the speaker's own dialogue in the separated speech stem, and
   the TTS stage uses it as the Seed-VC target while the original actor audio of
   each line is the Chatterbox performance prompt.
-* The run stops after TTS. ``timing`` and ``mixing`` are not implemented, so the
-  clips are not yet aligned to the original timings nor muxed back.
+* The run stops after speech synthesis **by design**: this runner reports what
+  each GPU stage produced, and the stages after it need no GPU. To produce the
+  deliverable, run ``python -m app.pipeline.orchestrator``, which continues
+  through timing, mixing and muxing to a dubbed MP4 and reuses the clips this
+  runner already wrote.
 * Real weights are downloaded on first use; expect a long first run.
 """
 
 from __future__ import annotations
 
 import argparse
-import shutil
-import subprocess
 import sys
 import time
 import traceback
@@ -60,6 +62,7 @@ from app.pipeline import (  # noqa: E402
     transcription,
     translation,
     tts,
+    video,
     voice_profiles,
 )
 from app.pipeline.translation import AdaptedDialogue  # noqa: E402
@@ -68,10 +71,6 @@ from app.pipeline.voice_profiles import VoiceProfile  # noqa: E402
 
 DEFAULT_VIDEO = PROJECT_ROOT / "data" / "input" / "test.mp4"
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "output" / "tts-test"
-
-#: BandIt v2 Multi is a 48 kHz model and separation rejects every other rate.
-MIX_SAMPLE_RATE = 48_000
-MIX_CHANNELS = 2
 
 
 def _rule(title: str) -> None:
@@ -97,48 +96,6 @@ def _audio_summary(path: Path) -> str:
         f"{info.frames / info.samplerate:6.2f} s  "
         f"{info.samplerate:6d} Hz  {info.channels} ch  {info.subtype}"
     )
-
-
-def extract_track(video: Path, destination: Path) -> Path:
-    """Extract the video's audio track as 48 kHz stereo PCM WAV.
-
-    The ``video`` stage that will own this is still a placeholder, so the runner
-    does it here; separation needs a 48 kHz file to accept the input at all.
-    """
-
-    if not video.is_file():
-        raise FileNotFoundError(f"test video not found: {video}")
-
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
-        raise RuntimeError("ffmpeg was not found on PATH")
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(video),
-        "-vn",
-        "-ac",
-        str(MIX_CHANNELS),
-        "-ar",
-        str(MIX_SAMPLE_RATE),
-        "-c:a",
-        "pcm_s16le",
-        str(destination),
-    ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg failed with exit code {result.returncode}: {result.stderr.strip()}"
-        )
-    if not destination.is_file() or destination.stat().st_size == 0:
-        raise RuntimeError(f"ffmpeg produced no audio at {destination}")
-    return destination
 
 
 def report_settings(settings: Settings) -> None:
@@ -289,7 +246,7 @@ def report_clips(clips: list[TtsClip], output_dir: Path) -> None:
     _info("listen to", output_dir / "clips")
 
 
-def run(video: Path, output_dir: Path, max_lines: int | None) -> int:
+def run(source: Path, output_dir: Path, max_lines: int | None) -> int:
     """Run the implemented chain once. Returns a process exit code."""
 
     started = time.perf_counter()
@@ -301,9 +258,11 @@ def run(video: Path, output_dir: Path, max_lines: int | None) -> int:
 
         work = output_dir / "stages"
         stage = "audio extraction"
-        _rule("0. Audio track (video stage is still a placeholder)")
-        mix = extract_track(video, work / f"{video.stem}_mix.wav")
-        _info("video", f"{video}  ({video.stat().st_size / 1e6:.1f} MB)")
+        _rule("0. Audio track (video.extract_audio)")
+        mix = video.extract_audio(
+            source, work / f"{source.stem}_mix.wav", settings=settings
+        )
+        _info("video", f"{source}  ({source.stat().st_size / 1e6:.1f} MB)")
         _info("extracted mix", f"{mix}")
         _info("", _audio_summary(mix))
 
@@ -350,9 +309,14 @@ def run(video: Path, output_dir: Path, max_lines: int | None) -> int:
         return 1
 
     _rule("Done")
-    _info("stage", "stopped after tts (timing and mixing are not implemented)")
+    _info("stage", "validated every GPU stage up to speech synthesis")
     _info("clips", f"{len(clips)} in {output_dir / 'clips'}")
     _info("elapsed", f"{time.perf_counter() - started:.1f} s")
+    _info(
+        "next",
+        "python -m app.pipeline.orchestrator <video>  -> dubbed MP4 "
+        "(timing, mixing, muxing; reuses these clips)",
+    )
     return 0
 
 
