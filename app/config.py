@@ -115,8 +115,29 @@ DEFAULT_TRANSCRIPTION_MODEL = "large-v3"
 #: ``int8`` or ``float32``, because CTranslate2 does not support fp16 on CPU.
 DEFAULT_TRANSCRIPTION_COMPUTE_TYPE = "float16"
 
-#: DeepSeek model used for dialogue adaptation into Amharic.
-DEFAULT_TRANSLATION_MODEL = "deepseek-flash"
+#: Which translation backend :mod:`app.pipeline.translation` uses.
+#:
+#: ``"nllb"`` (the default) translates locally with Meta's NLLB-200. ``"openai"``
+#: talks to any OpenAI-compatible endpoint - which is what provides *adaptation*
+#: rather than translation: scene and character context, a syllable budget, the
+#: borrowed-word policy, and per-line performance metadata.
+DEFAULT_TRANSLATION_BACKEND = "nllb"
+
+#: NLLB-200 distilled at 1.3B parameters. The distilled sizes are 600M, 1.3B and
+#: 3.3B: 600M is markedly weaker on low-resource pairs such as Amharic, and 3.3B is
+#: roughly 2.5x the memory and compute for a smaller gain, so 1.3B is the balance.
+#: Amharic (``amh_Ethi``) has real parallel data behind it in NLLB-200.
+DEFAULT_TRANSLATION_MODEL = "facebook/nllb-200-distilled-1.3B"
+
+#: Beam search width. ``1`` is greedy, which is deterministic - the same line always
+#: translates the same way, so two runs can be compared against one another. Raise it
+#: when quality matters more than reproducibility, at a proportional cost in time.
+DEFAULT_TRANSLATION_NUM_BEAMS = 1
+
+#: Longest output NLLB may generate for one chunk, in tokens. 512 is comfortably
+#: above any spoken line; it exists to bound a runaway generation rather than to
+#: shape it.
+DEFAULT_TRANSLATION_MAX_NEW_TOKENS = 512
 
 #: DeepSeek API endpoint. The official endpoint is OpenAI-compatible.
 DEFAULT_TRANSLATION_BASE_URL = "https://api.deepseek.com"
@@ -153,10 +174,41 @@ DEFAULT_VOICE_REFERENCE_MIN_DURATION = 3.0
 DEFAULT_VOICE_REFERENCE_TARGET_DURATION = 10.0
 DEFAULT_VOICE_REFERENCE_MAX_DURATION = 15.0
 
-#: Amharic speech adapter consumed by :mod:`app.pipeline.tts`. It is a LoRA
-#: delta plus a Fidel tokenizer that is applied on top of Chatterbox
-#: Multilingual v3 at runtime, so only the adapter is named here.
-DEFAULT_TTS_MODEL = "gabar-tech/chatterbox-amharic"
+#: Amharic speech engine consumed by :mod:`app.pipeline.tts`.
+#:
+#: ``"mms"`` is Meta's MMS-TTS Amharic: a VITS model trained on Amharic alone. It is
+#: a **single-speaker** model - one voice for the whole film, with no cloning and no
+#: per-character identity - and it needs its text romanised first (see the module).
+#: ``"chatterbox"`` is the Chatterbox Multilingual v3 + Amharic LoRA pair, which does
+#: per-character voices by prompting with the original actor's audio and converting
+#: the timbre afterwards, and is kept as the alternative.
+DEFAULT_TTS_ENGINE = "mms"
+
+#: The Amharic TTS checkpoint. Which model this id should name depends on
+#: ``TTS_ENGINE``: an MMS-TTS checkpoint for ``mms``, the Chatterbox Amharic adapter
+#: for ``chatterbox``.
+DEFAULT_TTS_MODEL = "facebook/mms-tts-amh"
+
+#: The Chatterbox Amharic adapter, used when ``TTS_ENGINE=chatterbox``. It is a LoRA
+#: delta plus a Fidel tokenizer applied on top of Chatterbox Multilingual v3 at
+#: runtime, so only the adapter is named here.
+DEFAULT_CHATTERBOX_MODEL = "gabar-tech/chatterbox-amharic"
+
+#: Sample rate MMS-TTS produces, in Hz. VITS models are trained per language and this
+#: one is trained at 16 kHz, so the pipeline resamples its output rather than
+#: pretending it is the 24 kHz Chatterbox produces.
+DEFAULT_MMS_SAMPLE_RATE = 16_000
+
+#: Fixed seed for the MMS duration predictor. VITS samples its rhythm, so the same
+#: line would otherwise come out a slightly different length every run - which would
+#: make a dub unreproducible and a baseline meaningless.
+DEFAULT_MMS_SEED = 0
+
+#: Speaking rate asked of the MMS duration predictor. ``1.0`` is the model's natural
+#: pace; VITS exposes this *before* synthesis, so a line can be made to fit its window
+#: by asking for a different speed rather than by time-stretching the result
+#: afterwards - which is what makes this engine less dependent on ``timing.py``.
+DEFAULT_MMS_SPEAKING_RATE = 1.0
 
 #: Name of the Seed-VC checkout inside ``MODEL_CACHE_DIR``. Seed-VC is not
 #: published as a package, so the identity-conversion step of
@@ -286,6 +338,27 @@ def _read_int(name: str, default: int) -> int:
     return value
 
 
+def _read_nonnegative_int(name: str, default: int) -> int:
+    """Return an environment value as a non-negative integer, or ``default``.
+
+    Zero is a legitimate value here where :func:`_read_int` would reject it: a seed
+    of zero is an ordinary seed.
+    """
+
+    raw = _read_env(name)
+    if raw is None:
+        return default
+
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+    if value < 0:
+        raise ValueError(f"{name} must not be negative, got {value}")
+    return value
+
+
 def _read_optional_int(name: str, default: Optional[int]) -> Optional[int]:
     """Return an environment value as an optional positive integer.
 
@@ -391,10 +464,15 @@ class Settings:
     #: Source language code for transcription; ``None`` detects it automatically.
     transcription_language: Optional[str] = None
     #: DeepSeek dialogue adaptation settings for :mod:`app.pipeline.translation`.
+    #: Dialogue adaptation / translation settings for
+    #: :mod:`app.pipeline.translation`.
+    translation_backend: str = DEFAULT_TRANSLATION_BACKEND
     translation_model: str = DEFAULT_TRANSLATION_MODEL
     translation_base_url: str = DEFAULT_TRANSLATION_BASE_URL
     translation_batch_size: int = DEFAULT_TRANSLATION_BATCH_SIZE
     translation_disable_thinking: bool = True
+    translation_num_beams: int = DEFAULT_TRANSLATION_NUM_BEAMS
+    translation_max_new_tokens: int = DEFAULT_TRANSLATION_MAX_NEW_TOKENS
     translation_enforce_budget: bool = DEFAULT_TRANSLATION_ENFORCE_BUDGET
     translation_enforce_fidel_loanwords: bool = (
         DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS
@@ -410,6 +488,11 @@ class Settings:
     #: Seed-VC checkout that converts identity, and the performance-prompt and
     #: pause bounds of one synthesized line.
     tts_model: str = DEFAULT_TTS_MODEL
+    tts_engine: str = DEFAULT_TTS_ENGINE
+    chatterbox_model: str = DEFAULT_CHATTERBOX_MODEL
+    mms_sample_rate: int = DEFAULT_MMS_SAMPLE_RATE
+    mms_seed: int = DEFAULT_MMS_SEED
+    mms_speaking_rate: float = DEFAULT_MMS_SPEAKING_RATE
     seed_vc_repo_path: Path = DEFAULT_MODEL_CACHE_DIR / DEFAULT_SEED_VC_REPO_NAME
     seed_vc_diffusion_steps: int = DEFAULT_SEED_VC_DIFFUSION_STEPS
     seed_vc_convert_style: bool = DEFAULT_SEED_VC_CONVERT_STYLE
@@ -473,6 +556,10 @@ class Settings:
             transcription_language=(
                 (_read_env("TRANSCRIPTION_LANGUAGE") or "").lower() or None
             ),
+            translation_backend=(
+                _read_env("TRANSLATION_BACKEND", DEFAULT_TRANSLATION_BACKEND)
+                or DEFAULT_TRANSLATION_BACKEND
+            ).lower(),
             translation_model=(
                 _read_env("TRANSLATION_MODEL", DEFAULT_TRANSLATION_MODEL)
                 or DEFAULT_TRANSLATION_MODEL
@@ -485,6 +572,12 @@ class Settings:
                 "TRANSLATION_BATCH_SIZE", DEFAULT_TRANSLATION_BATCH_SIZE
             ),
             translation_disable_thinking=_read_bool("TRANSLATION_DISABLE_THINKING", True),
+            translation_num_beams=_read_int(
+                "TRANSLATION_NUM_BEAMS", DEFAULT_TRANSLATION_NUM_BEAMS
+            ),
+            translation_max_new_tokens=_read_int(
+                "TRANSLATION_MAX_NEW_TOKENS", DEFAULT_TRANSLATION_MAX_NEW_TOKENS
+            ),
             translation_enforce_budget=_read_bool(
                 "TRANSLATION_ENFORCE_BUDGET", DEFAULT_TRANSLATION_ENFORCE_BUDGET
             ),
@@ -506,6 +599,18 @@ class Settings:
                 "DIALOGUE_BIBLE_PATH", work_dir / DEFAULT_DIALOGUE_BIBLE_FILENAME
             ),
             tts_model=(_read_env("TTS_MODEL", DEFAULT_TTS_MODEL) or DEFAULT_TTS_MODEL),
+            tts_engine=(
+                _read_env("TTS_ENGINE", DEFAULT_TTS_ENGINE) or DEFAULT_TTS_ENGINE
+            ).lower(),
+            chatterbox_model=(
+                _read_env("CHATTERBOX_MODEL", DEFAULT_CHATTERBOX_MODEL)
+                or DEFAULT_CHATTERBOX_MODEL
+            ),
+            mms_sample_rate=_read_int("MMS_SAMPLE_RATE", DEFAULT_MMS_SAMPLE_RATE),
+            mms_seed=_read_nonnegative_int("MMS_SEED", DEFAULT_MMS_SEED),
+            mms_speaking_rate=_read_float(
+                "MMS_SPEAKING_RATE", DEFAULT_MMS_SPEAKING_RATE
+            ),
             seed_vc_repo_path=_read_path(
                 "SEED_VC_REPO_PATH", model_cache_dir / DEFAULT_SEED_VC_REPO_NAME
             ),
@@ -592,10 +697,13 @@ class Settings:
             "transcription_model": self.transcription_model,
             "transcription_compute_type": self.transcription_compute_type,
             "transcription_language": self.transcription_language,
+            "translation_backend": self.translation_backend,
             "translation_model": self.translation_model,
             "translation_base_url": self.translation_base_url,
             "translation_batch_size": self.translation_batch_size,
             "translation_disable_thinking": self.translation_disable_thinking,
+            "translation_num_beams": self.translation_num_beams,
+            "translation_max_new_tokens": self.translation_max_new_tokens,
             "translation_enforce_budget": self.translation_enforce_budget,
             "translation_enforce_fidel_loanwords": (
                 self.translation_enforce_fidel_loanwords
@@ -606,6 +714,11 @@ class Settings:
             "voice_reference_max_duration": self.voice_reference_max_duration,
             "dialogue_bible_path": str(self.dialogue_bible_path),
             "tts_model": self.tts_model,
+            "tts_engine": self.tts_engine,
+            "chatterbox_model": self.chatterbox_model,
+            "mms_sample_rate": self.mms_sample_rate,
+            "mms_seed": self.mms_seed,
+            "mms_speaking_rate": self.mms_speaking_rate,
             "seed_vc_repo_path": str(self.seed_vc_repo_path),
             "seed_vc_diffusion_steps": self.seed_vc_diffusion_steps,
             "seed_vc_convert_style": self.seed_vc_convert_style,
@@ -633,6 +746,7 @@ def get_settings() -> Settings:
 
 
 __all__ = [
+    "DEFAULT_CHATTERBOX_MODEL",
     "DEFAULT_DIALOGUE_BIBLE_FILENAME",
     "DEFAULT_DIALOGUE_BIBLE_PATH",
     "DEFAULT_DIARIZATION_MAX_SPEAKERS",
@@ -640,11 +754,17 @@ __all__ = [
     "DEFAULT_DIARIZATION_MODEL",
     "DEFAULT_MIX_DIALOGUE_GAIN_DB",
     "DEFAULT_MIX_DUCK_DB",
+    "DEFAULT_MMS_SAMPLE_RATE",
+    "DEFAULT_MMS_SEED",
+    "DEFAULT_MMS_SPEAKING_RATE",
     "DEFAULT_SEED_VC_CONVERT_STYLE",
     "DEFAULT_SEED_VC_DIFFUSION_STEPS",
     "DEFAULT_SEED_VC_REPO_NAME",
     "DEFAULT_TRANSCRIPTION_COMPUTE_TYPE",
     "DEFAULT_TRANSCRIPTION_MODEL",
+    "DEFAULT_TRANSLATION_BACKEND",
+    "DEFAULT_TRANSLATION_MAX_NEW_TOKENS",
+    "DEFAULT_TRANSLATION_NUM_BEAMS",
     "DEFAULT_TRANSLATION_BASE_URL",
     "DEFAULT_TRANSLATION_BATCH_SIZE",
     "DEFAULT_TRANSLATION_ENFORCE_BUDGET",

@@ -80,7 +80,14 @@ dependencies = [
   "matplotlib",
 
   # --- Dialogue adaptation / translation client -----------------------------
+  # The instruction-following backend talks to any OpenAI-compatible endpoint; the
+  # default backend (NLLB-200) runs locally on the torch/transformers below.
   "openai",
+  # SentencePiece: NLLB's tokenizer. The fast tokenizer ships with transformers, but
+  # the checkpoint can fall back to the slow one, which needs this.
+  "sentencepiece",
+  # uroman romanises Fidel script into the Latin alphabet that MMS-TTS Amharic takes.
+  "uroman",
 
   # --- Audio I/O and numerics ----------------------------------------------
   "soundfile",

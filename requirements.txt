@@ -95,7 +95,18 @@ tqdm
 matplotlib
 
 # --- Dialogue adaptation / translation client ------------------------------
+# The instruction-following backend talks to any OpenAI-compatible endpoint.
 openai
+# SentencePiece: NLLB's tokenizer. The fast tokenizer ships with transformers, but
+# the checkpoint's tokenizer can fall back to the slow one, which needs this.
+sentencepiece
+
+# --- Amharic speech synthesis (MMS-TTS) ------------------------------------
+# MMS-TTS Amharic takes its text in the Latin alphabet, so Fidel script is
+# romanised with Meta's own uroman before synthesis. A hand-rolled transliteration
+# would be a mispronunciation waiting to happen, and there is no way to check one
+# against the model's own expectations.
+uroman
 
 # --- Audio I/O and numerics ------------------------------------------------
 soundfile

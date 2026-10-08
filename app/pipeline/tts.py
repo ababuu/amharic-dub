@@ -108,8 +108,13 @@ import numpy as np
 import soundfile as sf
 
 from app.config import (
+    DEFAULT_CHATTERBOX_MODEL,
+    DEFAULT_MMS_SAMPLE_RATE,
+    DEFAULT_MMS_SEED,
+    DEFAULT_MMS_SPEAKING_RATE,
     DEFAULT_SEED_VC_CONVERT_STYLE,
     DEFAULT_SEED_VC_DIFFUSION_STEPS,
+    DEFAULT_TTS_ENGINE,
     DEFAULT_TTS_MIN_LINE_SECONDS,
     DEFAULT_TTS_MODEL,
     DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION,
@@ -142,6 +147,10 @@ CHATTERBOX_DIRECTORY_NAME = "chatterbox"
 CONVERTED_DIRECTORY_NAME = "converted"
 
 #: Sub-directory holding the clips handed to :mod:`app.pipeline.timing`.
+#: Sub-directory holding the takes a single-voice engine produced.
+TAKE_DIRECTORY_NAME = "takes"
+
+#: Sub-directory holding the aligned, pause-rendered clips every engine ends with.
 CLIP_DIRECTORY_NAME = "clips"
 
 #: Bump when a change here would make an existing take or clip wrong; it is part
@@ -371,14 +380,40 @@ def _read_mono(path: Path, *, label: str) -> tuple[np.ndarray, int]:
     return np.ascontiguousarray(samples, dtype=np.float32), int(sample_rate)
 
 
-def _write_mono(path: Path, samples: np.ndarray, sample_rate: int, *, label: str) -> Path:
-    """Write a mono PCM-16 WAV and return ``path``."""
+#: Peak a written clip is held below. Anything above this would be truncated by the
+#: PCM-16 conversion, which is irreversible distortion - a harsh, buzzy timbre that
+#: no later stage can undo. Attenuating instead costs a little level and preserves
+#: the waveform, which is the better trade.
+CLIP_CEILING = 0.999
 
+
+def _peak_limit(samples: np.ndarray) -> tuple[np.ndarray, float]:
+    """Return ``samples`` below the ceiling, and the gain applied in dB.
+
+    A signal that is already inside the ceiling is returned untouched with ``0.0``.
+    One that would clip is scaled *as a whole*, so the waveform keeps its shape:
+    clipping the peaks would change the timbre, which is exactly the defect this
+    exists to prevent.
+    """
+
+    data = np.asarray(samples, dtype=np.float32)
+    peak = float(np.max(np.abs(data))) if data.size else 0.0
+    if peak <= CLIP_CEILING or peak <= 0.0:
+        return data, 0.0
+
+    gain = CLIP_CEILING / peak
+    return (data * gain).astype(np.float32), 20.0 * math.log10(gain)
+
+
+def _write_mono(path: Path, samples: np.ndarray, sample_rate: int, *, label: str) -> Path:
+    """Write a mono PCM-16 WAV, peak-limited rather than clipped, and return ``path``."""
+
+    limited, _ = _peak_limit(samples)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         sf.write(
             str(path),
-            np.clip(samples, -1.0, 1.0).astype(np.float32),
+            limited,
             int(sample_rate),
             format="WAV",
             subtype="PCM_16",
@@ -725,9 +760,13 @@ class TtsClip:
     dialogue: AdaptedDialogue
     performance: PerformanceControls
     audio_path: Path
+    #: The character's *performance* prompt, cut from the clean speech stem, and the
+    #: identity reference the take was converted towards. Both are ``None`` for a
+    #: single-voice engine: it follows no prompt and converts no identity, so there is
+    #: no reference to point at, and pretending otherwise would be worse than saying so.
     take_path: Path
-    performance_reference_path: Path
-    voice_reference_path: Path
+    performance_reference_path: Path | None
+    voice_reference_path: Path | None
     sample_rate: int
     speech_duration: float
     rendered_pause_before: float
@@ -753,10 +792,17 @@ class TtsClip:
         for name, value in (
             ("audio_path", self.audio_path),
             ("take_path", self.take_path),
+        ):
+            object.__setattr__(self, name, _clip_path(name, value))
+
+        # Optional: a single-voice engine has neither a performance prompt nor an
+        # identity reference, so these are absent rather than fabricated.
+        for name, value in (
             ("performance_reference_path", self.performance_reference_path),
             ("voice_reference_path", self.voice_reference_path),
         ):
-            object.__setattr__(self, name, _clip_path(name, value))
+            if value is not None:
+                object.__setattr__(self, name, _clip_path(name, value))
 
         if isinstance(self.sample_rate, bool) or not isinstance(self.sample_rate, int):
             raise InvalidInputError(
@@ -836,8 +882,16 @@ class TtsClip:
             "performance": self.performance.to_dict(),
             "audio_path": portable_path(self.audio_path),
             "take_path": portable_path(self.take_path),
-            "performance_reference_path": portable_path(self.performance_reference_path),
-            "voice_reference_path": portable_path(self.voice_reference_path),
+            "performance_reference_path": (
+                None
+                if self.performance_reference_path is None
+                else portable_path(self.performance_reference_path)
+            ),
+            "voice_reference_path": (
+                None
+                if self.voice_reference_path is None
+                else portable_path(self.voice_reference_path)
+            ),
             "sample_rate": self.sample_rate,
             "speech_duration": self.speech_duration,
             "duration": self.duration,
@@ -884,6 +938,35 @@ class ChatterboxPerformanceEngine(ABC):
         destination: Path,
     ) -> Path:
         """Speak ``text`` using ``performance_reference`` as the prompt."""
+
+
+class TextToSpeechEngine(ABC):
+    """An engine that speaks plain text in a single voice.
+
+    This is the simpler contract: no performance reference to follow and no identity
+    to convert to. It exists because a single-speaker model such as MMS-TTS has
+    neither - it speaks Amharic in one voice, always - and pretending otherwise by
+    feeding it a prompt it ignores would be dishonest plumbing.
+
+    Implementations write a mono WAV to ``destination`` and return that path.
+    """
+
+    #: Short, stable name recorded in the clip metadata.
+    name: str
+
+    @property
+    @abstractmethod
+    def is_loaded(self) -> bool:
+        """``True`` once the underlying model has actually been loaded."""
+
+    @property
+    @abstractmethod
+    def sample_rate(self) -> int:
+        """Sample rate of the audio this engine writes."""
+
+    @abstractmethod
+    def synthesize(self, *, text: str, destination: Path) -> Path:
+        """Speak ``text`` into ``destination``."""
 
 
 class VoiceConversionEngine(ABC):
@@ -1046,7 +1129,7 @@ class ChatterboxAmharicEngine(ChatterboxPerformanceEngine):
     def __init__(
         self,
         *,
-        model: str = DEFAULT_TTS_MODEL,
+        model: str = DEFAULT_CHATTERBOX_MODEL,
         device: str = "cuda",
         cache_dir: Path | None = None,
         adapter_dir: Path | None = None,
@@ -1672,6 +1755,251 @@ def seed_vc_revision(repo_path: str | Path) -> str | None:
     return revision
 
 
+#: The Amharic TTS engine name recorded in clip metadata.
+MMS_ENGINE_NAME = "mms-tts-amharic"
+
+
+def _require_vits() -> tuple[Any, Any, Any]:
+    """Return ``(torch, AutoTokenizer, VitsModel)``, or explain what is missing."""
+
+    try:
+        import torch
+        from transformers import AutoTokenizer, VitsModel
+    except ImportError as exc:  # pragma: no cover - only without the runtime
+        raise EngineLoadError(
+            "MMS-TTS needs torch and transformers; install the runtime dependencies "
+            f"before running speech synthesis ({type(exc).__name__}: {exc})"
+        ) from exc
+
+    return torch, AutoTokenizer, VitsModel
+
+
+def _require_uroman() -> Any:
+    """Return the ``uroman`` romanizer class, or explain what is missing.
+
+    MMS-TTS Amharic takes its text in the Latin alphabet, so Fidel script has to be
+    romanised first. ``uroman`` is Meta's own choice for that step, which is why it
+    is used here rather than a hand-rolled transliteration: a wrong romanisation is a
+    mispronunciation, and there is no way to test a hand-rolled one against the
+    model's own expectations.
+    """
+
+    try:
+        import uroman as uroman_module
+    except ImportError as exc:  # pragma: no cover - only without the runtime
+        raise EngineLoadError(
+            "MMS-TTS needs the 'uroman' package to romanise Fidel script before "
+            f"synthesis; install it from requirements.txt ({type(exc).__name__}: {exc})"
+        ) from exc
+
+    return uroman_module.Uroman
+
+
+class MmsAmharicEngine(TextToSpeechEngine):
+    """Adapter around **MMS-TTS Amharic** (``facebook/mms-tts-amh``).
+
+    A VITS model trained on Amharic alone. Two properties shape this adapter, and
+    both are properties of the model rather than choices made here:
+
+    * **One voice for the whole film.** VITS for Amharic was trained on a single
+      speaker, so there is no identity to clone and no per-character voice. Every
+      line comes out in the same voice, and the identity/conversion stages are
+      bypassed entirely rather than fed a reference they would ignore.
+    * **Latin input.** The checkpoint expects romanised text, so Fidel script is
+      converted with ``uroman`` before synthesis. That is the reverse of what the
+      Chatterbox path needs, and it is handled here so the rest of the pipeline can
+      keep working in Fidel.
+
+    The duration predictor samples its rhythm, so generation is seeded: without a
+    fixed seed the same line would change length between runs, and neither a
+    reproducible dub nor a meaningful baseline would be possible.
+    """
+
+    name = MMS_ENGINE_NAME
+
+    def __init__(
+        self,
+        *,
+        model: str = DEFAULT_TTS_MODEL,
+        device: str = "cuda",
+        cache_dir: Path | None = None,
+        seed: int = DEFAULT_MMS_SEED,
+        speaking_rate: float = DEFAULT_MMS_SPEAKING_RATE,
+        romanizer: Any | None = None,
+    ) -> None:
+        if not isinstance(model, str) or not model.strip():
+            raise ConfigurationError("the TTS model must be a non-empty repository id")
+        if not isinstance(device, str) or not device.strip():
+            raise ConfigurationError("the TTS device must be a non-empty string")
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ConfigurationError(f"MMS_SEED must be a non-negative integer, got {seed!r}")
+        if not math.isfinite(speaking_rate) or speaking_rate <= 0:
+            raise ConfigurationError(
+                f"MMS_SPEAKING_RATE must be a positive number, got {speaking_rate!r}"
+            )
+
+        self._model = model.strip()
+        self._device = device.strip()
+        self._cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self._seed = seed
+        self._speaking_rate = float(speaking_rate)
+        self._torch: Any | None = None
+        self._tokenizer: Any | None = None
+        self._network: Any | None = None
+        self._uroman: Any | None = romanizer
+        self._rate: int | None = None
+
+    @property
+    def model(self) -> str:
+        """The checkpoint this engine was constructed for."""
+
+        return self._model
+
+    @property
+    def device(self) -> str:
+        """The device this engine runs on."""
+
+        return self._device
+
+    @property
+    def is_loaded(self) -> bool:
+        """``True`` once the weights are in memory."""
+
+        return self._network is not None
+
+    @property
+    def sample_rate(self) -> int:
+        """The rate the checkpoint produces, known before loading if configured."""
+
+        return self._rate if self._rate is not None else DEFAULT_MMS_SAMPLE_RATE
+
+    def _load(self) -> tuple[Any, Any, Any]:
+        """Load the tokenizer and model once, and return them with torch."""
+
+        if (
+            self._tokenizer is not None
+            and self._network is not None
+            and self._torch is not None
+        ):
+            return self._torch, self._tokenizer, self._network
+
+        torch, auto_tokenizer, auto_model = _require_vits()
+        self._torch = torch
+
+        try:
+            self._tokenizer = auto_tokenizer.from_pretrained(
+                self._model, cache_dir=self._cache_dir
+            )
+        except Exception as exc:
+            raise EngineLoadError(
+                f"could not load the MMS tokenizer for {self._model!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        try:
+            self._network = auto_model.from_pretrained(
+                self._model, cache_dir=self._cache_dir
+            )
+        except Exception as exc:
+            raise EngineLoadError(
+                f"could not load the MMS model {self._model!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        try:
+            self._network.to(torch.device(self._device))
+        except Exception as exc:
+            raise EngineLoadError(
+                f"could not move {self._model!r} to device {self._device!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        self._network.eval()
+
+        # VITS exposes speaking rate through its config. Setting it when the
+        # attribute exists is how a line is made shorter or longer without
+        # time-stretching the result - so the model is asked for the right duration
+        # rather than the audio being stretched to reach it.
+        if hasattr(self._network.config, "speaking_rate"):
+            try:
+                self._network.config.speaking_rate = self._speaking_rate
+            except Exception:  # a frozen config is not worth failing a run over
+                pass
+
+        self._rate = int(
+            getattr(self._network.config, "sampling_rate", DEFAULT_MMS_SAMPLE_RATE)
+        )
+        return self._torch, self._tokenizer, self._network
+
+    def romanize(self, text: str) -> str:
+        """Return ``text`` in the Latin alphabet, as this checkpoint expects it.
+
+        Latin text already in the line - a borrowed word, a name - is left as it is:
+        romanising it again could only corrupt it, and it is already the script the
+        model wants.
+        """
+
+        if not isinstance(text, str) or not text.strip():
+            raise InvalidInputError("there is nothing to synthesize")
+
+        if self._uroman is None:
+            uroman_class = _require_uroman()
+            try:
+                self._uroman = uroman_class()
+            except Exception as exc:
+                raise EngineLoadError(
+                    f"could not initialise uroman: {type(exc).__name__}: {exc}"
+                ) from exc
+
+        try:
+            return self._uroman.romanize_string(text)
+        except Exception as exc:
+            raise SynthesisError(
+                f"uroman could not romanise Amharic text: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def synthesize(self, *, text: str, destination: Path) -> Path:
+        """Speak ``text`` into a mono PCM WAV at ``destination``."""
+
+        target = Path(destination)
+        romanized = self.romanize(text)
+        torch, tokenizer, network = self._load()
+
+        try:
+            inputs = tokenizer(romanized, return_tensors="pt")
+        except Exception as exc:
+            raise SynthesisError(
+                f"the MMS tokenizer rejected a line: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        device = next(network.parameters()).device
+        inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
+
+        try:
+            # Seeded, because the duration predictor samples: an unseeded run would
+            # give the same line a different length every time.
+            torch.manual_seed(self._seed)
+            with torch.no_grad():
+                waveform = network(**inputs).waveform
+        except Exception as exc:
+            raise SynthesisError(
+                f"MMS-TTS failed to synthesize {text!r}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        try:
+            samples = waveform.squeeze().detach().to("cpu").numpy().astype(np.float32)
+        except Exception as exc:
+            raise SynthesisError(
+                f"MMS-TTS returned an unusable waveform: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if samples.size == 0:
+            raise SynthesisError(f"MMS-TTS returned an empty waveform for {text!r}")
+
+        return _write_mono(
+            target, samples, self.sample_rate, label="MMS-TTS take"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Engine cache
 # ---------------------------------------------------------------------------
@@ -1680,6 +2008,8 @@ _CHATTERBOX_ENGINES: dict[tuple[str, str], ChatterboxAmharicEngine] = {}
 #: Keyed by device, checkout and diffusion steps *and* the style flag, because two
 #: settings that differ only in that flag need two different engines.
 _SEED_VC_ENGINES: dict[tuple[str, str, int, bool], SeedVcV2Engine] = {}
+#: Single-voice engines, keyed by the settings that shape one.
+_MMS_ENGINES: dict[tuple[str, str, int, float], MmsAmharicEngine] = {}
 
 
 def load_chatterbox_engine(*, settings: Settings | None = None) -> ChatterboxAmharicEngine:
@@ -1723,6 +2053,47 @@ def load_seed_vc_engine(*, settings: Settings | None = None) -> SeedVcV2Engine:
         )
         _SEED_VC_ENGINES[key] = engine
     return engine
+
+
+def load_mms_engine(*, settings: Settings | None = None) -> MmsAmharicEngine:
+    """Return the process-wide MMS-TTS Amharic engine for these settings."""
+
+    resolved = settings if settings is not None else get_settings()
+    key = (
+        resolved.device,
+        resolved.tts_model,
+        resolved.mms_seed,
+        resolved.mms_speaking_rate,
+    )
+    engine = _MMS_ENGINES.get(key)
+    if engine is None:
+        engine = MmsAmharicEngine(
+            model=resolved.tts_model,
+            device=resolved.device,
+            cache_dir=Path(resolved.model_cache_dir),
+            seed=resolved.mms_seed,
+            speaking_rate=resolved.mms_speaking_rate,
+        )
+        _MMS_ENGINES[key] = engine
+    return engine
+
+
+def load_tts_engine(*, settings: Settings | None = None) -> TextToSpeechEngine:
+    """Return the single-voice engine named by ``TTS_ENGINE``.
+
+    Only the engines that speak without a prompt or a conversion live here. The
+    prompt-and-convert pair is resolved separately by
+    :func:`synthesize_dialogue_detailed`, because it needs a voice profile per
+    speaker that a single-voice engine has no use for.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    if resolved.tts_engine == "mms":
+        return load_mms_engine(settings=resolved)
+    raise ConfigurationError(
+        f"TTS_ENGINE={resolved.tts_engine!r} is not a single-voice engine; "
+        "supported values here are 'mms'"
+    )
 
 
 def reset_engine_cache() -> None:
@@ -1850,12 +2221,13 @@ def _performance_window(
 
 @dataclass(frozen=True, slots=True)
 class _TtsDirectories:
-    """The four artifact directories of one TTS run."""
+    """The artifact directories of one TTS run."""
 
     performance: Path
     chatterbox: Path
     converted: Path
     clips: Path
+    takes: Path
 
     @classmethod
     def under(cls, base: Path) -> "_TtsDirectories":
@@ -1864,12 +2236,19 @@ class _TtsDirectories:
             chatterbox=base / CHATTERBOX_DIRECTORY_NAME,
             converted=base / CONVERTED_DIRECTORY_NAME,
             clips=base / CLIP_DIRECTORY_NAME,
+            takes=base / TAKE_DIRECTORY_NAME,
         )
 
     def create(self) -> None:
         """Create every directory, creating parents as needed."""
 
-        for directory in (self.performance, self.chatterbox, self.converted, self.clips):
+        for directory in (
+            self.performance,
+            self.chatterbox,
+            self.converted,
+            self.clips,
+            self.takes,
+        ):
             try:
                 directory.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
@@ -2152,6 +2531,65 @@ def _render_clip(
     return speech_duration, lead, trail
 
 
+def _synthesize_line_single_voice(
+    index: int,
+    dialogue: AdaptedDialogue,
+    *,
+    name: str,
+    directories: _TtsDirectories,
+    engine: TextToSpeechEngine,
+    settings: Settings,
+) -> TtsClip:
+    """Run a single-voice engine for one line and describe the result.
+
+    No performance prompt is cut from the stem and no identity conversion happens,
+    because this kind of engine accepts neither: it speaks Amharic in one voice. The
+    pauses are still rendered, and the clip is still the same
+    :class:`TtsClip` the rest of the pipeline consumes, so timing and mixing do not
+    need to know which engine produced it.
+    """
+
+    take = directories.takes / f"{name}.wav"
+    if not _usable_audio(take):
+        engine.synthesize(text=dialogue.amharic, destination=take)
+        _require_output(take, what="take", engine=engine.name)
+
+    clip_path = directories.clips / f"{name}.wav"
+    speech_duration, lead, trail = _render_clip(
+        take,
+        clip_path,
+        pause_before=dialogue.pause_before,
+        pause_after=dialogue.pause_after,
+        max_pause=settings.tts_max_pause_seconds,
+    )
+
+    _, clip_rate = _read_audio_info(clip_path, label="the dubbed clip")
+    return TtsClip(
+        index=index,
+        dialogue=dialogue,
+        performance=PerformanceControls.from_dialogue(
+            dialogue, seed=int(name[:8], 16) if _hex_prefix(name) else 0
+        ),
+        audio_path=clip_path,
+        take_path=take,
+        performance_reference_path=None,
+        voice_reference_path=None,
+        sample_rate=clip_rate,
+        speech_duration=speech_duration,
+        rendered_pause_before=lead,
+        rendered_pause_after=trail,
+        performance_engine=engine.name,
+        style_engine="none",
+    )
+
+
+def _hex_prefix(name: str) -> bool:
+    """``True`` when ``name`` starts with at least eight hex characters."""
+
+    head = name[:8]
+    return len(head) == 8 and all(c in "0123456789abcdefABCDEF" for c in head)
+
+
 def _synthesize_line(
     index: int,
     dialogue: AdaptedDialogue,
@@ -2234,12 +2672,13 @@ def _synthesize_line(
 def synthesize_dialogue_detailed(
     dialogue: Iterable[AdaptedDialogue],
     speech_stem: str | Path,
-    voice_profiles: Mapping[str, VoiceProfile],
+    voice_profiles: Mapping[str, VoiceProfile] | None = None,
     *,
     output_dir: str | Path | None = None,
     settings: Settings | None = None,
     performance_engine: ChatterboxPerformanceEngine | None = None,
     style_engine: VoiceConversionEngine | None = None,
+    tts_engine: TextToSpeechEngine | None = None,
 ) -> SynthesisResult:
     """Synthesize every dubbable line, and report the ones that could not be.
 
@@ -2303,43 +2742,65 @@ def synthesize_dialogue_detailed(
         return SynthesisResult(clips=())
 
     resolved = settings if settings is not None else get_settings()
-    profiles = _validate_profiles(
-        voice_profiles, speakers=[line.speaker_id for line in lines]
-    )
-    stem = _validate_audio_file(speech_stem, label="the BandIt speech stem")
-    _read_audio_info(stem, label="the BandIt speech stem")
+    single_voice = tts_engine is not None or resolved.tts_engine != "chatterbox"
 
-    # Validate the reference audio of every speaker that is about to be used
-    # before any model runs: a missing reference should fail the run the same way
-    # whether or not earlier lines could already be synthesized.
-    for speaker_id in dict.fromkeys(line.speaker_id for line in lines):
-        reference = profiles[speaker_id].resolve_reference_audio()
-        _validate_audio_file(reference, label=f"the voice reference of speaker {speaker_id!r}")
-
-    minimum = _positive(
-        "TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
-        resolved.tts_performance_reference_min_duration,
-    )
-    maximum = _positive(
-        "TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
-        resolved.tts_performance_reference_max_duration,
-    )
-    if maximum < minimum:
-        raise ConfigurationError(
-            f"TTS_PERFORMANCE_REFERENCE_MAX_DURATION ({maximum}) must not be smaller "
-            f"than TTS_PERFORMANCE_REFERENCE_MIN_DURATION ({minimum})"
+    if single_voice:
+        # A single-voice engine has no use for voice profiles, and requiring them
+        # would mean building identities the engine cannot honour.
+        profiles: Mapping[str, VoiceProfile] = {}
+        speech = _validate_audio_file(speech_stem, label="the speech stem")
+        _read_audio_info(speech, label="the speech stem")
+        performance = None
+        style = None
+    else:
+        profiles = _validate_profiles(
+            voice_profiles, speakers=[line.speaker_id for line in lines]
         )
+        stem = _validate_audio_file(speech_stem, label="the BandIt speech stem")
+        _read_audio_info(stem, label="the BandIt speech stem")
+
+        # Validate the reference audio of every speaker that is about to be used
+        # before any model runs: a missing reference should fail the run the same way
+        # whether or not earlier lines could already be synthesized.
+        for speaker_id in dict.fromkeys(line.speaker_id for line in lines):
+            reference = profiles[speaker_id].resolve_reference_audio()
+            _validate_audio_file(
+                reference, label=f"the voice reference of speaker {speaker_id!r}"
+            )
+
+        minimum = _positive(
+            "TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
+            resolved.tts_performance_reference_min_duration,
+        )
+        maximum = _positive(
+            "TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
+            resolved.tts_performance_reference_max_duration,
+        )
+        if maximum < minimum:
+            raise ConfigurationError(
+                f"TTS_PERFORMANCE_REFERENCE_MAX_DURATION ({maximum}) must not be "
+                f"smaller than TTS_PERFORMANCE_REFERENCE_MIN_DURATION ({minimum})"
+            )
+        performance, style = _resolve_engines(
+            settings=resolved,
+            performance_engine=performance_engine,
+            style_engine=style_engine,
+        )
+
     _positive("TTS_MAX_PAUSE_SECONDS", resolved.tts_max_pause_seconds)
     min_line_seconds = _positive(
         "TTS_MIN_LINE_SECONDS", resolved.tts_min_line_seconds
     )
     continue_on_failure = bool(resolved.tts_continue_on_failure)
 
-    performance, style = _resolve_engines(
-        settings=resolved,
-        performance_engine=performance_engine,
-        style_engine=style_engine,
+    engine = tts_engine if tts_engine is not None else (
+        load_tts_engine(settings=resolved) if single_voice else None
     )
+    if engine is not None and not isinstance(engine, TextToSpeechEngine):
+        raise InvalidEngineError(
+            f"tts_engine must be a TextToSpeechEngine adapter, got "
+            f"{type(engine).__name__}"
+        )
 
     directories = _TtsDirectories.under(
         resolve_tts_directory(output_dir=output_dir, settings=resolved)
@@ -2365,6 +2826,19 @@ def synthesize_dialogue_detailed(
 
         digest = _line_digest(line, model=resolved.tts_model)
         try:
+            if engine is not None:
+                clips.append(
+                    _synthesize_line_single_voice(
+                        index,
+                        line,
+                        name=_line_artifact_name(line, model=resolved.tts_model),
+                        directories=directories,
+                        engine=engine,
+                        settings=resolved,
+                    )
+                )
+                continue
+
             clips.append(
                 _synthesize_line(
                     index,
@@ -2441,6 +2915,7 @@ __all__ = [
     "BASE_TEMPERATURE",
     "CFG_WEIGHT_BOUNDS",
     "CHATTERBOX_SAMPLE_RATE",
+    "CLIP_CEILING",
     "EXAGGERATION_BOUNDS",
     "MINIMUM_SPEAKABLE_LINE_SECONDS",
     "MINIMUM_SPEAKABLE_SYLLABLES",
@@ -2464,15 +2939,19 @@ __all__ = [
     "MissingOutputError",
     "MissingVoiceProfileError",
     "SeedVcV2Engine",
+    "MmsAmharicEngine",
     "SkippedLine",
     "SynthesisError",
     "SynthesisResult",
     "TtsClip",
     "TtsError",
     "VoiceConversionEngine",
+    "TextToSpeechEngine",
     "extract_performance_reference",
     "load_chatterbox_engine",
+    "load_mms_engine",
     "load_seed_vc_engine",
+    "load_tts_engine",
     "reset_engine_cache",
     "seed_vc_revision",
     "resolve_tts_directory",

@@ -136,6 +136,11 @@ def _settings(**overrides) -> Settings:
         "output_dir": Path("output"),
         "model_cache_dir": Path("models"),
         "deepseek_api_key": "test-key",
+        # This file exercises the instruction-following backend against a fake
+        # client. Pinning it explicitly is what keeps the tests off the network: the
+        # project default is now NLLB, which would try to download real weights.
+        "translation_backend": "openai",
+        "translation_model": "deepseek-flash",
     }
     values.update(overrides)
     return Settings(**values)
@@ -376,13 +381,32 @@ def test_client_uses_the_configured_base_url_and_key(monkeypatch):
     ]
 
 
-def test_default_model_is_deepseek_flash(monkeypatch):
+def test_the_instruction_backend_uses_its_configured_model(monkeypatch):
+    """The project default is NLLB; this is the hosted backend when it is selected."""
+
     _patch(monkeypatch)
 
     adapt_dialogue([_segment()], settings=_settings())
 
-    assert DEFAULT_TRANSLATION_MODEL == "deepseek-flash"
     assert FakeOpenAI.requests[0]["model"] == "deepseek-flash"
+    # The default model belongs to the default backend, not to this one.
+    assert DEFAULT_TRANSLATION_MODEL != "deepseek-flash"
+
+
+def test_the_default_backend_is_local_nllb():
+    from app.config import DEFAULT_TRANSLATION_BACKEND
+
+    assert DEFAULT_TRANSLATION_BACKEND == "nllb"
+    assert "nllb" in DEFAULT_TRANSLATION_MODEL
+
+
+def test_an_unknown_backend_is_rejected(monkeypatch):
+    _patch(monkeypatch)
+
+    with pytest.raises(ConfigurationError, match="TRANSLATION_BACKEND"):
+        adapt_dialogue(
+            [_segment()], settings=_settings(translation_backend="google-translate")
+        )
 
 
 def test_the_configured_model_is_used(monkeypatch):

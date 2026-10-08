@@ -76,7 +76,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _settings(root: Path, **overrides: object) -> Settings:
-    """Return settings pointing every directory at ``root``."""
+    """Return settings pointing every directory at ``root``.
+
+    The engine is pinned to the prompt-and-convert pair: this file exercises that
+    path, so it has to ask for it rather than inherit whatever the project default
+    happens to be.
+    """
 
     values: dict[str, object] = {
         "input_dir": root,
@@ -85,6 +90,8 @@ def _settings(root: Path, **overrides: object) -> Settings:
         "model_cache_dir": root,
         "voice_profile_dir": root / "voices",
         "seed_vc_repo_path": root / "seed-vc",
+        "tts_engine": "chatterbox",
+        "tts_model": "gabar-tech/chatterbox-amharic",
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]

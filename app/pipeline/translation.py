@@ -61,6 +61,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.config import Settings, get_settings
+from app.pipeline import nllb
 from app.pipeline.amharic_text import latin_spans
 from app.pipeline.dialogue_context import (
     DEFAULT_BUDGET_TOLERANCE,
@@ -254,6 +255,10 @@ class DialogueIdError(InvalidModelOutputError, ValueError):
 
 class InvalidTranscriptSegmentsError(TranslationError, ValueError):
     """The supplied input is not an iterable of TranscriptSegment."""
+
+
+class NllbTranslationError(TranslationError):
+    """The NLLB backend could not translate a line."""
 
 
 class InvalidSegmentError(TranslationError, ValueError):
@@ -786,6 +791,69 @@ def _reduce_overshooting_lines(
     return adapted, final
 
 
+#: Performance metadata for a line produced by a *translation* backend such as NLLB.
+#: A plain translation model has no opinion about how a line should be performed -
+#: it has never seen the scene, the character or the delivery - so the honest value
+#: is a neutral default rather than an invented performance. The information is not
+#: lost: it was never produced. Recording it explicitly keeps
+#: :class:`AdaptedDialogue` valid without pretending the model decided anything.
+NEUTRAL_EMOTION = "neutral"
+NEUTRAL_INTENSITY = 0.5
+NEUTRAL_DELIVERY = "neutral"
+NEUTRAL_PAUSE = 0.0
+
+
+def _adapt_with_nllb(
+    transcript: list[TranscriptSegment],
+    *,
+    settings: Settings,
+    translator: Any | None = None,
+) -> list[AdaptedDialogue]:
+    """Translate every line with NLLB and return validated dialogue.
+
+    The application still owns identity and timing: ``speaker_id``, ``start`` and
+    ``end`` come from the transcript and are never touched. What NLLB supplies is the
+    Amharic text and nothing else - see :data:`NEUTRAL_EMOTION` for why the
+    performance fields are defaults here.
+    """
+
+    engine = translator if translator is not None else nllb.load_translator(settings=settings)
+
+    adapted: list[AdaptedDialogue] = []
+    for index, segment in enumerate(transcript, start=1):
+        line_id = _dialogue_id(index)
+        try:
+            translated = engine.translate(segment.text)
+        except Exception as exc:
+            raise NllbTranslationError(
+                f"NLLB could not translate {line_id} "
+                f"({segment.start:.3f}s-{segment.end:.3f}s): "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        try:
+            adapted.append(
+                AdaptedDialogue(
+                    speaker_id=segment.speaker_id,
+                    start=segment.start,
+                    end=segment.end,
+                    source_text=segment.text,
+                    amharic=translated.text,
+                    emotion=NEUTRAL_EMOTION,
+                    intensity=NEUTRAL_INTENSITY,
+                    delivery=NEUTRAL_DELIVERY,
+                    pause_before=NEUTRAL_PAUSE,
+                    pause_after=NEUTRAL_PAUSE,
+                )
+            )
+        except InvalidSegmentError as exc:
+            raise InvalidModelOutputError(
+                f"NLLB returned an unusable translation for {line_id!r}: {exc}"
+            ) from exc
+
+    return adapted
+
+
 def adapt_dialogue(
     segments: Iterable[TranscriptSegment],
     *,
@@ -796,6 +864,7 @@ def adapt_dialogue(
     budget_tolerance: float = DEFAULT_BUDGET_TOLERANCE,
     enforce_budget: bool = True,
     enforce_fidel_loanwords: bool = True,
+    translator: Any | None = None,
 ) -> list[AdaptedDialogue]:
     """Adapt transcribed dialogue into dubbing-ready Amharic.
 
@@ -866,6 +935,14 @@ def adapt_dialogue(
         # Nothing to adapt, so there is no reason to call the API at all.
         return []
 
+    if settings.translation_backend == "nllb":
+        return _adapt_with_nllb(transcript, settings=settings, translator=translator)
+    if settings.translation_backend != "openai":
+        raise ConfigurationError(
+            f"TRANSLATION_BACKEND must be 'nllb' or 'openai', got "
+            f"{settings.translation_backend!r}"
+        )
+
     api_key = _require_api_key(settings)
     batch_size = _resolve_batch_size(settings)
     client = _build_client(settings, api_key)
@@ -911,6 +988,11 @@ def adapt_dialogue(
 
 __all__ = [
     "DIALOGUE_ID_PREFIX",
+    "NEUTRAL_DELIVERY",
+    "NEUTRAL_EMOTION",
+    "NEUTRAL_INTENSITY",
+    "NEUTRAL_PAUSE",
+    "NllbTranslationError",
     "SYSTEM_PROMPT",
     "AdaptedDialogue",
     "ApiAuthenticationError",

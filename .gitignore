@@ -48,6 +48,12 @@ runs/
 # ---------------------------------------------------------------------------
 models_cache/
 models_cache/**
+# A bare `models/` is not the configured cache directory (`models_cache` is), but a
+# relative MODEL_CACHE_DIR - which is what a test or a quick script tends to set -
+# resolves to exactly this, and a partial download landing in the tree must never be
+# committable.
+models/
+models/**
 .cache/
 .huggingface/
 torch_cache/

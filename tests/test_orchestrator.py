@@ -48,6 +48,10 @@ def _settings(root: Path, **overrides: object) -> Settings:
         "voice_profile_dir": root / "voices",
         "seed_vc_repo_path": root / "seed-vc",
         "dialogue_bible_path": root / "work" / "dialogue_bible.json",
+        # These tests exercise the per-character path, which needs voice profiles,
+        # so they pin the engine that uses them rather than inheriting the default.
+        "tts_engine": "chatterbox",
+        "tts_model": "gabar-tech/chatterbox-amharic",
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]

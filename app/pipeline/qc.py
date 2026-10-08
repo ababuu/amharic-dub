@@ -166,11 +166,36 @@ class LineMetrics:
 
     @property
     def syllables_per_second(self) -> float:
-        """How fast the line is actually delivered, in syllables per second."""
+        """How fast the line is *delivered*, in syllables per second."""
 
         if self.speech_duration <= 0:
             return 0.0
         return self.syllables / self.speech_duration
+
+    @property
+    def natural_speech_duration(self) -> float:
+        """How long the line would have run before it was stretched to fit.
+
+        Dividing the applied tempo back out recovers the delivery the engine
+        produced, whatever the fitter did to it afterwards - which is what makes the
+        natural speaking rate measurable from a run that had to stretch its lines.
+        """
+
+        return self.speech_duration * self.tempo
+
+    @property
+    def natural_syllables_per_second(self) -> float:
+        """The rate the engine actually speaks at, before any stretching.
+
+        This is the figure the syllable budget should be computed from. Computing it
+        from the delivered duration instead would read a stretched line as evidence
+        that the engine speaks slower than it does, and the error compounds.
+        """
+
+        natural = self.natural_speech_duration
+        if natural <= 0:
+            return 0.0
+        return self.syllables / natural
 
     @property
     def plausible_rate(self) -> bool:
@@ -195,6 +220,9 @@ class LineMetrics:
             "fits": self.fits,
             "close_fit": self.close_fit,
             "syllables_per_second": round(self.syllables_per_second, 3),
+            "natural_syllables_per_second": round(
+                self.natural_syllables_per_second, 3
+            ),
             "plausible_rate": self.plausible_rate,
             "notes": list(self.notes),
         }

@@ -43,10 +43,53 @@ flowchart LR
 | Source separation    | BandIt v2 Multi                         |
 | Diarization          | pyannote Community-1                    |
 | Transcription        | faster-whisper large-v3                 |
-| Translation/adaptation | DeepSeek V4.1 Flash API (any OpenAI-compatible endpoint, local or hosted) |
-| Speech synthesis     | Chatterbox Multilingual v3 + gabar-tech Amharic adapter |
-| Voice conversion     | Seed-VC V2 (timbre-only, `convert_style=false`) |
+| Translation/adaptation | **NLLB-200 distilled 1.3B** (default, local) or any OpenAI-compatible endpoint (opt-in) |
+| Speech synthesis     | **MMS-TTS Amharic** (`facebook/mms-tts-amh`, default) or Chatterbox + the Amharic adapter (opt-in) |
+| Voice conversion     | Seed-VC V2 (timbre-only) - only used by the Chatterbox path |
 | Quality control      | `qc.py` (model-free; pronunciation measurement is injected) |
+
+## Choosing a translation backend
+
+`TRANSLATION_BACKEND` selects between two genuinely different things, and the
+difference is worth understanding before changing it:
+
+| | `nllb` (default) | `openai` |
+| --- | --- | --- |
+| What it is | a translation model, 200 languages | an instruction-following LLM |
+| Amharic | real parallel training data behind `amh_Ethi` | incidental, and often weak |
+| Scene/character context | no | yes, via the character bible |
+| Syllable budget + re-ask | no | yes |
+| Borrowed-word policy (Fidel) | prompt-level only, unenforced | enforced |
+| Per-line performance metadata | neutral defaults | emotion, intensity, delivery, pauses |
+| Runs locally, no key | yes | no |
+
+NLLB translates; it does not *adapt*. It has never seen the scene or the character,
+so it cannot keep a joke, match a register, or shorten a line to fit - and the
+performance fields on each line are neutral defaults rather than anything the model
+decided. That is the real cost of the default, and it is stated rather than hidden.
+
+## Choosing a speech engine
+
+`TTS_ENGINE` selects between two very different capabilities:
+
+| | `mms` (default) | `chatterbox` |
+| --- | --- | --- |
+| Voice(s) | **one for the whole film** | one per character |
+| Speaker identity | none - single-speaker VITS | cloned from the character's own audio |
+| Actor performance preserved | no | yes, prompted with the original line |
+| Input script | Fidel, romanised with `uroman` | Fidel |
+| Voice profiles needed | no | yes, one per speaker |
+| Determinism | seeded duration predictor | seeded sampling controls |
+
+MMS-TTS Amharic is a VITS model trained on a **single speaker**, so every character
+comes out in the same voice. The pipeline says so rather than pretending otherwise:
+with `TTS_ENGINE=mms` the voice-profile stage is skipped, the clip records no
+identity or performance reference, and `coverage` reports what the material
+exercised. Per-character voices require `TTS_ENGINE=chatterbox`.
+
+`MMS_SPEAKING_RATE` is asked of the model's duration predictor *before* synthesis,
+so a line can be made to fit its window without being time-stretched afterwards -
+which is why this engine leans on `timing.py` less than the Chatterbox path does.
 | Delivery (later)     | Bunny Stream                            |
 
 Target GPU: **NVIDIA RTX A40 (48 GB VRAM)**.
@@ -85,6 +128,7 @@ amharic-dub/
       transcription.py        # faster-whisper large-v3 transcription (implemented)
       translation.py          # DeepSeek Amharic dialogue adaptation (implemented)
       voice_profiles.py       # per-speaker voice references + clone-prompt cache (implemented)
+      nllb.py                 # local NLLB-200 translation (default backend) (implemented)
       dialogue_context.py     # scenes, character bible, syllable budget (implemented)
       amharic_text.py         # Ethiopic syllables + homophone folding (implemented)
       tts.py                  # Chatterbox Amharic + Seed-VC V2 synthesis (implemented)
@@ -137,8 +181,15 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSCRIPTION_MODEL` | faster-whisper model for transcription            | `large-v3`         |
 | `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
 | `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |
-| `TRANSLATION_BASE_URL` | DeepSeek API endpoint (OpenAI-compatible)        | `https://api.deepseek.com` |
-| `TRANSLATION_MODEL` | DeepSeek model for dialogue adaptation            | `deepseek-flash`   |
+| `TRANSLATION_BACKEND` | `nllb` (local translation) or `openai` (instruction-following adaptation) | `nllb` |
+| `TRANSLATION_MODEL`  | Model for the selected backend                | `facebook/nllb-200-distilled-1.3B` |
+| `TRANSLATION_NUM_BEAMS` | NLLB beam width; `1` is greedy and deterministic | `1` |
+| `TRANSLATION_MAX_NEW_TOKENS` | Longest NLLB output per chunk, in tokens | `512` |
+| `TTS_ENGINE`        | `mms` (single voice) or `chatterbox` (per character) | `mms` |
+| `MMS_SEED`          | Fixes the MMS duration predictor, so a line is the same length every run | `0` |
+| `MMS_SPEAKING_RATE` | Rate asked of the MMS duration predictor before synthesis | `1.0` |
+| `CHATTERBOX_MODEL`  | The Amharic adapter used when `TTS_ENGINE=chatterbox` | `gabar-tech/chatterbox-amharic` |
+| `TRANSLATION_BASE_URL` | OpenAI-compatible endpoint (only for `TRANSLATION_BACKEND=openai`) | `https://api.deepseek.com` |
 | `TRANSLATION_BATCH_SIZE` | Dialogue lines adapted per request           | `10`               |
 | `TRANSLATION_DISABLE_THINKING` | Turn off reasoning/thinking mode       | `true`             |
 | `TRANSLATION_ENFORCE_BUDGET` | Send a line that is over its syllable budget back once to be shortened | `true` |
@@ -794,7 +845,10 @@ pytest tests/test_config.py
 - [x] `diarization`: crosstalk from the overlap-aware view, speaker-count hints
 - [x] `prosody` + `evaluation`: coverage, identity consistency, performance
       preservation, and baseline comparison
-- [ ] Representative evaluation clips: record a scored baseline on real material
+- [x] `nllb`: local NLLB-200 translation as the default backend
+- [x] `mms`: MMS-TTS Amharic single-voice engine (and the `chatterbox` alternative)
+- [x] Peak limiting so a clip is attenuated, never silently truncated
+- [ ] Record a scored baseline on real material with the new engines
 - [ ] Per-stage resume, so a long run continues instead of restarting
 - [ ] Mix realism: ambience continuity, dialogue EQ/reverb match, EBU R128
 - [ ] Character-name reconciliation above the diarization clusters

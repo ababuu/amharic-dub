@@ -252,10 +252,16 @@ class PipelineResult:
             f"elapsed         {self.elapsed_seconds:.1f} s",
         ]
         if self.partial:
+            reasons: list[str] = []
+            if self.skipped:
+                reasons.append(f"{len(self.skipped)} line(s) could not be voiced")
+            if self.synthesized_lines + len(self.skipped) < len(self.dialogue):
+                reasons.append("--max-lines")
+            detail = f" ({'; '.join(reasons)})" if reasons else ""
             lines.insert(
                 6,
                 f"PARTIAL DUB     only {self.synthesized_lines} of "
-                f"{len(self.dialogue)} line(s) were synthesized (--max-lines)",
+                f"{len(self.dialogue)} line(s) were synthesized{detail}",
             )
         return "\n".join(lines)
 
@@ -462,23 +468,33 @@ def run_pipeline(
     if not dialogue:
         raise EmptyStageError("adaptation produced no lines; nothing to synthesize")
 
-    # Built from every transcribed line, not from a shortened run: a profile is a
-    # character's identity and is reused across runs, so it is never truncated.
-    profiles = _stage(
-        "voice_profiles",
-        seconds,
-        report,
-        voice_profiles.build_voice_profiles,
-        turns,
-        stems.speech,
-        transcript=lines,
-        settings=resolved,
-    )
-    if not profiles:
-        raise EmptyStageError(
-            "no voice profile could be built from the dialogue stem; the TTS stage "
-            "needs one identity reference per speaker"
+    # Voice profiles answer "what should this character sound like?" - a question only
+    # a per-character engine can act on. A single-voice engine speaks everyone the
+    # same way, so building identities for it would be work whose only result is a
+    # set of references nothing reads.
+    single_voice = resolved.tts_engine != "chatterbox"
+    profiles: Mapping[str, VoiceProfile] = {}
+    if single_voice:
+        seconds["voice_profiles"] = 0.0
+        report(f"  voice profiles: skipped ({resolved.tts_engine} is single-voice)")
+    else:
+        # Built from every transcribed line, not from a shortened run: a profile is a
+        # character's identity and is reused across runs, so it is never truncated.
+        profiles = _stage(
+            "voice_profiles",
+            seconds,
+            report,
+            voice_profiles.build_voice_profiles,
+            turns,
+            stems.speech,
+            transcript=lines,
+            settings=resolved,
         )
+        if not profiles:
+            raise EmptyStageError(
+                "no voice profile could be built from the dialogue stem; the TTS stage "
+                "needs one identity reference per speaker"
+            )
 
     spoken = dialogue
     if max_lines is not None and max_lines < len(dialogue):
@@ -496,7 +512,7 @@ def run_pipeline(
         tts.synthesize_dialogue_detailed,
         spoken,
         stems.speech,
-        profiles,
+        profiles or None,
         settings=resolved,
     )
     clips = tuple(synthesized.clips)
