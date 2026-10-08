@@ -150,6 +150,34 @@ can test and run the health check before configuring credentials.
 cp .env.example .env   # then edit .env and fill in real values
 ```
 
+### Which variables you actually have to set
+
+`.env.example` and the table above are the complete catalogue of knobs, listing
+every setting with the value it already has. **Nothing has to be copied into
+`.env`**: only the two credentials have no fallback, and every other variable has a
+working default resolved against the project root.
+
+| | Variables | Why |
+| --- | --- | --- |
+| Required | `DEEPSEEK_API_KEY`, `HUGGINGFACE_TOKEN` | No fallback value; diarization and adaptation cannot run without them |
+| Required on a Pod | `HF_HOME` | Defaults to the container's `~/.cache/huggingface`, which is lost when the Pod stops |
+| Worth setting | `MODEL_CACHE_DIR`, `SEED_VC_REPO_PATH` | Defaults already resolve under the project root, so they follow the repository onto the volume. Set them to keep weights outside the checkout or share one cache |
+| Everything else | e.g. `TRANSCRIPTION_MODEL`, `TIMING_MAX_TEMPO`, `MIX_DUCK_DB` | Set only to change behaviour |
+
+Values are resolved in three layers, in this order: a real environment variable,
+then `.env`, then the built-in default. `.env` never overrides a real environment
+variable, so configuration made on the Pod always wins over a checked-out file.
+
+To see what is actually in effect - including the path every default resolved to -
+without exposing secrets:
+
+```bash
+python -c "from app.config import get_settings; print(get_settings().as_dict())"
+```
+
+The two credentials appear only as the booleans `deepseek_api_key_set` and
+`huggingface_token_set`; their values are never printed or logged.
+
 ## Quickstart - RunPod A40 worker
 
 The pipeline runs on a GPU worker; the repository is Git-based, so the runbook is
@@ -170,21 +198,32 @@ in a shell later. A Pod environment variable exists before Python starts, which 
 what `HF_HOME` needs, and it survives reconnects:
 
 ```
-DEEPSEEK_API_KEY=...                 # dialogue adaptation
-HUGGINGFACE_TOKEN=hf_...             # gated pyannote Community-1 weights
-HF_HOME=/workspace/models_cache      # must precede any Hugging Face import
-MODEL_CACHE_DIR=/workspace/models_cache
-SEED_VC_REPO_PATH=/workspace/seed-vc
+DEEPSEEK_API_KEY=...                 # required - dialogue adaptation
+HUGGINGFACE_TOKEN=hf_...             # required - gated pyannote Community-1 weights
+HF_HOME=/workspace/models_cache      # required on a Pod - see below
+MODEL_CACHE_DIR=/workspace/models_cache    # optional; defaults under the repo
+SEED_VC_REPO_PATH=/workspace/seed-vc       # optional; defaults under the repo
 ```
 
-`HUGGINGFACE_TOKEN` only works if that account has accepted the conditions on the
+Create the Hugging Face token with the **Read** role, or as a fine-grained token
+with read access to the gated repository. The pipeline only ever downloads from the
+Hub, so a write token would be unnecessary and riskier if it leaked. Access to a
+gated repository is granted to your **account** by accepting its licence, not by
+the token's role - so a Read token works, as long as the account has been approved
+on the
 [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
 model page.
 
-`HF_HOME` is frozen when `huggingface_hub` is first imported, so it has to be a
-real environment variable - exporting it in a shell works but has to be repeated
-every session, and putting it in `.env` does **not** work. The other four can also
-go in a `.env` in the project root, which `app.config` loads while never letting it
+`HF_HOME` is the one variable that has to be set even though the project also
+works without it: its default is the container's `~/.cache/huggingface`, which is
+lost when the Pod stops. It is frozen when `huggingface_hub` is first imported, so
+it has to be a real environment variable - exporting it in a shell works but must
+be repeated every session, and putting it in `.env` does not work at all.
+`MODEL_CACHE_DIR` and `SEED_VC_REPO_PATH` are listed for completeness: their
+defaults already resolve under the project root, so if you cloned onto the volume
+they are on the volume too. Set them only to put the weights somewhere else, such
+as a cache shared between checkouts. The other four variables can also go in a
+`.env` in the project root, which `app.config` loads while never letting it
 override a real environment variable; `.env` is git-ignored, so it is never
 committed. Changing a running Pod's variables requires restarting it.
 
