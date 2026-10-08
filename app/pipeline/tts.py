@@ -1228,6 +1228,11 @@ def _adapt_seed_vc_vocoder_downloads(repo_path: Path) -> None:
     dropping them changes nothing observable. The patch is confined to the vocoder
     module rather than applied to ``huggingface_hub`` globally, so nothing else in
     the process sees it.
+
+    This is the only place in the checkout that needs adapting: every other hub
+    call there - ``hf_utils.py``, ``modules/v2/vc_wrapper.py``,
+    ``modules/astral_quantization/default_model.py`` - passes only arguments that
+    still exist.
     """
 
     try:

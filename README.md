@@ -402,6 +402,24 @@ Two engines run per line, in this order:
    `(mp3_bytes, full_audio)` with the completed `(sample_rate, samples)` only on
    the final chunk.
 
+The checkout was written against `huggingface_hub` 0.x (its own requirements ask
+only for `>=0.28.1`), while this project runs the 1.x line: `transformers` 5.x,
+which Chatterbox needs, requires `huggingface-hub>=1.3.0`. Two arguments were
+removed in that major release and Seed-VC's BigVGAN vocoder still uses both -
+`ModelHubMixin.from_pretrained` no longer passes `proxies` and `resume_download`
+to `_from_pretrained` (which declares them as required), and `hf_hub_download` no
+longer accepts them either. Pinning hub down is not an option, because it would
+break the engine that works, so `app.pipeline.tts` adapts the checkout at load
+time instead: the vocoder's config node gains the two arguments, and the vocoder
+module's own `hf_hub_download` drops them. Both only ever selected defaults hub now
+applies itself, and the adaptation touches nothing else in the process. It is the
+only incompatible call site in the checkout.
+
+Note that Seed-VC's `hf_utils.py` writes its checkpoints to `./checkpoints`
+relative to the current directory, so they land next to wherever a run is started
+rather than under `MODEL_CACHE_DIR`. Run the pipeline from the repository root to
+keep them in one predictable place.
+
 The two references come from two different places on purpose. Chatterbox's prompt
 decides *how* the line is performed, so it is the original actor's own audio for
 that line, cut from the clean BandIt speech stem and centred on the line (padded
