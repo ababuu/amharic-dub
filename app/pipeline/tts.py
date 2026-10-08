@@ -18,8 +18,14 @@ Two engines run in sequence for every line, each behind its own adapter:
    adapter repository (``amharic_tts.py`` -> ``load_amharic_tts``), so training
    and inference see the same text front-end.
 2. :class:`SeedVcV2Engine` - Seed-VC V2 converts that take into the character's
-   identity with ``convert_style=True``, which keeps the accent and emotion of
-   the take while replacing the timbre.
+   identity. It runs in its **timbre-only** mode (``convert_style=False``), which
+   replaces the voice without touching the delivery. The style-converting mode
+   must not be used here: Seed-VC V2's style branch conditions its autoregressive
+   stage on the *reference's* acoustic tokens and content indices, so it speaks the
+   source content in the reference's accent and emotion. The character reference is
+   the original actor's English audio, so switching that mode on would re-impose an
+   English accent on the Amharic and overwrite the very performance the Chatterbox
+   prompt carried over.
 
 Why each reference is what it is
 --------------------------------
@@ -96,6 +102,7 @@ import numpy as np
 import soundfile as sf
 
 from app.config import (
+    DEFAULT_SEED_VC_CONVERT_STYLE,
     DEFAULT_SEED_VC_DIFFUSION_STEPS,
     DEFAULT_TTS_MODEL,
     DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION,
@@ -176,9 +183,12 @@ SEED_VC_ENGINE_NAME = "seed-vc-v2"
 #: Configuration that describes Seed-VC V2, relative to its checkout.
 SEED_VC_CONFIG_PARTS = ("configs", "v2", "vc_wrapper.yaml")
 
-#: Seed-VC V2 always runs with style conversion on: the Amharic take's accent and
-#: emotion are what the character should keep, only the timbre is replaced.
-SEED_VC_CONVERT_STYLE = True
+#: Seed-VC V2 runs in timbre-only mode by default: it replaces the character's
+#: voice and leaves the take's delivery alone. The flag means "also convert the
+#: *reference's* accent and style", which is the opposite of what this stage needs,
+#: so it is exposed as :data:`SEED_VC_CONVERT_STYLE` - overridable through settings
+#: for a single controlled comparison - rather than hard-coded.
+SEED_VC_CONVERT_STYLE = DEFAULT_SEED_VC_CONVERT_STYLE
 
 #: The V2 wrapper caches the autoregressive model for one sequence at a time,
 #: which is how the repository's own inference script sets it up.
@@ -1333,7 +1343,7 @@ def _seed_vc_device(device: str) -> Any:
 
 
 class SeedVcV2Engine(VoiceConversionEngine):
-    """Adapter around Seed-VC V2, run with style conversion enabled.
+    """Adapter around Seed-VC V2, run in timbre-only mode by default.
 
     Seed-VC is not a package, so this engine runs the ``VCWrapper`` that the
     repository's ``inference_v2.py`` builds from a checkout. The wrapper is created
@@ -1344,6 +1354,14 @@ class SeedVcV2Engine(VoiceConversionEngine):
     :class:`torch.device` (the converter reads ``device.type``), and with
     ``stream_output=True`` the generator yields ``(mp3_bytes, full_audio)`` pairs
     where only the final chunk carries the completed ``(sample_rate, samples)``.
+
+    ``convert_style`` is off unless explicitly asked for: on, Seed-VC V2's
+    autoregressive stage is primed with the *reference's* acoustic tokens and
+    teacher-forced against the *reference's* content indices, so the output
+    inherits the reference's accent and emotion rather than the take's. Because the
+    identity reference is the original actor's audio in the source language, that
+    mode would both anglicise the Amharic and discard the performance this stage
+    exists to preserve.
     """
 
     name = SEED_VC_ENGINE_NAME
@@ -1360,6 +1378,7 @@ class SeedVcV2Engine(VoiceConversionEngine):
         top_p: float = 0.9,
         temperature: float = 1.0,
         repetition_penalty: float = 1.0,
+        convert_style: bool = DEFAULT_SEED_VC_CONVERT_STYLE,
     ) -> None:
         if not isinstance(device, str) or not device.strip():
             raise ConfigurationError("the Seed-VC device must be a non-empty string")
@@ -1371,11 +1390,16 @@ class SeedVcV2Engine(VoiceConversionEngine):
             raise ConfigurationError(
                 f"SEED_VC_DIFFUSION_STEPS must be at least 1, got {diffusion_steps}"
             )
+        if not isinstance(convert_style, bool):
+            raise ConfigurationError(
+                f"SEED_VC_CONVERT_STYLE must be a boolean, got {convert_style!r}"
+            )
 
         self._repo_path = _clip_path("repo_path", repo_path)
         self._device = device.strip()
         self._diffusion_steps = diffusion_steps
         self._length_adjust = _positive("length_adjust", length_adjust)
+        self._convert_style = convert_style
         self._intelligibility_cfg_rate = _rate(
             "intelligibility_cfg_rate", intelligibility_cfg_rate
         )
@@ -1401,9 +1425,13 @@ class SeedVcV2Engine(VoiceConversionEngine):
 
     @property
     def convert_style(self) -> bool:
-        """Always ``True``: the character keeps the take's accent and emotion."""
+        """Whether Seed-VC also converts the reference's accent and style.
 
-        return SEED_VC_CONVERT_STYLE
+        ``False`` by default, which is the mode that leaves the take's delivery
+        intact; see the class docstring for why that is the correct default here.
+        """
+
+        return self._convert_style
 
     def _load(self) -> Any:
         """Build the Seed-VC V2 wrapper once and return it."""
@@ -1477,7 +1505,7 @@ class SeedVcV2Engine(VoiceConversionEngine):
                 top_p=self._top_p,
                 temperature=self._temperature,
                 repetition_penalty=self._repetition_penalty,
-                convert_style=SEED_VC_CONVERT_STYLE,
+                convert_style=self._convert_style,
                 anonymization_only=False,
                 device=self._torch_device,
                 dtype=_seed_vc_dtype(self._device),
@@ -1527,11 +1555,111 @@ class SeedVcV2Engine(VoiceConversionEngine):
 
 
 # ---------------------------------------------------------------------------
+# Seed-VC provenance
+# ---------------------------------------------------------------------------
+
+#: Directory holding the checkout's git metadata.
+SEED_VC_GIT_DIRECTORY = ".git"
+
+#: A commit id is 40 hex characters; abbreviated ones are accepted too.
+_GIT_SHA_LENGTHS = range(7, 41)
+
+
+def _looks_like_commit(value: str) -> bool:
+    """``True`` when ``value`` is shaped like a git object id."""
+
+    return len(value) in _GIT_SHA_LENGTHS and all(
+        character in "0123456789abcdefABCDEF" for character in value
+    )
+
+
+def _read_git_file(path: Path) -> str | None:
+    """Return ``path``'s stripped contents, or ``None`` when it cannot be read."""
+
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip() or None
+    except OSError:
+        return None
+
+
+def _resolve_git_directory(repo_path: Path) -> Path | None:
+    """Return the checkout's real git directory, following a ``.git`` file.
+
+    A normal clone has a ``.git`` directory; a worktree or a submodule has a
+    ``.git`` file containing ``gitdir: <path>``, which is followed when it
+    resolves to an existing directory.
+    """
+
+    candidate = repo_path / SEED_VC_GIT_DIRECTORY
+    if candidate.is_dir():
+        return candidate
+    if not candidate.is_file():
+        return None
+
+    pointer = _read_git_file(candidate)
+    if pointer is None or not pointer.lower().startswith("gitdir:"):
+        return None
+
+    resolved = Path(pointer.split(":", 1)[1].strip())
+    if not resolved.is_absolute():
+        resolved = (candidate.parent / resolved).resolve()
+    return resolved if resolved.is_dir() else None
+
+
+def _read_packed_ref(git_dir: Path, ref: str) -> str | None:
+    """Return ``ref`` from ``packed-refs``, or ``None`` when it is not packed."""
+
+    packed = _read_git_file(git_dir / "packed-refs")
+    if packed is None:
+        return None
+
+    for line in packed.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("^"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[1].strip() == ref:
+            return parts[0].strip() or None
+    return None
+
+
+def seed_vc_revision(repo_path: str | Path) -> str | None:
+    """Return the commit the Seed-VC checkout is sitting on, or ``None``.
+
+    Seed-VC is not a package: it is a ``git clone`` that the pipeline runs code
+    from, and upstream has been read-only since April 2025. Recording the exact
+    commit a run used is therefore the only way to say what produced a dub, and
+    the only way to notice that a re-clone silently changed the engine. Nothing
+    here raises: an unreadable checkout is reported as unknown revision, not turned
+    into a failed run.
+    """
+
+    git_dir = _resolve_git_directory(Path(repo_path))
+    if git_dir is None:
+        return None
+
+    head = _read_git_file(git_dir / "HEAD")
+    if head is None:
+        return None
+
+    if not head.lower().startswith("ref:"):
+        return head if _looks_like_commit(head) else None
+
+    ref = head.split(":", 1)[1].strip()
+    revision = _read_git_file(git_dir / ref) or _read_packed_ref(git_dir, ref)
+    if revision is None or not _looks_like_commit(revision):
+        return None
+    return revision
+
+
+# ---------------------------------------------------------------------------
 # Engine cache
 # ---------------------------------------------------------------------------
 
 _CHATTERBOX_ENGINES: dict[tuple[str, str], ChatterboxAmharicEngine] = {}
-_SEED_VC_ENGINES: dict[tuple[str, str, int], SeedVcV2Engine] = {}
+#: Keyed by device, checkout and diffusion steps *and* the style flag, because two
+#: settings that differ only in that flag need two different engines.
+_SEED_VC_ENGINES: dict[tuple[str, str, int, bool], SeedVcV2Engine] = {}
 
 
 def load_chatterbox_engine(*, settings: Settings | None = None) -> ChatterboxAmharicEngine:
@@ -1563,6 +1691,7 @@ def load_seed_vc_engine(*, settings: Settings | None = None) -> SeedVcV2Engine:
         resolved.device,
         str(resolved.seed_vc_repo_path),
         resolved.seed_vc_diffusion_steps,
+        resolved.seed_vc_convert_style,
     )
     engine = _SEED_VC_ENGINES.get(key)
     if engine is None:
@@ -1570,6 +1699,7 @@ def load_seed_vc_engine(*, settings: Settings | None = None) -> SeedVcV2Engine:
             repo_path=resolved.seed_vc_repo_path,
             device=resolved.device,
             diffusion_steps=resolved.seed_vc_diffusion_steps,
+            convert_style=resolved.seed_vc_convert_style,
         )
         _SEED_VC_ENGINES[key] = engine
     return engine
@@ -2150,6 +2280,7 @@ __all__ = [
     "load_chatterbox_engine",
     "load_seed_vc_engine",
     "reset_engine_cache",
+    "seed_vc_revision",
     "resolve_tts_directory",
     "synthesize_dialogue",
 ]

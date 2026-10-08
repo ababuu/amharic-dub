@@ -56,11 +56,21 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from app.config import Settings, get_settings
+from app.pipeline.dialogue_context import (
+    DEFAULT_BUDGET_TOLERANCE,
+    DEFAULT_SYLLABLES_PER_SECOND,
+    BudgetVerdict,
+    CharacterBible,
+    Scene,
+    SyllableBudget,
+    segment_scenes,
+    syllable_budget,
+)
 from app.pipeline.transcription import TranscriptSegment
 
 try:  # Runtime dependency (pulls in httpx). Guarded so that this module stays
@@ -135,11 +145,21 @@ like a real person on screen IS the goal.
 
 Timing
 ------
-Each line comes with the approximate duration of the original performance. Choose
-wording that can be delivered comfortably inside that window, at the character's
-pace, without rushing and without padding. Punctuation should support spoken
-delivery - use commas, dashes, ellipses and question marks the way a performer
-would breathe and pause.
+Each line comes with the approximate duration of the original performance, and -
+when it is supplied - a `syllable_budget`: the number of Amharic syllables that
+fit that window at a natural speaking pace. Amharic words are usually longer than
+their English equivalents, so a faithful line often needs more time than the
+original took; that is expected, and the budget is what tells you how much room
+you actually have.
+
+Treat the budget as a hard limit, not a suggestion. A line that goes over it will
+either be rushed or stretched, and both sound wrong. If a faithful rendering does
+not fit, say the same thing in fewer words - drop filler, use a shorter synonym or
+restructure the sentence - rather than allowing the line to run long. Never pad a
+line to fill its window, and never cut meaning to reach the budget.
+
+Punctuation should support spoken delivery - use commas, dashes, ellipses and
+question marks the way a performer would breathe and pause.
 
 Performance metadata
 --------------------
@@ -386,24 +406,98 @@ def _batches(
         yield segments[start : start + size]
 
 
+def _scene_of(scenes: Sequence[Scene], position: int) -> Scene | None:
+    """Return the scene holding the line at ``position`` (0-based), if any."""
+
+    for scene in scenes:
+        if position in scene.line_indexes:
+            return scene
+    return None
+
+
+def _context_block(
+    *,
+    scene: Scene | None,
+    scene_lines: int,
+    bible: CharacterBible | None,
+    speakers: Sequence[str],
+) -> str | None:
+    """Build the scene-and-characters preamble for one batch, or ``None``.
+
+    The block is deliberately built from state the application owns - the scene
+    boundaries it derived from the timings, and the character bible it was given -
+    rather than from anything the model inferred, so a request cannot invent a
+    location or a relationship.
+    """
+
+    parts: list[str] = []
+
+    if scene is not None:
+        parts.append(
+            f"SCENE: scene {scene.index + 1} of the film, covering "
+            f"{scene.start:.1f}s to {scene.end:.1f}s, with {scene_lines} line(s) of "
+            f"dialogue in total. {len(scene.speaker_ids)} character(s) are in it."
+        )
+        if len(scene.speaker_ids) > 1:
+            parts.append(
+                " This batch is part of that scene, so the lines belong to the same "
+                "situation and the same conversation."
+            )
+        else:
+            parts.append(
+                " Only one character speaks in this scene, so it is not a "
+                "conversation."
+            )
+
+    if bible is not None:
+        block = bible.as_prompt_block(speakers)
+        if block:
+            parts.append("\nCHARACTERS IN THIS SCENE:\n" + block)
+
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
 def _request_kwargs(
     settings: Settings,
     batch: list[TranscriptSegment],
     ids: list[str],
+    *,
+    context: str | None = None,
+    budgets: Sequence[SyllableBudget] | None = None,
+    rewrite: str | None = None,
 ) -> dict[str, Any]:
-    """Build the ``chat.completions.create`` arguments for one batch."""
+    """Build the ``chat.completions.create`` arguments for one batch.
 
-    payload = {
+    Each line carries the length of the window it has to fill and, when budgets are
+    supplied, the number of syllables it may use: a faithful translation of an
+    English line routinely needs more time than the original took, so the line is
+    asked to fit *before* it is synthesized rather than stretched afterwards.
+    """
+
+    payload: dict[str, Any] = {
         "lines": [
             {
                 "id": line_id,
                 "speaker": segment.speaker_id,  # context only; never returned
                 "duration": round(segment.duration, 3),
                 "text": segment.text,
+                **(
+                    {"syllable_budget": budget.syllables}
+                    if budgets is not None
+                    else {}
+                ),
             }
-            for segment, line_id in zip(batch, ids)
+            for segment, line_id, budget in zip(
+                batch, ids, budgets if budgets is not None else (None,) * len(batch)
+            )
         ]
     }
+    if context:
+        payload["context"] = context
+    if rewrite:
+        payload["rewrite"] = rewrite
 
     kwargs: dict[str, Any] = {
         "model": settings.translation_model,
@@ -559,12 +653,22 @@ def _adapt_batch(
     client: Any,
     settings: Settings,
     batch: list[TranscriptSegment],
-    first_position: int,
+    ids: list[str],
+    *,
+    context: str | None = None,
+    budgets: Sequence[SyllableBudget] | None = None,
+    rewrite: str | None = None,
 ) -> list[AdaptedDialogue]:
-    """Adapt one batch of consecutive lines, in order."""
+    """Adapt one batch of consecutive lines, in order.
 
-    ids = [_dialogue_id(first_position + offset) for offset in range(len(batch))]
-    kwargs = _request_kwargs(settings, batch, ids)
+    The ids are supplied by the caller rather than derived from a start position,
+    because a retry sends a *subset* of a batch and each line must keep the id it
+    was given the first time.
+    """
+
+    kwargs = _request_kwargs(
+        settings, batch, ids, context=context, budgets=budgets, rewrite=rewrite
+    )
 
     try:
         response = client.chat.completions.create(**kwargs)
@@ -575,10 +679,73 @@ def _adapt_batch(
     return [_build(segment, line_id, lines[line_id]) for segment, line_id in zip(batch, ids)]
 
 
+def _reduce_overshooting_lines(
+    client: Any,
+    settings: Settings,
+    batch: list[TranscriptSegment],
+    first_position: int,
+    adapted: list[AdaptedDialogue],
+    budgets: Sequence[SyllableBudget],
+    *,
+    context: str | None,
+    tolerance: float,
+) -> tuple[list[AdaptedDialogue], tuple[BudgetVerdict, ...]]:
+    """Ask once more for the lines that came back too long for their window.
+
+    English and Amharic do not express the same idea in the same number of
+    syllables, so a faithful adaptation routinely overshoots. The literature's
+    answer - and the one that preserves performance - is to make the *text* shorter
+    rather than the audio faster, so an overshooting line is sent back with the
+    number of syllables to cut. Only the offending lines are resent, and only once:
+    what is still too long afterwards is reported in the verdicts rather than
+    retried indefinitely.
+    """
+
+    verdicts = tuple(
+        budget.verdict(line.amharic, tolerance=tolerance)
+        for budget, line in zip(budgets, adapted)
+    )
+    offenders = [index for index, verdict in enumerate(verdicts) if not verdict.within_tolerance]
+    if not offenders:
+        return adapted, verdicts
+
+    ids = [_dialogue_id(first_position + index) for index in offenders]
+    instruction = "\n".join(
+        f"- {_dialogue_id(first_position + index)}: {verdicts[index].describe()}"
+        for index in offenders
+    )
+    retried = _adapt_batch(
+        client,
+        settings,
+        [batch[index] for index in offenders],
+        ids,
+        context=context,
+        budgets=[budgets[index] for index in offenders],
+        rewrite=(
+            "These lines were longer than their window allows. Rewrite each of them "
+            "shorter, keeping the meaning, tone and character - prefer dropping "
+            "filler and restructuring over cutting meaning.\n" + instruction
+        ),
+    )
+    for slot, line in zip(offenders, retried):
+        adapted[slot] = line
+
+    final = tuple(
+        budget.verdict(line.amharic, tolerance=tolerance)
+        for budget, line in zip(budgets, adapted)
+    )
+    return adapted, final
+
+
 def adapt_dialogue(
     segments: Iterable[TranscriptSegment],
     *,
     settings: Settings | None = None,
+    scenes: Sequence[Scene] | None = None,
+    bible: CharacterBible | None = None,
+    syllables_per_second: float = DEFAULT_SYLLABLES_PER_SECOND,
+    budget_tolerance: float = DEFAULT_BUDGET_TOLERANCE,
+    enforce_budget: bool = True,
 ) -> list[AdaptedDialogue]:
     """Adapt transcribed dialogue into dubbing-ready Amharic.
 
@@ -592,6 +759,23 @@ def adapt_dialogue(
         Project settings override; defaults to :func:`app.config.get_settings`.
         The API key, base URL, model, batch size and thinking toggle all come from
         here - nothing is hard-coded in this module.
+    scenes:
+        Scene boundaries from
+        :func:`app.pipeline.dialogue_context.segment_scenes`. Derived from the
+        transcript's own timings when not supplied, so the model is always told
+        which lines share a situation. Passing ``()`` disables scene context.
+    bible:
+        The persistent :class:`~app.pipeline.dialogue_context.CharacterBible`, so
+        names, address forms and register survive the whole film instead of being
+        re-derived from a ten-line window.
+    syllables_per_second, budget_tolerance:
+        The rate a performer delivers Amharic at and how far over the resulting
+        budget a line may be before it is sent back to be shortened. Both come
+        from :mod:`app.pipeline.dialogue_context`.
+    enforce_budget:
+        When ``True`` (the default), a line that comes back too long for its window
+        is re-asked once. Set ``False`` to send every line exactly once, which is
+        cheaper and is the right choice for a comparison run.
 
     Returns
     -------
@@ -629,10 +813,39 @@ def adapt_dialogue(
     batch_size = _resolve_batch_size(settings)
     client = _build_client(settings, api_key)
 
+    resolved_scenes = segment_scenes(transcript) if scenes is None else tuple(scenes)
+
     adapted: list[AdaptedDialogue] = []
     position = 1
     for batch in _batches(transcript, batch_size):
-        adapted.extend(_adapt_batch(client, settings, batch, position))
+        first_position = position
+        ids = [_dialogue_id(first_position + offset) for offset in range(len(batch))]
+        budgets = [syllable_budget(line.duration, rate=syllables_per_second) for line in batch]
+
+        scene = _scene_of(resolved_scenes, first_position - 1)
+        context = _context_block(
+            scene=scene,
+            scene_lines=scene.line_count if scene is not None else len(batch),
+            bible=bible,
+            speakers=[line.speaker_id for line in batch],
+        )
+
+        produced = _adapt_batch(
+            client, settings, batch, ids, context=context, budgets=budgets
+        )
+        if enforce_budget:
+            produced, _ = _reduce_overshooting_lines(
+                client,
+                settings,
+                batch,
+                first_position,
+                produced,
+                budgets,
+                context=context,
+                tolerance=budget_tolerance,
+            )
+
+        adapted.extend(produced)
         position += len(batch)
 
     return adapted

@@ -22,13 +22,14 @@ flowchart LR
     V[Source video] --> SEP[Source separation<br/>BandIt v2 Multi]
     SEP -->|dialogue| DIA[Speaker diarization<br/>pyannote Community-1]
     DIA --> ASR[Transcription<br/>faster-whisper large-v3]
-    ASR --> TR[Adapt + translate to Amharic<br/>DeepSeek V4.1 Flash]
+    ASR --> TR[Adapt + translate to Amharic<br/>scene + character bible + syllable budget]
     TR --> VP[Voice profiles<br/>best clean reference per speaker]
     VP --> TTS[Speech synthesis + voice adaptation<br/>Chatterbox Amharic → Seed-VC V2]
     TTS --> TIM[Timing alignment]
     TIM --> MIX[Mixing]
     SEP -->|music + effects| MIX
-    MIX --> OUT[Dubbed video<br/>Bunny Stream]
+    MIX --> QC[Quality control<br/>fit, rate, crosstalk]
+    QC --> OUT[Dubbed video<br/>Bunny Stream]
 ```
 
 ## Tech stack
@@ -42,9 +43,10 @@ flowchart LR
 | Source separation    | BandIt v2 Multi                         |
 | Diarization          | pyannote Community-1                    |
 | Transcription        | faster-whisper large-v3                 |
-| Translation/adaptation | DeepSeek V4.1 Flash API               |
+| Translation/adaptation | DeepSeek V4.1 Flash API (any OpenAI-compatible endpoint, local or hosted) |
 | Speech synthesis     | Chatterbox Multilingual v3 + gabar-tech Amharic adapter |
-| Voice conversion     | Seed-VC V2                              |
+| Voice conversion     | Seed-VC V2 (timbre-only, `convert_style=false`) |
+| Quality control      | `qc.py` (model-free; pronunciation measurement is injected) |
 | Delivery (later)     | Bunny Stream                            |
 
 Target GPU: **NVIDIA RTX A40 (48 GB VRAM)**.
@@ -83,9 +85,14 @@ amharic-dub/
       transcription.py        # faster-whisper large-v3 transcription (implemented)
       translation.py          # DeepSeek Amharic dialogue adaptation (implemented)
       voice_profiles.py       # per-speaker voice references + clone-prompt cache (implemented)
+      dialogue_context.py     # scenes, character bible, syllable budget (implemented)
+      amharic_text.py         # Ethiopic syllables + homophone folding (implemented)
       tts.py                  # Chatterbox Amharic + Seed-VC V2 synthesis (implemented)
       timing.py               # pitch-preserving fit to the original timings (implemented)
       mixing.py               # dialogue over ducked music + effects (implemented)
+      qc.py                   # measures each run: fit, rate, crosstalk (implemented)
+      prosody.py              # model-free pitch tracking for performance checks (implemented)
+      evaluation.py           # coverage, identity, performance, baselines (implemented)
       video.py                # FFmpeg extraction + mux into a dubbed MP4 (implemented)
       orchestrator.py         # runs every stage and produces the deliverable (implemented)
     models/                   # shared model loading/caching (placeholder)
@@ -125,6 +132,8 @@ environment, so values configured on the RunPod pod always win.
 | `OUTPUT_DIR`        | Final dubbed videos                                 | `./data/output`    |
 | `MODEL_CACHE_DIR`   | Runtime model weight downloads                      | `./models_cache`   |
 | `DIARIZATION_MODEL` | Hugging Face pipeline id for diarization            | `pyannote/speaker-diarization-community-1` |
+| `DIARIZATION_MIN_SPEAKERS` | Fewest speakers diarization may report; unset lets it decide | *(unset)* |
+| `DIARIZATION_MAX_SPEAKERS` | Most speakers diarization may report; unset lets it decide | *(unset)* |
 | `TRANSCRIPTION_MODEL` | faster-whisper model for transcription            | `large-v3`         |
 | `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
 | `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |
@@ -136,6 +145,13 @@ environment, so values configured on the RunPod pod always win.
 | `VOICE_REFERENCE_MIN_DURATION` | Shortest usable voice-cloning reference  | `3.0`              |
 | `VOICE_REFERENCE_TARGET_DURATION` | Preferred reference length            | `10.0`             |
 | `VOICE_REFERENCE_MAX_DURATION` | Longest reference kept (a longer continuous turn is scanned with a sliding window) | `15.0` |
+| `DIALOGUE_BIBLE_PATH` | Persistent character/consistency state for adaptation (see [Cinematic dialogue adaptation](#cinematic-dialogue-adaptation-dialogue_contextpy)) | `$WORK_DIR/dialogue_bible.json` |
+| `TTS_MODEL` | Amharic speech adapter used by the TTS stage   | `gabar-tech/chatterbox-amharic` |
+| `SEED_VC_REPO_PATH` | Seed-VC checkout for the identity-conversion step | `$MODEL_CACHE_DIR/seed-vc` |
+| `SEED_VC_DIFFUSION_STEPS` | Diffusion steps of the Seed-VC V2 converter | `30` |
+| `SEED_VC_CONVERT_STYLE` | Also convert the *reference's* accent and style. **Keep this off** - see [Speech synthesis](#speech-synthesis-ttspy) | `false` |
+| `TTS_PERFORMANCE_REFERENCE_MIN_DURATION` / `..._MAX_DURATION` | Length of the original-performance prompt handed to Chatterbox | `6.0` / `12.0` |
+| `TTS_MAX_PAUSE_SECONDS` | Longest pause rendered around a synthesized line | `2.0` |
 | `TIMING_MIN_TEMPO` | Slowest a line may be stretched to fit its window | `0.80` |
 | `TIMING_MAX_TEMPO` | Fastest a line may be stretched to fit its window | `1.25` |
 | `MIX_DIALOGUE_GAIN_DB` | Dialogue level in the final mix (signed dB)     | `0.0`              |
@@ -154,15 +170,32 @@ cp .env.example .env   # then edit .env and fill in real values
 
 `.env.example` and the table above are the complete catalogue of knobs, listing
 every setting with the value it already has. **Nothing has to be copied into
-`.env`**: only the two credentials have no fallback, and every other variable has a
-working default resolved against the project root.
+`.env`**: the credentials have no fallback, and every other variable has a working
+default resolved against the project root.
 
 | | Variables | Why |
 | --- | --- | --- |
-| Required | `DEEPSEEK_API_KEY`, `HUGGINGFACE_TOKEN` | No fallback value; diarization and adaptation cannot run without them |
+| Required | `HUGGINGFACE_TOKEN` | No fallback value; diarization cannot run without it |
+| Required only for the hosted API | `DEEPSEEK_API_KEY` | Needed when `TRANSLATION_BASE_URL` points at the hosted DeepSeek API. A local OpenAI-compatible server needs no key |
 | Required on a Pod | `HF_HOME` | Defaults to the container's `~/.cache/huggingface`, which is lost when the Pod stops |
-| Worth setting | `MODEL_CACHE_DIR`, `SEED_VC_REPO_PATH` | Defaults already resolve under the project root, so they follow the repository onto the volume. Set them to keep weights outside the checkout or share one cache |
+| Worth setting | `MODEL_CACHE_DIR`, `SEED_VC_REPO_PATH`, `DIALOGUE_BIBLE_PATH` | The first two default under the project root, so they follow the repository onto the volume. The bible is per-film consistency state worth keeping between runs |
 | Everything else | e.g. `TRANSCRIPTION_MODEL`, `TIMING_MAX_TEMPO`, `MIX_DUCK_DB` | Set only to change behaviour |
+
+**Running without a commercial API.** Adaptation talks to any OpenAI-compatible
+endpoint, so a self-hosted server replaces the hosted one by configuration alone -
+no code change:
+
+```
+TRANSLATION_BASE_URL=http://localhost:8000/v1   # vLLM, Ollama, llama.cpp server
+TRANSLATION_MODEL=<the served model name>
+```
+
+Which local model adapts English dialogue into performable Amharic best is an open
+question: no source publishes credible English-to-Amharic *dubbing* quality
+figures, and there is no Amharic dialogue-MT research at all. Treat the choice as a
+bake-off over a few hundred representative lines, scored against the hosted
+baseline on the `qc` block plus a native-speaker read - not as a model swap that
+can be assumed to work.
 
 Values are resolved in three layers, in this order: a real environment variable,
 then `.env`, then the built-in default. `.env` never overrides a real environment
@@ -392,15 +425,33 @@ Two engines run per line, in this order:
    `chatterbox-tts` is installed with `--no-deps` (see
    [Quickstart](#quickstart---runpod-a40-worker)): the packages its code needs are
    declared in `requirements.txt` instead.
-2. **Seed-VC V2** converts that take into the character's identity with
-   `convert_style=True`, which keeps the take's accent and emotion and replaces
-   only the timbre. Seed-VC is not a package, so clone it and point
+2. **Seed-VC V2** converts that take into the character's identity in its
+   **timbre-only mode** (`convert_style=False`, the default), which replaces the
+   voice without touching the delivery. The style-converting mode must not be used
+   here: Seed-VC V2's style branch conditions its autoregressive stage on the
+   *reference's* acoustic tokens and content indices, so it speaks the source
+   content in the reference's accent and emotion. The character reference is the
+   original actor's English audio, so switching that mode on would re-impose an
+   English accent on the Amharic and overwrite the very performance this stage
+   exists to preserve. `SEED_VC_CONVERT_STYLE=true` remains available for a single
+   controlled comparison, and nothing else uses it. Seed-VC is not a package, so
+   clone it and point
    `SEED_VC_REPO_PATH` at the checkout:
-   `git clone https://github.com/Plachtaa/seed-vc <SEED_VC_REPO_PATH>`. Its V2
+   `git clone https://github.com/Plachtaa/seed-vc <SEED_VC_REPO_PATH>`. Upstream
+   has been read-only since April 2025, so **pin a known-good commit**
+   (`git -C <SEED_VC_REPO_PATH> checkout <commit>`): the checkout is the one
+   engine here that is code rather than a pinned dependency, and the run's
+   manifest records `provenance.seed_vc_revision`, so a re-clone that silently
+   moves the engine is visible afterwards. Its V2
    converter is called as its own `inference_v2.py` calls it: a `torch.device`
    (it reads `device.type`) and `stream_output=True`, whose generator yields
    `(mp3_bytes, full_audio)` with the completed `(sample_rate, samples)` only on
    the final chunk.
+
+   Note that `length_adjust`, which the V2 converter also accepts, only has an
+   effect in the style-converting branch it is not using - in timbre-only mode the
+   converted take follows the length of the take it was given. Fitting the line to
+   its window stays where it already was, in `timing.py`.
 
 The checkout was written against `huggingface_hub` 0.x (its own requirements ask
 only for `>=0.28.1`), while this project runs the 1.x line: `transformers` 5.x,
@@ -536,6 +587,129 @@ speech synthesis on purpose: it exists to validate the GPU stages on a new
 machine, and the stages after it need no GPU. Run the orchestrator afterwards to
 get the MP4 - it reuses the clips the runner already wrote.
 
+### Cinematic dialogue adaptation (`dialogue_context.py`, `translation.py`)
+
+Adaptation is where the largest quality gain lives, so the stage is given three
+things a ten-line window cannot provide:
+
+* **Scene structure.** `segment_scenes` cuts the transcript on the silences
+  between lines (and on a maximum scene length), so the model is told which lines
+  share a situation, who is in the scene, and whether it is a conversation at all.
+  The boundaries come from the timings, so the same film always segments the same
+  way.
+* **A character bible.** `CharacterBible` is persistent state - names, aliases,
+  relationships, register, and the canonical Amharic spelling of recurring names
+  and terms - keyed by diarized speaker id and written to
+  `DIALOGUE_BIBLE_PATH`. Consistency across 90-180 minutes then rests on a file a
+  human can edit between runs rather than on an LLM's recall. A missing file is an
+  empty bible, not an error, so a first run just works.
+* **A duration budget.** Amharic words are longer than English ones, so a faithful
+  line often needs more time than the original took. Each line is given the number
+  of **syllables** its window allows - one Fidel character is one syllable, so this
+  needs no G2P model - and a line that comes back over budget is **sent back once
+  with the number of syllables to cut**. Shortening the text is the fix the
+  literature supports; `timing.py` is left to do only a small final trim.
+
+```python
+# What the model receives for one line, alongside the system prompt.
+{"id": "dialogue_000042", "speaker": "SPEAKER_03", "duration": 2.5,
+ "text": "You have to listen to me.", "syllable_budget": 10}
+```
+
+The syllable rate behind the budget is `DEFAULT_SYLLABLES_PER_SECOND` (4.0), which
+is documented as an **initial prior rather than a measurement**. Calibrate it from
+a real run: read the `syllables_per_second` figures the `qc` block reports for the
+lines that *did* fit, and set the constant to their median.
+
+`enforce_budget=False` sends every line exactly once, which is cheaper and is what
+a comparison run wants.
+
+### Quality control (`qc.py`)
+
+Every run measures itself. `qc.py` builds a report from the metadata the stages
+already produced, so it needs no model, no GPU and no audio decoding, and it is
+written into the manifest as the `qc` block and printed as the run's last line:
+
+```
+qc              19/21 line(s) within 10% of their window, 2 not fitted, 1 at an
+                implausible rate, 3 crosstalk region(s) (2.41s)
+```
+
+What it reports, and why each figure is there:
+
+* **Duration fit as a distribution, not an average.** The largest human study of
+  professional dubbing found the audience complaint is an unnatural speaking rate
+  - "too slow, too fast, or too uneven" - so a mean would hide exactly the tail
+  that matters. The block carries the fitted/close/unfitted counts, the
+  close-fit ratio, the mean and worst residual, and the tempo extremes, plus a
+  per-line breakdown.
+* **Speaking rate in syllables per second.** One Fidel character is one syllable,
+  which is what the script encodes, so this needs no grapheme-to-phoneme model
+  (none exists for Amharic). A rate outside the plausible band marks a line no
+  performer could deliver, however well it "fits".
+* **Crosstalk.** Simultaneous speech is what the exclusive diarization cannot
+  describe, so it is reported as a known uncertainty.
+* **Pronunciation, when a transcriber is supplied.** A round trip through an
+  Amharic ASR model gives a character error rate against the text that was
+  synthesized - the only automated check that the dub is *intelligible*. It needs
+  a model, so `build_qc_report(..., transcribe=...)` takes it as an argument and a
+  run leaves it unmeasured rather than pretending. Homophone families (ሀ/ሐ/ኀ, ሰ/ሠ,
+  አ/ዐ, ጸ/ፀ) are folded before comparison, because a difference between them is a
+  spelling choice rather than a pronunciation error.
+
+Nothing in the report fails a run: it states what was measured, and deciding what
+is good enough stays a project decision.
+
+### Evaluation and baselines (`prosody.py`, `evaluation.py`)
+
+`qc.py` measures one run. Two questions decide whether the system is *getting
+better*, and `evaluation.py` answers them:
+
+**Is the evaluation material representative?** A run can score well simply because
+it was easy. Every run therefore reports coverage of the cases that break the
+pipeline in different ways - whispers, shouts, one-word lines, monologues, rapid
+turn-taking, overlapping speech, low and high intensity, English code-switching,
+recurring characters, crowded scenes - and names what is **missing**:
+
+```
+coverage        4/11 categories; missing whisper, shout, long_line, overlapping_speech, ...
+```
+
+The point is that a good score on non-representative material is not evidence.
+
+**Did a change make it worse?** A report can be saved as a baseline and later runs
+compared against it, metric by metric, with a tolerance per metric and a direction
+per metric (more `close_fit_ratio` is better; more `unfitted` is worse). Identity
+and delivery carry tighter tolerances than the rest, because they are the qualities
+least able to absorb drift:
+
+```bash
+# save a baseline, then compare a later run against it
+python -c "from app.pipeline import evaluation as e; e.save_baseline(load_json(), 'baseline.json')"
+```
+
+The two qualities the project is judged on most are measured directly, both by
+injected callables so that nothing is downloaded by a run:
+
+* **Consistent character voices** - `measure_speaker_identity` compares each
+  generated line with its character's own reference and reports the mean, the
+  *worst* line and the spread per character. The worst line matters more than the
+  mean: a character who sounds right four times and like somebody else once is the
+  failure an audience notices, and an average hides it.
+* **Preservation of the actor's performance** - `prosody.py` measures the pitch
+  centre, pitch range and periodicity of the generated take against the original
+  actor's prompt audio, with a model-free autocorrelation tracker. `range_ratio`
+  near `1.0` means the delivery survived; well below it means the take was
+  flattened toward a neutral read, which is what losing the performance sounds like
+  numerically.
+
+`prosody.py` documents its own limitations (an above-range pitch is reported as a
+sub-multiple; a *sustained musical tone* is indistinguishable from a sustained
+vowel by these means; whispers and creaky voice are reported as unvoiced rather than
+guessed at). Its numbers are meaningful as **relative** measurements - both sides of
+a comparison go through the same tracker, so systematic bias largely cancels - and
+should not be quoted as absolute pitches.
+
 ### Configuration-only check (no GPU or API keys required)
 
 The configuration layer and its tests run on any machine with Python 3.12:
@@ -558,15 +732,74 @@ pytest tests/test_config.py
 - [x] `mixing`: dialogue over ducked music and effects
 - [x] `video`: FFmpeg extraction and mux into a dubbed MP4
 - [x] Orchestrator: one command from a video to the deliverable
-- [ ] EBU R128 loudness normalization on the delivered audio
+- [x] `qc`: per-run quality measurement (fit, delivery rate, crosstalk)
+- [x] `dialogue_context`: scenes, character bible, syllable budget
+- [x] Duration-aware adaptation: lines shortened to fit before synthesis
+- [x] `diarization`: crosstalk from the overlap-aware view, speaker-count hints
+- [x] `prosody` + `evaluation`: coverage, identity consistency, performance
+      preservation, and baseline comparison
+- [ ] Representative evaluation clips: record a scored baseline on real material
+- [ ] Per-stage resume, so a long run continues instead of restarting
+- [ ] Mix realism: ambience continuity, dialogue EQ/reverb match, EBU R128
+- [ ] Character-name reconciliation above the diarization clusters
+- [ ] Full-film soak test (separation seams, cluster drift, cost)
 - [ ] Bunny Stream upload/streaming integration
 - [ ] (Later) production API + database
+- [ ] (Optional) 5.1 output; lip regeneration for close-ups
 
 ## Contributing
 
 Contributions are welcome. Each pipeline stage lives in its own module under
 `app/pipeline/` with a docstring describing its intended interface; please keep
 that structure and add tests alongside new code.
+
+## Priorities
+
+The project is judged on, in order:
+
+1. natural cinematic Amharic dialogue
+2. consistent character voices across the whole film
+3. preservation of the actor's emotion and performance
+4. high-quality speech separation
+5. realistic music and effects reconstruction
+6. natural timing and pacing
+7. robustness over 90-180+ minute films
+
+Those are qualities, not features, so they are *measured* rather than asserted:
+see [Evaluation and baselines](#evaluation-and-baselines-prosodypy-evaluationpy).
+Before lower-value infrastructure, the priority is proving those qualities on
+representative material and then on a full-length soak test.
+
+## Licensing
+
+This project is intended to remain open source for personal, non-commercial use.
+Licences of the components are therefore documented here for transparency but do
+**not** drive model selection - the best available component wins on technical
+merit. What is currently in use, so the obligations are known rather than assumed:
+
+| Component | Licence | Note |
+| --- | --- | --- |
+| BandIt v2 (`v2-multi`) | code Apache-2.0, weights **CC-BY-SA-4.0** | share-alike on derivatives; the original BandIt's weights are CC-BY-NC-4.0 and are *not* used |
+| pyannote Community-1 | **CC-BY-4.0**, gated | requires accepting the model card; the HF token must have read access |
+| faster-whisper `large-v3` | MIT | not gated |
+| Chatterbox Multilingual v3 | MIT | base model |
+| `gabar-tech/chatterbox-amharic` adapter | **CC-BY-SA-4.0** | share-alike propagates from WaxalNLP |
+| Seed-VC V2 | **GPL-3.0**, *archived* | read-only upstream since April 2025; pin the commit (`provenance.seed_vc_revision`) |
+| DeepSeek API | proprietary service | the adaptation baseline; swappable for a local OpenAI-compatible server |
+
+Cloning real performers' voices carries likeness and publicity considerations that
+a software licence does not address. That is worth stating plainly for a
+voice-matched dub, and it is the one legal question here that no licence table
+answers.
+
+Two decisions taken deliberately, for now:
+
+* **Stereo 2.0 is the deliverable.** 5.1 is a possible later output format and does
+  not drive the architecture.
+* **DeepSeek remains the adaptation baseline.** It is not replaced merely for being
+  a hosted service; the stage is improved through context, prompting, timing budgets
+  and Amharic-specific processing, and a different model replaces it only if
+  measurement shows a materially better Amharic result.
 
 ## License
 

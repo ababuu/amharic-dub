@@ -439,6 +439,7 @@ def test_user_message_carries_id_speaker_duration_and_text(monkeypatch):
     adapt_dialogue(
         [_segment(speaker_id="SPEAKER_07", start=10.0, end=14.0, text="Line one")],
         settings=_settings(),
+        enforce_budget=False,
     )
 
     assert _sent_lines(FakeOpenAI.requests[0]) == [
@@ -447,6 +448,8 @@ def test_user_message_carries_id_speaker_duration_and_text(monkeypatch):
             "speaker": "SPEAKER_07",
             "duration": 4.0,
             "text": "Line one",
+            # Four seconds at the default rate of four syllables a second.
+            "syllable_budget": 16,
         }
     ]
 
@@ -508,7 +511,7 @@ def test_dialogue_is_sent_in_bounded_batches(monkeypatch):
         for index in range(1, 8)
     ]
 
-    adapt_dialogue(segments, settings=_settings(translation_batch_size=3))
+    adapt_dialogue(segments, settings=_settings(translation_batch_size=3), enforce_budget=False)
 
     assert [len(_sent_lines(request)) for request in FakeOpenAI.requests] == [3, 3, 1]
 
@@ -517,7 +520,7 @@ def test_a_whole_movie_is_never_sent_in_one_request(monkeypatch):
     _patch(monkeypatch)
     segments = [_segment(start=float(index), end=float(index) + 1.0) for index in range(100)]
 
-    adapt_dialogue(segments, settings=_settings())
+    adapt_dialogue(segments, settings=_settings(), enforce_budget=False)
 
     assert DEFAULT_TRANSLATION_BATCH_SIZE == 10
     assert len(FakeOpenAI.requests) == 10
@@ -528,7 +531,7 @@ def test_stable_ids_are_assigned_across_batches(monkeypatch):
     _patch(monkeypatch)
     segments = [_segment(start=float(index), end=float(index) + 1.0) for index in range(4)]
 
-    adapt_dialogue(segments, settings=_settings(translation_batch_size=2))
+    adapt_dialogue(segments, settings=_settings(translation_batch_size=2), enforce_budget=False)
 
     sent_ids = [line["id"] for request in FakeOpenAI.requests for line in _sent_lines(request)]
     assert sent_ids == [
@@ -553,6 +556,189 @@ def test_batch_context_includes_who_is_speaking(monkeypatch):
 
     speakers = [line["speaker"] for line in _sent_lines(FakeOpenAI.requests[0])]
     assert speakers == ["SPEAKER_00", "SPEAKER_01"]
+
+
+# ---------------------------------------------------------------------------
+# scene context, the character bible, and the syllable budget
+# ---------------------------------------------------------------------------
+
+
+def _payload(request: dict) -> dict:
+    return json.loads(request["messages"][1]["content"])
+
+
+def test_the_request_carries_the_syllable_budget(monkeypatch):
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [_segment(start=0.0, end=2.5)], settings=_settings(), enforce_budget=False
+    )
+
+    line = _sent_lines(FakeOpenAI.requests[0])[0]
+    # 2.5s at the default four syllables a second.
+    assert line["syllable_budget"] == 10
+
+
+def test_a_straddling_batch_is_told_which_scene_it_is_in(monkeypatch):
+    _patch(monkeypatch)
+    segments = [
+        _segment(start=0.0, end=1.0, text="first"),
+        _segment(start=60.0, end=61.0, text="much later"),
+    ]
+
+    adapt_dialogue(segments, settings=_settings(), enforce_budget=False)
+
+    context = _payload(FakeOpenAI.requests[0]).get("context", "")
+    assert "SCENE:" in context
+    assert "scene 1 of the film" in context
+    assert "one character speaks" in context
+
+
+def test_a_scene_with_two_speakers_is_described_as_a_conversation(monkeypatch):
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [
+            _segment(speaker_id="SPEAKER_00", start=0.0, end=1.0, text="a"),
+            _segment(speaker_id="SPEAKER_01", start=1.0, end=2.0, text="b"),
+        ],
+        settings=_settings(),
+        enforce_budget=False,
+    )
+
+    context = _payload(FakeOpenAI.requests[0])["context"]
+    assert "2 character(s) are in it" in context
+    assert "same situation" in context
+
+
+def test_the_character_bible_is_sent_only_for_the_speakers_present(monkeypatch):
+    _patch(monkeypatch)
+    from app.pipeline.dialogue_context import Character, CharacterBible
+
+    bible = CharacterBible(
+        {
+            "SPEAKER_00": Character(speaker_id="SPEAKER_00", name="Selam"),
+            "SPEAKER_09": Character(speaker_id="SPEAKER_09", name="Absent"),
+        }
+    )
+
+    adapt_dialogue(
+        [_segment(speaker_id="SPEAKER_00")],
+        settings=_settings(),
+        bible=bible,
+        enforce_budget=False,
+    )
+
+    context = _payload(FakeOpenAI.requests[0])["context"]
+    assert "Selam" in context
+    assert "Absent" not in context
+
+
+def test_an_overshooting_line_is_sent_back_once(monkeypatch):
+    """Amharic needs more syllables than English, so the text is shortened, not stretched."""
+
+    _patch(monkeypatch)
+    # ``transform`` sees the response body, so the request count is what says
+    # whether this is the first pass or the rewrite.
+    calls: list[int] = []
+
+    def transform(body):
+        calls.append(1)
+        amharic = "ሰላም" if len(calls) > 1 else "ሰላም እንደምን ነህ"
+        for line in body["lines"]:
+            line["amharic"] = amharic
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapted = adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
+
+    assert len(FakeOpenAI.requests) == 2
+    rewrite = _payload(FakeOpenAI.requests[1])["rewrite"]
+    assert "shorter" in rewrite
+    assert "cut at least 6 syllable(s)" in rewrite
+    # Only the offending line is resent, under the id it was first given.
+    assert [line["id"] for line in _sent_lines(FakeOpenAI.requests[1])] == [
+        "dialogue_000001"
+    ]
+    assert adapted[0].amharic == "ሰላም"
+
+
+def test_only_the_overshooting_lines_are_resent(monkeypatch):
+    _patch(monkeypatch)
+    calls: list[int] = []
+
+    def transform(body):
+        calls.append(1)
+        if len(calls) == 1:
+            body["lines"][0]["amharic"] = "ሰላም"  # 3 syllables: inside an 8-syllable budget
+            body["lines"][1]["amharic"] = "ሰላም እንደምን ነህ"  # 10 syllables: over
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapt_dialogue(
+        [_segment(start=0.0, end=2.0), _segment(start=2.0, end=4.0)],
+        settings=_settings(),
+    )
+
+    resent = _sent_lines(FakeOpenAI.requests[1])
+    assert [line["id"] for line in resent] == ["dialogue_000002"]
+
+
+def test_a_line_inside_its_budget_is_not_resent(monkeypatch):
+    _patch(monkeypatch)
+
+    def transform(body):
+        for line in body["lines"]:
+            line["amharic"] = "ሰላም"
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapt_dialogue([_segment(start=0.0, end=2.0)], settings=_settings())
+
+    assert len(FakeOpenAI.requests) == 1
+
+
+def test_budget_enforcement_can_be_turned_off(monkeypatch):
+    """A comparison run sends every line exactly once."""
+
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [_segment(start=0.0, end=1.0)], settings=_settings(), enforce_budget=False
+    )
+
+    assert len(FakeOpenAI.requests) == 1
+
+
+def test_a_retry_that_is_still_too_long_is_reported_not_retried_forever(monkeypatch):
+    """One retry only: a model that cannot shorten a line must not loop."""
+
+    _patch(monkeypatch)
+
+    def transform(body):
+        for line in body["lines"]:
+            line["amharic"] = "ሰላም እንደምን ነህ"
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapted = adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
+
+    assert len(FakeOpenAI.requests) == 2
+    assert adapted[0].amharic == "ሰላም እንደምን ነህ"
+
+
+def test_the_scene_is_derived_when_none_is_supplied(monkeypatch):
+    """The model is always told which lines share a situation, without being asked."""
+
+    _patch(monkeypatch)
+
+    adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings(), scenes=())
+
+    assert "context" not in _payload(FakeOpenAI.requests[0])
 
 
 # ---------------------------------------------------------------------------

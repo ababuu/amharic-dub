@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from app.config import (
+    DEFAULT_DIALOGUE_BIBLE_FILENAME,
     DEFAULT_DIARIZATION_MODEL,
     DEFAULT_MIX_DIALOGUE_GAIN_DB,
     DEFAULT_MIX_DUCK_DB,
@@ -162,6 +163,35 @@ def test_diarization_model_is_configurable(
     assert settings.as_dict()["diarization_model"] == "pyannote/speaker-diarization-3.1"
 
 
+def test_diarization_speaker_counts_are_optional_and_configurable(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    defaults = Settings.from_env()
+    assert defaults.diarization_min_speakers is None
+    assert defaults.diarization_max_speakers is None
+
+    monkeypatch.setenv("DIARIZATION_MIN_SPEAKERS", "4")
+    monkeypatch.setenv("DIARIZATION_MAX_SPEAKERS", "12")
+
+    settings = Settings.from_env()
+    assert settings.diarization_min_speakers == 4
+    assert settings.diarization_max_speakers == 12
+    assert settings.as_dict()["diarization_min_speakers"] == 4
+    assert settings.as_dict()["diarization_max_speakers"] == 12
+
+
+def test_a_malformed_speaker_count_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    monkeypatch.setenv("DIARIZATION_MAX_SPEAKERS", "0")
+    with pytest.raises(ValueError, match="positive integer"):
+        Settings.from_env()
+
+    monkeypatch.setenv("DIARIZATION_MAX_SPEAKERS", "several")
+    with pytest.raises(ValueError, match="integer"):
+        Settings.from_env()
+
+
 def test_transcription_settings_are_configurable(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:
@@ -264,6 +294,24 @@ def test_voice_profile_dir_follows_a_custom_work_dir(
     assert settings.voice_profile_dir == settings.work_dir / "voices"
 
 
+def test_the_dialogue_bible_path_follows_the_work_directory(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    """Consistency state is per-film working data, so it lives with the work dir."""
+
+    defaults = Settings.from_env()
+    assert defaults.dialogue_bible_path == (
+        defaults.work_dir / DEFAULT_DIALOGUE_BIBLE_FILENAME
+    )
+
+    monkeypatch.setenv("WORK_DIR", "scratch")
+    monkeypatch.setenv("DIALOGUE_BIBLE_PATH", "scratch/bible.json")
+
+    settings = Settings.from_env()
+    assert settings.dialogue_bible_path.name == "bible.json"
+    assert settings.as_dict()["dialogue_bible_path"].endswith("bible.json")
+
+
 def test_tts_settings_are_configurable(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:
@@ -273,6 +321,9 @@ def test_tts_settings_are_configurable(
         defaults.model_cache_dir / DEFAULT_SEED_VC_REPO_NAME
     )
     assert defaults.seed_vc_diffusion_steps == DEFAULT_SEED_VC_DIFFUSION_STEPS
+    # Timbre-only by default: Seed-VC's style branch would re-impose the reference's
+    # (English) accent and overwrite the take's performance.
+    assert defaults.seed_vc_convert_style is False
     assert (
         defaults.tts_performance_reference_min_duration
         == DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION
@@ -286,6 +337,7 @@ def test_tts_settings_are_configurable(
     monkeypatch.setenv("TTS_MODEL", "someone/other-adapter")
     monkeypatch.setenv("SEED_VC_REPO_PATH", "vendor/seed-vc")
     monkeypatch.setenv("SEED_VC_DIFFUSION_STEPS", "12")
+    monkeypatch.setenv("SEED_VC_CONVERT_STYLE", "on")
     monkeypatch.setenv("TTS_PERFORMANCE_REFERENCE_MIN_DURATION", "4")
     monkeypatch.setenv("TTS_PERFORMANCE_REFERENCE_MAX_DURATION", "8.5")
     monkeypatch.setenv("TTS_MAX_PAUSE_SECONDS", "1.5")
@@ -295,6 +347,7 @@ def test_tts_settings_are_configurable(
     assert settings.seed_vc_repo_path.name == "seed-vc"
     assert settings.seed_vc_repo_path.parent.name == "vendor"
     assert settings.seed_vc_diffusion_steps == 12
+    assert settings.seed_vc_convert_style is True
     assert settings.tts_performance_reference_min_duration == 4.0
     assert settings.tts_performance_reference_max_duration == 8.5
     assert settings.tts_max_pause_seconds == 1.5
@@ -302,6 +355,7 @@ def test_tts_settings_are_configurable(
     payload = settings.as_dict()
     assert payload["tts_model"] == "someone/other-adapter"
     assert payload["seed_vc_diffusion_steps"] == 12
+    assert payload["seed_vc_convert_style"] is True
     assert payload["tts_performance_reference_min_duration"] == 4.0
     assert payload["tts_performance_reference_max_duration"] == 8.5
     assert payload["tts_max_pause_seconds"] == 1.5

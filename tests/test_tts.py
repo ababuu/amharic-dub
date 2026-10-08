@@ -54,6 +54,7 @@ from app.pipeline.tts import (
     load_chatterbox_engine,
     load_seed_vc_engine,
     reset_engine_cache,
+    seed_vc_revision,
     resolve_tts_directory,
     synthesize_dialogue,
 )
@@ -388,7 +389,7 @@ def test_constructing_the_real_adapters_loads_nothing(tmp_path: Path) -> None:
     assert chatterbox.model == "gabar-tech/chatterbox-amharic"
     assert chatterbox.device == "cpu"
     assert chatterbox.sample_rate == CHATTERBOX_SAMPLE_RATE
-    assert seedvc.convert_style is True
+    assert seedvc.convert_style is False
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +481,60 @@ def test_default_engines_are_cached_per_device_and_model(tmp_path: Path) -> None
     assert load_seed_vc_engine(settings=settings) is style
     assert style.repo_path == settings.seed_vc_repo_path
     assert style.name == tts.SEED_VC_ENGINE_NAME
+
+
+def test_seed_vc_engines_are_cached_per_style_flag(tmp_path: Path) -> None:
+    """Two settings that differ only in the style flag need two engines."""
+
+    timbre_only = _settings(tmp_path, seed_vc_convert_style=False)
+    styled = _settings(tmp_path, seed_vc_convert_style=True)
+
+    first = load_seed_vc_engine(settings=timbre_only)
+    assert first.convert_style is False
+    assert load_seed_vc_engine(settings=timbre_only) is first
+
+    other = load_seed_vc_engine(settings=styled)
+    assert other is not first
+    assert other.convert_style is True
+
+
+def test_the_default_engine_converts_timbre_only(tmp_path: Path) -> None:
+    """:class:`Settings` defaults to the mode that keeps the take's delivery."""
+
+    from app.config import DEFAULT_SEED_VC_CONVERT_STYLE
+
+    assert DEFAULT_SEED_VC_CONVERT_STYLE is False
+    assert _settings(tmp_path).seed_vc_convert_style is False
+
+    engine = load_seed_vc_engine(settings=_settings(tmp_path))
+    assert engine.convert_style is False
+
+
+def test_an_explicit_style_conversion_is_honoured(
+    vc: tuple[SeedVcV2Engine, FakeVcWrapper, list[str]], seed_vc_repo: Path, tmp_path: Path
+) -> None:
+    """The flag stays reachable for a single controlled comparison."""
+
+    _, wrapper, _ = vc
+    engine = SeedVcV2Engine(
+        repo_path=seed_vc_repo, device="cuda", diffusion_steps=25, convert_style=True
+    )
+
+    source = _write_wav(tmp_path / "take.wav", np.full(4800, 0.2, dtype=np.float32), 24_000)
+    reference = _write_wav(tmp_path / "reference.wav", np.full(2400, 0.3, dtype=np.float32), 24_000)
+    engine.convert(
+        source_audio=source, identity_reference=reference, destination=tmp_path / "voice.wav"
+    )
+
+    (call,) = wrapper.conversions
+    assert call["convert_style"] is True
+
+
+def test_a_non_boolean_style_flag_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError, match="SEED_VC_CONVERT_STYLE"):
+        SeedVcV2Engine(
+            repo_path=tmp_path / "seed-vc", device="cpu", convert_style="yes"  # type: ignore[arg-type]
+        )
 
 
 def test_resetting_the_cache_releases_the_engines(tmp_path: Path) -> None:
@@ -1781,7 +1836,10 @@ def vc(
     return engine, wrapper, built
 
 
-def test_seed_vc_runs_with_style_conversion_on(vc: tuple[SeedVcV2Engine, FakeVcWrapper, list[str]], tmp_path: Path) -> None:
+def test_seed_vc_runs_in_timbre_only_mode(vc: tuple[SeedVcV2Engine, FakeVcWrapper, list[str]], tmp_path: Path) -> None:
+    """The default is timbre-only: converting the reference's style would anglicise
+    the Amharic and discard the take's performance."""
+
     engine, wrapper, _ = vc
     source = _write_wav(tmp_path / "take.wav", np.full(4800, 0.2, dtype=np.float32), 24_000)
     reference = _write_wav(tmp_path / "reference.wav", np.full(2400, 0.3, dtype=np.float32), 24_000)
@@ -1791,7 +1849,7 @@ def test_seed_vc_runs_with_style_conversion_on(vc: tuple[SeedVcV2Engine, FakeVcW
     )
 
     (call,) = wrapper.conversions
-    assert call["convert_style"] is True
+    assert call["convert_style"] is False
     assert call["anonymization_only"] is False
     assert call["source_audio_path"] == str(source)
     assert call["target_audio_path"] == str(reference)
@@ -2002,3 +2060,87 @@ def test_bad_seed_vc_options_are_rejected(seed_vc_repo: Path) -> None:
 
     with pytest.raises(ConfigurationError, match="device"):
         SeedVcV2Engine(repo_path=seed_vc_repo, device="  ")
+
+
+# ---------------------------------------------------------------------------
+# Seed-VC provenance
+# ---------------------------------------------------------------------------
+
+
+def _git_checkout(root: Path, head: str) -> Path:
+    """Build a minimal ``.git`` directory holding ``head`` verbatim."""
+
+    git_dir = root / ".git"
+    git_dir.mkdir(parents=True, exist_ok=True)
+    (git_dir / "HEAD").write_text(head, encoding="utf-8")
+    return root
+
+
+def test_a_branch_head_reports_the_commit_it_points_at(tmp_path: Path) -> None:
+    sha = "5de7a54aa4e5e2baadb0182dde554908b48b85c2"
+    root = _git_checkout(tmp_path / "seed-vc", "ref: refs/heads/main\n")
+    (root / ".git" / "refs" / "heads").mkdir(parents=True)
+    (root / ".git" / "refs" / "heads" / "main").write_text(sha + "\n", encoding="utf-8")
+
+    assert seed_vc_revision(root) == sha
+
+
+def test_a_packed_branch_ref_is_read(tmp_path: Path) -> None:
+    """A cloned repo often has no loose ref for its branch."""
+
+    sha = "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567"
+    root = _git_checkout(tmp_path / "seed-vc", "ref: refs/heads/main\n")
+    (root / ".git" / "packed-refs").write_text(
+        f"# pack-refs with: peeled fully-peeled sorted\n{sha} refs/heads/main\n",
+        encoding="utf-8",
+    )
+
+    assert seed_vc_revision(root) == sha
+
+
+def test_a_detached_head_reports_its_commit(tmp_path: Path) -> None:
+    sha = "abcdef1234567890abcdef1234567890abcdef12"
+    root = _git_checkout(tmp_path / "seed-vc", sha + "\n")
+
+    assert seed_vc_revision(root) == sha
+
+
+def test_a_gitdir_pointer_is_followed(tmp_path: Path) -> None:
+    """A worktree or submodule has a ``.git`` file, not a directory."""
+
+    sha = "1122334455667788990011223344556677889900"
+    real_git = tmp_path / "real-git"
+    real_git.mkdir()
+    (real_git / "HEAD").write_text(sha + "\n", encoding="utf-8")
+
+    checkout = tmp_path / "seed-vc"
+    checkout.mkdir()
+    (checkout / ".git").write_text(f"gitdir: {real_git}\n", encoding="utf-8")
+
+    assert seed_vc_revision(checkout) == sha
+
+
+def test_an_unknown_revision_is_reported_rather_than_raised(tmp_path: Path) -> None:
+    """Nothing here may fail a run: an unreadable checkout is unknown provenance."""
+
+    # Not a checkout at all.
+    plain = tmp_path / "seed-vc"
+    plain.mkdir()
+    assert seed_vc_revision(plain) is None
+
+    # A checkout with no HEAD, and one that does not exist.
+    (plain / ".git").mkdir()
+    assert seed_vc_revision(plain) is None
+    assert seed_vc_revision(tmp_path / "does-not-exist") is None
+
+
+def test_a_malformed_head_is_not_reported_as_a_commit(tmp_path: Path) -> None:
+    root = _git_checkout(tmp_path / "seed-vc", "not a revision at all\n")
+
+    assert seed_vc_revision(root) is None
+
+
+def test_a_branch_ref_that_cannot_be_resolved_is_unknown(tmp_path: Path) -> None:
+    root = _git_checkout(tmp_path / "seed-vc", "ref: refs/heads/missing\n")
+
+    assert seed_vc_revision(root) is None

@@ -37,12 +37,25 @@ Environment variables
 ``TRANSLATION_DISABLE_THINKING``
                       Set ``false`` if the API rejects the thinking toggle.
 ``VOICE_PROFILE_DIR`` Directory holding per-speaker voice profiles.
+``DIALOGUE_BIBLE_PATH``
+                      Persistent character/consistency state (names, address
+                      forms, register, recurring spellings) handed to dialogue
+                      adaptation. Absent means an empty bible.
 ``VOICE_REFERENCE_MIN_DURATION`` / ``..._TARGET_DURATION`` / ``..._MAX_DURATION``
                       Preferred length of a voice-cloning reference, in seconds.
 ``TTS_MODEL``         Amharic speech adapter used by the TTS stage.
 ``SEED_VC_REPO_PATH`` Seed-VC checkout used for the identity-conversion step.
 ``SEED_VC_DIFFUSION_STEPS``
                       Diffusion steps of the Seed-VC V2 converter.
+``SEED_VC_CONVERT_STYLE``
+                      Whether Seed-VC V2 converts the *reference's* accent and
+                      style as well as its timbre. Off by default: see
+                      :mod:`app.pipeline.tts` for why that is the correct mode
+                      for a voice-matched dub.
+``DIARIZATION_MIN_SPEAKERS`` / ``DIARIZATION_MAX_SPEAKERS``
+                      Optional bounds on how many speakers diarization may find.
+                      A cast list turns these into the strongest single guard
+                      against a character splitting into several clusters.
 ``TTS_PERFORMANCE_REFERENCE_MIN_DURATION`` / ``..._MAX_DURATION``
                       Length of the original-performance prompt handed to
                       Chatterbox, in seconds.
@@ -78,6 +91,13 @@ DEFAULT_MODEL_CACHE_DIR = PROJECT_ROOT / "models_cache"
 #: pyannote Community-1 speaker diarization pipeline on the Hugging Face Hub.
 DEFAULT_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
 
+#: Optional bounds on the number of speakers diarization may report, or ``None``
+#: to let the model decide. Supplying them is the strongest single guard against
+#: a character splitting into several clusters or merging with another, so a cast
+#: count - or a generous range around one - is worth configuring for a film.
+DEFAULT_DIARIZATION_MIN_SPEAKERS: Optional[int] = None
+DEFAULT_DIARIZATION_MAX_SPEAKERS: Optional[int] = None
+
 #: faster-whisper model used to transcribe the dialogue stem.
 DEFAULT_TRANSCRIPTION_MODEL = "large-v3"
 
@@ -99,6 +119,15 @@ DEFAULT_TRANSLATION_BATCH_SIZE = 10
 #: Directory holding the per-speaker voice profiles consumed by the TTS stage.
 DEFAULT_VOICE_PROFILE_DIR = DEFAULT_WORK_DIR / "voices"
 
+#: Persistent consistency state for dialogue adaptation: who the characters are,
+#: how they address one another, and how their recurring names and terms are
+#: spelled. Kept beside the voice profiles because both are per-film state that
+#: outlives a single stage - unlike an artifact, it is meant to be edited by hand
+#: between runs and reused, which is what stops a character drifting over 90-180
+#: minutes. A missing file is an empty bible, not an error.
+DEFAULT_DIALOGUE_BIBLE_FILENAME = "dialogue_bible.json"
+DEFAULT_DIALOGUE_BIBLE_PATH = DEFAULT_WORK_DIR / DEFAULT_DIALOGUE_BIBLE_FILENAME
+
 #: Preferred length of a voice-cloning reference, in seconds. The target is the
 #: window the selector aims for, the minimum rejects snippets too short to clone
 #: from, and the maximum caps how much audio a single profile keeps around.
@@ -119,6 +148,15 @@ DEFAULT_SEED_VC_REPO_NAME = "seed-vc"
 #: Seed-VC V2 diffusion steps. The V2 inference script's own default is 30;
 #: fewer steps trade quality for speed.
 DEFAULT_SEED_VC_DIFFUSION_STEPS = 30
+
+#: Whether Seed-VC V2 converts the *reference's* accent and style along with its
+#: timbre. Left **off**, which is the only mode that preserves the performance of
+#: the take: Seed-VC V2's style branch conditions its autoregressive stage on the
+#: reference's acoustic tokens and content indices, so switching it on speaks the
+#: source content in the *reference's* style. With a character reference taken
+#: from the original actor's English audio, that re-imposes an English accent on
+#: the Amharic and discards the performance the Chatterbox prompt carried over.
+DEFAULT_SEED_VC_CONVERT_STYLE = False
 
 #: Preferred length of the original-performance prompt handed to Chatterbox, in
 #: seconds. The Amharic adapter clones from roughly ten seconds of audio, so a
@@ -216,6 +254,28 @@ def _read_int(name: str, default: int) -> int:
     return value
 
 
+def _read_optional_int(name: str, default: Optional[int]) -> Optional[int]:
+    """Return an environment value as an optional positive integer.
+
+    Unlike :func:`_read_int`, an unset variable is a legitimate value here: the
+    speaker-count bounds of diarization are optional, and "not configured" has to
+    stay distinguishable from any number.
+    """
+
+    raw = _read_env(name)
+    if raw is None:
+        return default
+
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value}")
+    return value
+
+
 #: Values accepted (case-insensitively) for a boolean environment flag.
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -290,6 +350,9 @@ class Settings:
     log_level: str = "INFO"
     #: Hugging Face pipeline id used by :mod:`app.pipeline.diarization`.
     diarization_model: str = DEFAULT_DIARIZATION_MODEL
+    #: Optional speaker-count bounds for diarization; ``None`` lets it decide.
+    diarization_min_speakers: Optional[int] = DEFAULT_DIARIZATION_MIN_SPEAKERS
+    diarization_max_speakers: Optional[int] = DEFAULT_DIARIZATION_MAX_SPEAKERS
     #: faster-whisper model and CTranslate2 compute type for transcription.
     transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL
     transcription_compute_type: str = DEFAULT_TRANSCRIPTION_COMPUTE_TYPE
@@ -305,12 +368,15 @@ class Settings:
     voice_reference_min_duration: float = DEFAULT_VOICE_REFERENCE_MIN_DURATION
     voice_reference_target_duration: float = DEFAULT_VOICE_REFERENCE_TARGET_DURATION
     voice_reference_max_duration: float = DEFAULT_VOICE_REFERENCE_MAX_DURATION
+    #: Persistent character/consistency state handed to dialogue adaptation.
+    dialogue_bible_path: Path = DEFAULT_DIALOGUE_BIBLE_PATH
     #: TTS settings for :mod:`app.pipeline.tts`: the Amharic speech adapter, the
     #: Seed-VC checkout that converts identity, and the performance-prompt and
     #: pause bounds of one synthesized line.
     tts_model: str = DEFAULT_TTS_MODEL
     seed_vc_repo_path: Path = DEFAULT_MODEL_CACHE_DIR / DEFAULT_SEED_VC_REPO_NAME
     seed_vc_diffusion_steps: int = DEFAULT_SEED_VC_DIFFUSION_STEPS
+    seed_vc_convert_style: bool = DEFAULT_SEED_VC_CONVERT_STYLE
     tts_performance_reference_min_duration: float = (
         DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION
     )
@@ -348,6 +414,12 @@ class Settings:
                 _read_env("DIARIZATION_MODEL", DEFAULT_DIARIZATION_MODEL)
                 or DEFAULT_DIARIZATION_MODEL
             ),
+            diarization_min_speakers=_read_optional_int(
+                "DIARIZATION_MIN_SPEAKERS", DEFAULT_DIARIZATION_MIN_SPEAKERS
+            ),
+            diarization_max_speakers=_read_optional_int(
+                "DIARIZATION_MAX_SPEAKERS", DEFAULT_DIARIZATION_MAX_SPEAKERS
+            ),
             transcription_model=(
                 _read_env("TRANSCRIPTION_MODEL", DEFAULT_TRANSCRIPTION_MODEL)
                 or DEFAULT_TRANSCRIPTION_MODEL
@@ -381,12 +453,18 @@ class Settings:
             voice_reference_max_duration=_read_float(
                 "VOICE_REFERENCE_MAX_DURATION", DEFAULT_VOICE_REFERENCE_MAX_DURATION
             ),
+            dialogue_bible_path=_read_path(
+                "DIALOGUE_BIBLE_PATH", work_dir / DEFAULT_DIALOGUE_BIBLE_FILENAME
+            ),
             tts_model=(_read_env("TTS_MODEL", DEFAULT_TTS_MODEL) or DEFAULT_TTS_MODEL),
             seed_vc_repo_path=_read_path(
                 "SEED_VC_REPO_PATH", model_cache_dir / DEFAULT_SEED_VC_REPO_NAME
             ),
             seed_vc_diffusion_steps=_read_int(
                 "SEED_VC_DIFFUSION_STEPS", DEFAULT_SEED_VC_DIFFUSION_STEPS
+            ),
+            seed_vc_convert_style=_read_bool(
+                "SEED_VC_CONVERT_STYLE", DEFAULT_SEED_VC_CONVERT_STYLE
             ),
             tts_performance_reference_min_duration=_read_float(
                 "TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
@@ -454,6 +532,8 @@ class Settings:
             "device": self.device,
             "log_level": self.log_level,
             "diarization_model": self.diarization_model,
+            "diarization_min_speakers": self.diarization_min_speakers,
+            "diarization_max_speakers": self.diarization_max_speakers,
             "transcription_model": self.transcription_model,
             "transcription_compute_type": self.transcription_compute_type,
             "transcription_language": self.transcription_language,
@@ -465,9 +545,11 @@ class Settings:
             "voice_reference_min_duration": self.voice_reference_min_duration,
             "voice_reference_target_duration": self.voice_reference_target_duration,
             "voice_reference_max_duration": self.voice_reference_max_duration,
+            "dialogue_bible_path": str(self.dialogue_bible_path),
             "tts_model": self.tts_model,
             "seed_vc_repo_path": str(self.seed_vc_repo_path),
             "seed_vc_diffusion_steps": self.seed_vc_diffusion_steps,
+            "seed_vc_convert_style": self.seed_vc_convert_style,
             "tts_performance_reference_min_duration": (
                 self.tts_performance_reference_min_duration
             ),
@@ -490,9 +572,14 @@ def get_settings() -> Settings:
 
 
 __all__ = [
+    "DEFAULT_DIALOGUE_BIBLE_FILENAME",
+    "DEFAULT_DIALOGUE_BIBLE_PATH",
+    "DEFAULT_DIARIZATION_MAX_SPEAKERS",
+    "DEFAULT_DIARIZATION_MIN_SPEAKERS",
     "DEFAULT_DIARIZATION_MODEL",
     "DEFAULT_MIX_DIALOGUE_GAIN_DB",
     "DEFAULT_MIX_DUCK_DB",
+    "DEFAULT_SEED_VC_CONVERT_STYLE",
     "DEFAULT_SEED_VC_DIFFUSION_STEPS",
     "DEFAULT_SEED_VC_REPO_NAME",
     "DEFAULT_TRANSCRIPTION_COMPUTE_TYPE",

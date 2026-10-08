@@ -48,8 +48,11 @@ from typing import Any
 
 from app.config import Settings, get_settings
 from app.pipeline import (
+    dialogue_context,
     diarization,
+    evaluation,
     mixing,
+    qc,
     separation,
     timing,
     transcription,
@@ -58,7 +61,7 @@ from app.pipeline import (
     video,
     voice_profiles,
 )
-from app.pipeline.diarization import SpeakerSegment
+from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
 from app.pipeline.mixing import MixResult
 from app.pipeline.timing import AlignedClip
 from app.pipeline.transcription import TranscriptSegment
@@ -115,6 +118,7 @@ class PipelineResult:
     stems: separation.StemPaths
     turns: tuple[SpeakerSegment, ...]
     lines: tuple[TranscriptSegment, ...]
+    crosstalk: tuple[CrosstalkRegion, ...]
     dialogue: tuple[AdaptedDialogue, ...]
     profiles: Mapping[str, VoiceProfile]
     clips: tuple[TtsClip, ...]
@@ -164,6 +168,22 @@ class PipelineResult:
             "diarization": {
                 "turns": len(self.turns),
                 "speakers": sorted({turn.speaker_id for turn in self.turns}),
+                # Simultaneous speech the exclusive attribution could not carry.
+                # Reported so a run can be audited for it without re-listening.
+                "crosstalk": {
+                    "regions": len(self.crosstalk),
+                    "seconds": round(
+                        sum(region.duration for region in self.crosstalk), 3
+                    ),
+                    "detail": [
+                        {
+                            "start": region.start,
+                            "end": region.end,
+                            "speakers": list(region.speaker_ids),
+                        }
+                        for region in self.crosstalk
+                    ],
+                },
             },
             "transcription": {
                 "lines": len(self.lines),
@@ -380,19 +400,24 @@ def run_pipeline(
         settings=resolved,
     )
 
-    turns = tuple(
-        _stage(
-            "diarization",
-            seconds,
-            report,
-            diarization.diarize,
-            stems.speech,
-            settings=resolved,
-        )
+    diarized = _stage(
+        "diarization",
+        seconds,
+        report,
+        diarization.diarize_detailed,
+        stems.speech,
+        settings=resolved,
     )
+    turns = tuple(diarized.turns)
     if not turns:
         raise EmptyStageError(
             f"diarization found no speech in {stems.speech}; nothing downstream can run"
+        )
+    crosstalk = tuple(diarized.crosstalk)
+    if crosstalk:
+        report(
+            f"  crosstalk: {len(crosstalk)} region(s), "
+            f"{diarized.crosstalk_seconds:.2f}s of simultaneous speech"
         )
 
     lines = tuple(
@@ -409,6 +434,10 @@ def run_pipeline(
     if not lines:
         raise EmptyStageError("transcription produced no lines; nothing to adapt")
 
+    # Consistency state, not a guess: an absent bible yields an empty one, so a
+    # first run works and a second run inherits whatever was filled in by hand.
+    bible = dialogue_context.CharacterBible.load(resolved.dialogue_bible_path)
+
     dialogue = tuple(
         _stage(
             "translation",
@@ -417,8 +446,11 @@ def run_pipeline(
             translation.adapt_dialogue,
             lines,
             settings=resolved,
+            bible=bible,
         )
     )
+    if bible:
+        report(f"  dialogue bible: {len(bible)} character(s) applied")
     if not dialogue:
         raise EmptyStageError("adaptation produced no lines; nothing to synthesize")
 
@@ -508,6 +540,7 @@ def run_pipeline(
         stems=stems,
         turns=turns,
         lines=lines,
+        crosstalk=crosstalk,
         dialogue=dialogue,
         profiles=dict(profiles),
         clips=clips,
@@ -520,24 +553,81 @@ def run_pipeline(
         synthesized_lines=len(spoken),
     )
 
-    _write_manifest(result, settings=resolved)
+    # Measured, not assumed: the model-free quality report is part of every run.
+    # Pronunciation is deliberately left unmeasured here - it needs an Amharic ASR
+    # model, and injecting one is the caller's decision (see the qc module).
+    quality = qc.build_qc_report(
+        result.alignment,
+        dialogue=result.dialogue,
+        clips=result.clips,
+        crosstalk=result.crosstalk,
+    )
+    # Which hard cases the material actually contains. A run can score well simply
+    # because it was easy, so this says what was *not* exercised.
+    coverage = evaluation.measure_coverage(result.dialogue, crosstalk=result.crosstalk)
+
+    _write_manifest(result, settings=resolved, quality=quality, coverage=coverage)
     report(result.report())
+    report(f"qc              {quality.summary()}")
+    report(f"coverage        {coverage.summary()}")
     return result
 
 
-def _write_manifest(result: PipelineResult, *, settings: Settings) -> Path:
+def _provenance(settings: Settings) -> dict[str, Any]:
+    """Describe what actually produced a run, for reproducibility.
+
+    Seed-VC is the one engine that is a *checkout* rather than a pinned dependency,
+    so the commit it is sitting on is recorded here. A re-clone that silently moved
+    the engine is otherwise invisible in a delivered dub.
+    """
+
+    return {
+        "seed_vc_revision": tts.seed_vc_revision(settings.seed_vc_repo_path),
+        "seed_vc_repo_path": portable_path(Path(settings.seed_vc_repo_path)),
+        "seed_vc_convert_style": settings.seed_vc_convert_style,
+        "seed_vc_diffusion_steps": settings.seed_vc_diffusion_steps,
+    }
+
+
+def _write_manifest(
+    result: PipelineResult,
+    *,
+    settings: Settings,
+    quality: qc.QcReport | None = None,
+    coverage: evaluation.CoverageReport | None = None,
+) -> Path:
     """Write the run's manifest, atomically, and return its path."""
+
+    report = quality if quality is not None else qc.build_qc_report(
+        result.alignment,
+        dialogue=result.dialogue,
+        clips=result.clips,
+        crosstalk=result.crosstalk,
+    )
+    exercised = (
+        coverage
+        if coverage is not None
+        else evaluation.measure_coverage(result.dialogue, crosstalk=result.crosstalk)
+    )
 
     payload: dict[str, Any] = {
         "run": result.to_dict(),
         "settings": settings.as_dict(),
+        "provenance": _provenance(settings),
+        "qc": report.as_dict(),
+        "coverage": exercised.as_dict(),
         "notes": [
             "video streams are copied, never re-encoded; the source's own audio "
             "streams are replaced by the Amharic mix",
+            "Seed-VC V2 runs in timbre-only mode: it replaces the character's voice "
+            "and leaves the take's delivery alone (SEED_VC_CONVERT_STYLE=false)",
             "loudness normalization (EBU R128) is not applied: the mix is placed "
             "at a defined peak with defined dialogue and bed levels",
             "clip paths are content-addressed artifacts of the tts stage, so later "
             "runs of the same lines reuse them instead of re-synthesizing",
+            "the qc block is measured, not assumed; pronunciation is left "
+            "unmeasured because it needs an Amharic ASR model, which is injected "
+            "by the caller rather than downloaded by a run",
         ],
     }
 

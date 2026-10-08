@@ -15,7 +15,7 @@ import pytest
 
 from app.config import Settings
 from app.pipeline import orchestrator
-from app.pipeline.diarization import SpeakerSegment
+from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
 from app.pipeline.mixing import MixResult
 from app.pipeline.orchestrator import (
     MANIFEST_FILENAME,
@@ -47,6 +47,7 @@ def _settings(root: Path, **overrides: object) -> Settings:
         "model_cache_dir": root / "cache",
         "voice_profile_dir": root / "voices",
         "seed_vc_repo_path": root / "seed-vc",
+        "dialogue_bible_path": root / "work" / "dialogue_bible.json",
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]
@@ -157,6 +158,7 @@ class Stages:
         root: Path,
         *,
         turns: list[SpeakerSegment] | None = None,
+        crosstalk: list[CrosstalkRegion] | None = None,
         lines: list[TranscriptSegment] | None = None,
         dialogue: list[AdaptedDialogue] | None = None,
         profiles: dict[str, VoiceProfile] | None = None,
@@ -164,6 +166,7 @@ class Stages:
     ) -> None:
         self.root = root
         self.turns = [_turn()] if turns is None else turns
+        self.crosstalk = [] if crosstalk is None else crosstalk
         self.lines = [_line()] if lines is None else lines
         self.dialogue = [_dialogue()] if dialogue is None else dialogue
         self.profiles = {SPEAKER: _profile(root)} if profiles is None else profiles
@@ -193,9 +196,11 @@ class Stages:
             effects=output_dir / "movie_effects.wav",
         )
 
-    def diarize(self, speech: Path, *, settings: Settings) -> list[SpeakerSegment]:
+    def diarize_detailed(self, speech: Path, *, settings: Settings):  # noqa: ANN201
+        from app.pipeline.diarization import DiarizationResult
+
         self._record("diarization", speech, settings)
-        return list(self.turns)
+        return DiarizationResult(turns=tuple(self.turns), crosstalk=tuple(self.crosstalk))
 
     def transcribe(
         self, speech: Path, turns: object, *, settings: Settings
@@ -203,8 +208,10 @@ class Stages:
         self._record("transcription", speech, turns, settings)
         return list(self.lines)
 
-    def adapt_dialogue(self, lines: object, *, settings: Settings) -> list[AdaptedDialogue]:
-        self._record("translation", lines, settings)
+    def adapt_dialogue(
+        self, lines: object, *, settings: Settings, bible: object = None
+    ) -> list[AdaptedDialogue]:
+        self._record("translation", lines, settings, bible)
         return list(self.dialogue)
 
     def build_voice_profiles(
@@ -260,14 +267,14 @@ class Stages:
         return _dub(self.root)
 
 
-@pytest.fixture
-def stages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stages:
-    """Wire the orchestrator to recording fakes and return them."""
+def _wire(monkeypatch: pytest.MonkeyPatch, fake: Stages) -> None:
+    """Point every stage the orchestrator calls at ``fake``."""
 
-    fake = Stages(tmp_path)
     monkeypatch.setattr(orchestrator.video, "extract_audio", fake.extract_audio)
     monkeypatch.setattr(orchestrator.separation, "separate_stems", fake.separate_stems)
-    monkeypatch.setattr(orchestrator.diarization, "diarize", fake.diarize)
+    monkeypatch.setattr(
+        orchestrator.diarization, "diarize_detailed", fake.diarize_detailed
+    )
     monkeypatch.setattr(orchestrator.transcription, "transcribe", fake.transcribe)
     monkeypatch.setattr(orchestrator.translation, "adapt_dialogue", fake.adapt_dialogue)
     monkeypatch.setattr(
@@ -277,6 +284,14 @@ def stages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stages:
     monkeypatch.setattr(orchestrator.timing, "align_dialogue", fake.align_dialogue)
     monkeypatch.setattr(orchestrator.mixing, "mix_track", fake.mix_track)
     monkeypatch.setattr(orchestrator.video, "mux_dub", fake.mux_dub)
+
+
+@pytest.fixture
+def stages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stages:
+    """Wire the orchestrator to recording fakes and return them."""
+
+    fake = Stages(tmp_path)
+    _wire(monkeypatch, fake)
     return fake
 
 
@@ -406,7 +421,11 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert payload["run"]["final_video"] == result.to_dict()["final_video"]
     assert payload["run"]["synthesized_lines"] == len(result.clips)
     assert payload["run"]["partial"] is False
-    assert payload["run"]["diarization"] == {"turns": 1, "speakers": [SPEAKER]}
+    assert payload["run"]["diarization"] == {
+        "turns": 1,
+        "speakers": [SPEAKER],
+        "crosstalk": {"regions": 0, "seconds": 0.0, "detail": []},
+    }
     assert payload["run"]["tts"]["clips"][0]["amharic"] == stages.dialogue[0].amharic
     assert payload["run"]["voice_profiles"][SPEAKER]["reference_duration"] == 5.0
     assert payload["run"]["timing"]["lines"] == len(result.alignment)
@@ -415,6 +434,83 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert payload["run"]["mux"]["audio_codec"] == "aac"
     assert payload["settings"]["deepseek_api_key_set"] is False
     assert payload["notes"]
+    # Every run measures itself, so a regression is visible without re-listening.
+    assert payload["qc"]["duration"]["lines"] == len(result.alignment)
+    assert payload["qc"]["duration"]["close_fits"] == len(result.alignment)
+    assert payload["qc"]["pronunciation"] is None
+    assert payload["qc"]["crosstalk"] == {"regions": 0, "seconds": 0.0}
+    # Coverage says what the run did *not* exercise, so a good score cannot be
+    # mistaken for good material.
+    assert payload["coverage"]["lines"] == len(result.dialogue)
+    assert payload["coverage"]["representative"] is False
+    assert "long_line" in payload["coverage"]["missing"]
+    # Seed-VC is a checkout, not a pinned dependency, so a run records what it used.
+    assert payload["provenance"]["seed_vc_convert_style"] is False
+    assert payload["provenance"]["seed_vc_revision"] is None
+    assert payload["provenance"]["seed_vc_diffusion_steps"] == 30
+
+
+def test_crosstalk_is_reported_in_the_manifest(tmp_path: Path, monkeypatch) -> None:
+    """Simultaneous speech is invisible to exclusive attribution, so it is reported."""
+
+    fake = Stages(
+        tmp_path,
+        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), start=1.0, end=2.5)],
+    )
+    _wire(monkeypatch, fake)
+
+    result = run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    crosstalk = json.loads(result.manifest_path.read_text(encoding="utf-8"))["run"][
+        "diarization"
+    ]["crosstalk"]
+    assert crosstalk["regions"] == 1
+    assert crosstalk["seconds"] == 1.5
+    assert crosstalk["detail"] == [
+        {"start": 1.0, "end": 2.5, "speakers": ["SPEAKER_00", "SPEAKER_01"]}
+    ]
+    assert result.crosstalk == tuple(fake.crosstalk)
+
+    crosstalk = json.loads(result.manifest_path.read_text(encoding="utf-8"))["run"][
+        "diarization"
+    ]["crosstalk"]
+    assert crosstalk["regions"] == 1
+    assert crosstalk["seconds"] == 1.5
+    assert crosstalk["detail"] == [
+        {"start": 1.0, "end": 2.5, "speakers": ["SPEAKER_00", "SPEAKER_01"]}
+    ]
+
+
+def test_the_dialogue_bible_is_handed_to_adaptation(
+    tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consistency state must reach the prompt, not just exist on disk."""
+
+    from app.pipeline.dialogue_context import Character, CharacterBible
+
+    settings = _settings(tmp_path)
+    CharacterBible(
+        {SPEAKER: Character(speaker_id=SPEAKER, name="Selam", register="informal")}
+    ).save(settings.dialogue_bible_path)
+    monkeypatch.setattr(orchestrator, "get_settings", lambda: settings)
+
+    run_pipeline(_source(tmp_path), settings=settings)
+
+    bible = stages.received["translation"][2]
+    assert isinstance(bible, CharacterBible)
+    assert bible.name_of(SPEAKER) == "Selam"
+
+
+def test_an_absent_bible_is_empty_rather_than_fatal(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """A first run has no consistency state yet, which is the normal case."""
+
+    result = run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    bible = stages.received["translation"][2]
+    assert len(bible) == 0
+    assert result.dialogue
 
 
 def test_manifest_truncation_is_recorded(

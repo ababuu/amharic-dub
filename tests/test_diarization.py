@@ -17,8 +17,10 @@ import pytest
 from app.config import DEFAULT_DIARIZATION_MODEL, Settings
 from app.pipeline import diarization
 from app.pipeline.diarization import (
+    CrosstalkRegion,
     DiarizationError,
     DiarizationInferenceError,
+    DiarizationResult,
     InvalidInputError,
     InvalidSegmentError,
     InvalidSpeakerCountError,
@@ -28,6 +30,7 @@ from app.pipeline.diarization import (
     SpeakerSegment,
     UnsupportedOutputError,
     diarize,
+    diarize_detailed,
 )
 
 
@@ -151,6 +154,8 @@ def _settings(
     device: str = "cuda",
     token: str | None = "hf_test_token",
     model: str = DEFAULT_DIARIZATION_MODEL,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
 ) -> Settings:
     return Settings(
         input_dir=tmp_path / "input",
@@ -160,6 +165,8 @@ def _settings(
         huggingface_token=token,
         device=device,
         diarization_model=model,
+        diarization_min_speakers=min_speakers,
+        diarization_max_speakers=max_speakers,
     )
 
 
@@ -402,7 +409,6 @@ def test_speaker_segment_normalises_integers_to_float():
 
 def test_speaker_segment_is_immutable():
     segment = SpeakerSegment("SPEAKER_00", 0.0, 1.0)
-
     with pytest.raises(dataclasses.FrozenInstanceError):
         segment.speaker_id = "SPEAKER_01"
 
@@ -586,3 +592,206 @@ def test_inference_failure_is_wrapped(monkeypatch, tmp_path):
         diarize(_audio(tmp_path), settings=_settings(tmp_path))
 
     assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# crosstalk from the overlap-aware view
+# ---------------------------------------------------------------------------
+
+
+def _crosstalk_output(exclusive, overlapping) -> FakeDiarizeOutput:
+    """Build the ``DiarizeOutput`` pyannote actually returns for both views."""
+
+    return FakeDiarizeOutput(
+        exclusive_speaker_diarization=FakeAnnotation(exclusive),
+        speaker_diarization=FakeAnnotation(overlapping),
+    )
+
+
+def test_diarize_detailed_reports_both_turns_and_crosstalk(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    FakePipeline.result = _crosstalk_output(
+        exclusive=[(0.0, 2.0, "SPEAKER_00"), (2.0, 4.0, "SPEAKER_01")],
+        overlapping=[(0.0, 2.0, "SPEAKER_00"), (1.0, 3.0, "SPEAKER_01")],
+    )
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert isinstance(result, DiarizationResult)
+    # Attribution still comes from the exclusive view, and only from it.
+    assert result.turns == (
+        SpeakerSegment("SPEAKER_00", 0.0, 2.0),
+        SpeakerSegment("SPEAKER_01", 2.0, 4.0),
+    )
+    assert result.crosstalk == (
+        CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), start=1.0, end=2.0),
+    )
+    assert result.speaker_ids == ("SPEAKER_00", "SPEAKER_01")
+    assert result.crosstalk_seconds == 1.0
+
+
+def test_diarize_returns_only_the_turns(monkeypatch, tmp_path):
+    """The existing contract is unchanged: crosstalk is additive information."""
+
+    _patch(monkeypatch)
+    FakePipeline.result = _crosstalk_output(
+        exclusive=[(0.0, 2.0, "SPEAKER_00")],
+        overlapping=[(0.0, 2.0, "SPEAKER_00"), (0.5, 1.5, "SPEAKER_01")],
+    )
+
+    assert diarize(_audio(tmp_path), settings=_settings(tmp_path)) == [
+        SpeakerSegment("SPEAKER_00", 0.0, 2.0)
+    ]
+
+
+def test_a_result_without_the_overlap_view_reports_no_crosstalk(monkeypatch, tmp_path):
+    """A missing overlap view means "nothing to report", not an error."""
+
+    _patch(monkeypatch)
+    FakePipeline.result = _pipeline_output([(0.0, 2.0, "SPEAKER_00")])
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.crosstalk == ()
+    assert result.turns == (SpeakerSegment("SPEAKER_00", 0.0, 2.0),)
+
+
+def test_three_simultaneous_speakers_are_one_region(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    FakePipeline.result = _crosstalk_output(
+        exclusive=[(0.0, 4.0, "SPEAKER_00")],
+        overlapping=[
+            (0.0, 4.0, "SPEAKER_00"),
+            (1.0, 3.0, "SPEAKER_01"),
+            (1.5, 2.5, "SPEAKER_02"),
+        ],
+    )
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.crosstalk == (
+        CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), start=1.0, end=1.5),
+        CrosstalkRegion(("SPEAKER_00", "SPEAKER_01", "SPEAKER_02"), start=1.5, end=2.5),
+        CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), start=2.5, end=3.0),
+    )
+
+
+def test_touching_regions_with_the_same_speakers_are_merged(monkeypatch, tmp_path):
+    """A long stretch of crosstalk is one region, not one per turn boundary."""
+
+    _patch(monkeypatch)
+    FakePipeline.result = _crosstalk_output(
+        exclusive=[(0.0, 6.0, "SPEAKER_00")],
+        overlapping=[
+            (0.0, 6.0, "SPEAKER_00"),
+            (1.0, 2.5, "SPEAKER_01"),
+            (2.5, 4.0, "SPEAKER_01"),
+        ],
+    )
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.crosstalk == (
+        CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), start=1.0, end=4.0),
+    )
+
+
+def test_non_overlapping_speakers_report_no_crosstalk(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    FakePipeline.result = _crosstalk_output(
+        exclusive=[(0.0, 1.0, "SPEAKER_00"), (1.0, 2.0, "SPEAKER_01")],
+        overlapping=[(0.0, 1.0, "SPEAKER_00"), (1.0, 2.0, "SPEAKER_01")],
+    )
+
+    assert diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path)).crosstalk == ()
+
+
+def test_a_crosstalk_region_needs_two_speakers():
+    with pytest.raises(InvalidSegmentError, match="at least two"):
+        CrosstalkRegion(("SPEAKER_00",), start=0.0, end=1.0)
+
+    with pytest.raises(InvalidSegmentError, match="at least two"):
+        CrosstalkRegion(("SPEAKER_00", "  "), start=0.0, end=1.0)
+
+
+def test_a_crosstalk_region_validates_its_interval():
+    with pytest.raises(InvalidSegmentError, match="greater than start"):
+        CrosstalkRegion(("A", "B"), start=2.0, end=2.0)
+
+    with pytest.raises(InvalidSegmentError, match="start must be"):
+        CrosstalkRegion(("A", "B"), start=-1.0, end=1.0)
+
+
+def test_a_crosstalk_region_normalises_speaker_ids():
+    region = CrosstalkRegion(("b", "A", "A"), start=0, end=1)
+
+    assert region.speaker_ids == ("A", "b")
+    assert region.duration == 1.0
+
+
+def test_crosstalk_regions_are_deduplicated_case_sensitively(monkeypatch, tmp_path):
+    """Repeated labels are collapsed, so a region cannot claim a speaker twice."""
+
+    _patch(monkeypatch)
+    FakePipeline.result = _crosstalk_output(
+        exclusive=[(0.0, 3.0, "SPEAKER_00")],
+        overlapping=[(0.0, 1.0, "SPEAKER_00"), (0.5, 1.5, "SPEAKER_00")],
+    )
+
+    assert diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path)).crosstalk == ()
+
+
+# ---------------------------------------------------------------------------
+# speaker-count hints from settings
+# ---------------------------------------------------------------------------
+
+
+def test_configured_speaker_counts_are_used_as_a_fallback(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    FakePipeline.result = _pipeline_output([(0.0, 1.0, "SPEAKER_00")])
+
+    diarize(
+        _audio(tmp_path),
+        settings=_settings(tmp_path, min_speakers=4, max_speakers=9),
+    )
+
+    assert FakePipeline.calls[0][1] == {"min_speakers": 4, "max_speakers": 9}
+
+
+def test_explicit_speaker_counts_win_over_the_configured_ones(monkeypatch, tmp_path):
+    """A caller that knows better for one film is never overridden by the env."""
+
+    _patch(monkeypatch)
+    FakePipeline.result = _pipeline_output([(0.0, 1.0, "SPEAKER_00")])
+
+    diarize(
+        _audio(tmp_path),
+        settings=_settings(tmp_path, min_speakers=4, max_speakers=9),
+        min_speakers=2,
+        max_speakers=3,
+    )
+
+    assert FakePipeline.calls[0][1] == {"min_speakers": 2, "max_speakers": 3}
+
+
+def test_num_speakers_still_wins_over_everything(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    FakePipeline.result = _pipeline_output([(0.0, 1.0, "SPEAKER_00")])
+
+    diarize(
+        _audio(tmp_path),
+        settings=_settings(tmp_path, min_speakers=4, max_speakers=9),
+        num_speakers=5,
+    )
+
+    assert FakePipeline.calls[0][1] == {"num_speakers": 5, "min_speakers": 4, "max_speakers": 9}
+
+
+def test_configured_counts_are_validated_before_the_model_is_touched(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    FakePipeline.result = _pipeline_output([(0.0, 1.0, "SPEAKER_00")])
+
+    with pytest.raises(InvalidSpeakerCountError, match="must not exceed"):
+        diarize(_audio(tmp_path), settings=_settings(tmp_path, min_speakers=9, max_speakers=4))
+
+    assert FakePipeline.requests == []
