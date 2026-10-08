@@ -152,6 +152,8 @@ environment, so values configured on the RunPod pod always win.
 | `SEED_VC_CONVERT_STYLE` | Also convert the *reference's* accent and style. **Keep this off** - see [Speech synthesis](#speech-synthesis-ttspy) | `false` |
 | `TTS_PERFORMANCE_REFERENCE_MIN_DURATION` / `..._MAX_DURATION` | Length of the original-performance prompt handed to Chatterbox | `6.0` / `12.0` |
 | `TTS_MAX_PAUSE_SECONDS` | Longest pause rendered around a synthesized line | `2.0` |
+| `TTS_MIN_LINE_SECONDS` | Shortest original window that can be dubbed; shorter lines are skipped and reported | `0.30` |
+| `TTS_CONTINUE_ON_FAILURE` | Skip and report a line an engine fails on instead of ending the run | `false` |
 | `TIMING_MIN_TEMPO` | Slowest a line may be stretched to fit its window | `0.80` |
 | `TIMING_MAX_TEMPO` | Fastest a line may be stretched to fit its window | `1.25` |
 | `MIX_DIALOGUE_GAIN_DB` | Dialogue level in the final mix (signed dB)     | `0.0`              |
@@ -484,6 +486,17 @@ when the line is short, trimmed when it is long, bounded by
 `VoiceProfile.reference_audio` is used only as the Seed-VC target identity, which
 is what makes a character sound like themselves across a film. A `VoiceProfile`
 is never modified by this stage.
+
+**Lines that cannot be dubbed are skipped and reported.** A window shorter than
+`TTS_MIN_LINE_SECONDS` (0.30s by default) is a fragment, not a spoken line: there is
+no room for a word in the time it occupied, so any Amharic written for it is
+unintelligible - and Chatterbox can fail outright on it, with an empty mel
+spectrogram that trips a convolution inside its vocoder. Such a line, and a line
+whose Amharic has nothing to pronounce, is skipped *before* the engines are called,
+the lines around it are unaffected, and both the line and the reason are recorded in
+the manifest under `run.tts.skipped`. This is input validation, not failure
+tolerance: an engine that actually *fails* on a line still stops the run with that
+line named, unless `TTS_CONTINUE_ON_FAILURE=true` asks for a reported hole instead.
 
 `AdaptedDialogue`'s performance metadata is mapped, not discarded. `intensity`
 moves Chatterbox's `exaggeration` and `temperature` predictably; `emotion` and

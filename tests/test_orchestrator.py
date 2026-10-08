@@ -159,6 +159,7 @@ class Stages:
         *,
         turns: list[SpeakerSegment] | None = None,
         crosstalk: list[CrosstalkRegion] | None = None,
+        skipped: list[object] | None = None,
         lines: list[TranscriptSegment] | None = None,
         dialogue: list[AdaptedDialogue] | None = None,
         profiles: dict[str, VoiceProfile] | None = None,
@@ -167,6 +168,7 @@ class Stages:
         self.root = root
         self.turns = [_turn()] if turns is None else turns
         self.crosstalk = [] if crosstalk is None else crosstalk
+        self.skipped = [] if skipped is None else skipped
         self.lines = [_line()] if lines is None else lines
         self.dialogue = [_dialogue()] if dialogue is None else dialogue
         self.profiles = {SPEAKER: _profile(root)} if profiles is None else profiles
@@ -225,17 +227,20 @@ class Stages:
         self._record("voice_profiles", turns, speech, transcript, settings)
         return dict(self.profiles)
 
-    def synthesize_dialogue(
+    def synthesize_dialogue_detailed(
         self,
         dialogue: object,
         speech: Path,
         profiles: object,
         *,
         settings: Settings,
-    ) -> list[TtsClip]:
+    ):  # noqa: ANN201
+        from app.pipeline.tts import SynthesisResult
+
         self._record("tts", dialogue, speech, profiles, settings)
         spoken = list(dialogue)  # type: ignore[arg-type]
-        return [_clip(self.root, index, line) for index, line in enumerate(spoken, start=1)]
+        clips = [_clip(self.root, index, line) for index, line in enumerate(spoken, start=1)]
+        return SynthesisResult(clips=tuple(clips), skipped=tuple(self.skipped))
 
     def align_dialogue(
         self, clips: object, *, output_dir: Path, settings: Settings
@@ -280,7 +285,9 @@ def _wire(monkeypatch: pytest.MonkeyPatch, fake: Stages) -> None:
     monkeypatch.setattr(
         orchestrator.voice_profiles, "build_voice_profiles", fake.build_voice_profiles
     )
-    monkeypatch.setattr(orchestrator.tts, "synthesize_dialogue", fake.synthesize_dialogue)
+    monkeypatch.setattr(
+        orchestrator.tts, "synthesize_dialogue_detailed", fake.synthesize_dialogue_detailed
+    )
     monkeypatch.setattr(orchestrator.timing, "align_dialogue", fake.align_dialogue)
     monkeypatch.setattr(orchestrator.mixing, "mix_track", fake.mix_track)
     monkeypatch.setattr(orchestrator.video, "mux_dub", fake.mux_dub)
@@ -511,6 +518,39 @@ def test_an_absent_bible_is_empty_rather_than_fatal(
     bible = stages.received["translation"][2]
     assert len(bible) == 0
     assert result.dialogue
+
+
+def test_a_line_that_cannot_be_voiced_is_recorded_in_the_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hole in the dub has to be auditable, not just missing."""
+
+    from app.pipeline.tts import SkippedLine
+
+    fake = Stages(
+        tmp_path,
+        skipped=[
+            SkippedLine(
+                index=0,
+                speaker_id=SPEAKER,
+                start=5.836,
+                end=6.056,
+                amharic="ዋልት።",
+                reason="cannot be dubbed: the original window is 0.220s",
+            )
+        ],
+    )
+    _wire(monkeypatch, fake)
+
+    result = run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    skipped = payload["run"]["tts"]["skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["amharic"] == "ዋልት።"
+    assert skipped[0]["duration"] == 0.22
+    assert "cannot be dubbed" in skipped[0]["reason"]
+    assert result.skipped == tuple(fake.skipped)
 
 
 def test_manifest_truncation_is_recorded(

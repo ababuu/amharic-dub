@@ -66,7 +66,7 @@ from app.pipeline.mixing import MixResult
 from app.pipeline.timing import AlignedClip
 from app.pipeline.transcription import TranscriptSegment
 from app.pipeline.translation import AdaptedDialogue
-from app.pipeline.tts import TtsClip
+from app.pipeline.tts import SkippedLine, TtsClip
 from app.pipeline.video import MuxResult
 from app.pipeline.voice_profiles import VoiceProfile, portable_path
 
@@ -122,6 +122,7 @@ class PipelineResult:
     dialogue: tuple[AdaptedDialogue, ...]
     profiles: Mapping[str, VoiceProfile]
     clips: tuple[TtsClip, ...]
+    skipped: tuple[SkippedLine, ...]
     alignment: tuple[AlignedClip, ...]
     mix: MixResult
     dub: MuxResult
@@ -193,8 +194,7 @@ class PipelineResult:
                 "lines": len(self.dialogue),
                 "segments": [_dialogue_dict(line) for line in self.dialogue],
             },
-            "voice_profiles": {
-                speaker_id: {
+            "voice_profiles": {                speaker_id: {
                     "reference_audio": portable_path(profile.reference_audio),
                     "reference_start": profile.reference_start,
                     "reference_end": profile.reference_end,
@@ -210,7 +210,13 @@ class PipelineResult:
                 }
                 for speaker_id, profile in self.profiles.items()
             },
-            "tts": {"clips": [clip.to_dict() for clip in self.clips]},
+            "tts": {
+                "clips": [clip.to_dict() for clip in self.clips],
+                # Lines the stage could not voice. Recorded because a line missing
+                # from the dub is audible, so a run has to be able to say which
+                # ones and why without re-listening to the film.
+                "skipped": [line.as_dict() for line in self.skipped],
+            },
             "timing": {
                 "lines": len(self.alignment),
                 "unfitted": len(self.unfitted_lines),
@@ -481,18 +487,23 @@ def run_pipeline(
         )
         spoken = dialogue[:max_lines]
 
-    clips = tuple(
-        _stage(
-            "tts",
-            seconds,
-            report,
-            tts.synthesize_dialogue,
-            spoken,
-            stems.speech,
-            profiles,
-            settings=resolved,
-        )
+    synthesized = _stage(
+        "tts",
+        seconds,
+        report,
+        tts.synthesize_dialogue_detailed,
+        spoken,
+        stems.speech,
+        profiles,
+        settings=resolved,
     )
+    clips = tuple(synthesized.clips)
+    skipped = tuple(synthesized.skipped)
+    if skipped:
+        report(
+            f"  skipped: {len(skipped)} line(s) could not be voiced "
+            f"({len(synthesized.failed)} engine failure(s))"
+        )
     if not clips:
         raise EmptyStageError(
             "speech synthesis produced no clips; there is nothing to place or mix"
@@ -544,13 +555,14 @@ def run_pipeline(
         dialogue=dialogue,
         profiles=dict(profiles),
         clips=clips,
+        skipped=skipped,
         alignment=alignment,
         mix=mixed,
         dub=dub,
         manifest_path=run_dir / MANIFEST_FILENAME,
         stage_seconds=dict(seconds),
         elapsed_seconds=time.perf_counter() - started,
-        synthesized_lines=len(spoken),
+        synthesized_lines=len(clips),
     )
 
     # Measured, not assumed: the model-free quality report is part of every run.

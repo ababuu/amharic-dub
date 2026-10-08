@@ -82,6 +82,12 @@ What this stage deliberately does not do
   ``HF_HOME`` - see ``.env.example``.
 * **No Docker, no ffmpeg.** Cutting the performance reference uses ``soundfile``
   seeking, so this stage adds no external process.
+
+A line that cannot be dubbed at all - a window too short to hold a word, or text
+with nothing to pronounce - is skipped before either engine is called and reported,
+so a fragment cannot end a run over a film. An engine that genuinely *fails* on a
+line still stops the run with that line named, unless
+``TTS_CONTINUE_ON_FAILURE=true`` asks for a reported hole instead.
 """
 
 from __future__ import annotations
@@ -104,12 +110,14 @@ import soundfile as sf
 from app.config import (
     DEFAULT_SEED_VC_CONVERT_STYLE,
     DEFAULT_SEED_VC_DIFFUSION_STEPS,
+    DEFAULT_TTS_MIN_LINE_SECONDS,
     DEFAULT_TTS_MODEL,
     DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION,
     DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION,
     Settings,
     get_settings,
 )
+from app.pipeline.amharic_text import count_syllables
 from app.pipeline.translation import AdaptedDialogue
 from app.pipeline.voice_profiles import (
     VoiceProfile,
@@ -182,6 +190,17 @@ SEED_VC_ENGINE_NAME = "seed-vc-v2"
 
 #: Configuration that describes Seed-VC V2, relative to its checkout.
 SEED_VC_CONFIG_PARTS = ("configs", "v2", "vc_wrapper.yaml")
+
+#: Shortest original window that can be dubbed, in seconds. Below this the original
+#: is a fragment rather than a spoken line - there is no room for a word in the time
+#: it occupied - and the engine can fail outright on it: Chatterbox does, with an
+#: empty mel spectrogram that trips a convolution inside its vocoder.
+MINIMUM_SPEAKABLE_LINE_SECONDS = DEFAULT_TTS_MIN_LINE_SECONDS
+
+#: Shortest Amharic line worth synthesizing, in syllables. One Fidel character is one
+#: syllable, so this counts the script's own unit: text with nothing to pronounce
+#: produces no speech, and asking the engine for it is what fails.
+MINIMUM_SPEAKABLE_SYLLABLES = 1
 
 #: Seed-VC V2 runs in timbre-only mode by default: it replaces the character's
 #: voice and leaves the take's delivery alone. The flag means "also convert the
@@ -1897,6 +1916,109 @@ def _line_artifact_name(dialogue: AdaptedDialogue, *, model: str) -> str:
     return f"{speaker_directory_name(dialogue.speaker_id)}_{digest}"
 
 
+@dataclass(frozen=True, slots=True)
+class SkippedLine:
+    """A dialogue line that was deliberately not synthesized, and why.
+
+    Reported rather than silently dropped: a line missing from the dub is something
+    a listener will notice, so the run has to be able to say which ones and why.
+    """
+
+    index: int
+    speaker_id: str
+    start: float
+    end: float
+    amharic: str
+    reason: str
+
+    @property
+    def duration(self) -> float:
+        """Length of the original window in seconds."""
+
+        return self.end - self.start
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-safe view of the skipped line."""
+
+        return {
+            "index": self.index,
+            "speaker_id": self.speaker_id,
+            "start": round(self.start, 3),
+            "end": round(self.end, 3),
+            "duration": round(self.duration, 3),
+            "amharic": self.amharic,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesisResult:
+    """Every clip the stage produced, plus every line it could not.
+
+    A film is thousands of lines and a paid run is hours long, so one line the engine
+    cannot voice must not end the run: the failures are collected here and reported,
+    and the stages after this one work with the clips that exist.
+    """
+
+    clips: tuple[TtsClip, ...]
+    skipped: tuple[SkippedLine, ...] = ()
+
+    @property
+    def attempted(self) -> int:
+        """How many lines were considered."""
+
+        return len(self.clips) + len(self.skipped)
+
+    @property
+    def failed(self) -> tuple[SkippedLine, ...]:
+        """Lines skipped because an engine failed, rather than as unusable input."""
+
+        return tuple(
+            line for line in self.skipped if line.reason.startswith(FAILURE_REASON_PREFIX)
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-safe view of the result."""
+
+        return {
+            "clips": len(self.clips),
+            "skipped": len(self.skipped),
+            "attempted": self.attempted,
+            "failed": len(self.failed),
+            "skipped_lines": [line.as_dict() for line in self.skipped],
+        }
+
+
+#: Prefix of the reason recorded for a line an engine failed on, so a report can tell
+#: a broken line apart from an unusable one.
+FAILURE_REASON_PREFIX = "synthesis failed"
+#: Prefix of the reason recorded for a line that cannot be dubbed at all.
+UNSPEAKABLE_REASON_PREFIX = "cannot be dubbed"
+
+
+def _skip_reason(line: AdaptedDialogue, *, min_line_seconds: float) -> str | None:
+    """Return why ``line`` cannot be dubbed, or ``None`` when it can.
+
+    Both checks are about the *input*, not about an engine: a window with no room for
+    a word, or text with nothing to pronounce. Skipping these is not tolerating a
+    failure, it is refusing to ask for something that cannot work - and it is what
+    keeps a broken fragment from ending a three-hour run.
+    """
+
+    if line.duration < min_line_seconds:
+        return (
+            f"{UNSPEAKABLE_REASON_PREFIX}: the original window is "
+            f"{line.duration:.3f}s, shorter than the {min_line_seconds:g}s a line "
+            "needs to hold a word"
+        )
+    if count_syllables(line.amharic) < MINIMUM_SPEAKABLE_SYLLABLES:
+        return (
+            f"{UNSPEAKABLE_REASON_PREFIX}: the Amharic line has no syllables to "
+            "pronounce"
+        )
+    return None
+
+
 def _validate_dialogue(dialogue: Iterable[AdaptedDialogue]) -> list[AdaptedDialogue]:
     """Return the dialogue as a chronological list of valid lines."""
 
@@ -2108,7 +2230,7 @@ def _synthesize_line(
     )
 
 
-def synthesize_dialogue(
+def synthesize_dialogue_detailed(
     dialogue: Iterable[AdaptedDialogue],
     speech_stem: str | Path,
     voice_profiles: Mapping[str, VoiceProfile],
@@ -2117,8 +2239,8 @@ def synthesize_dialogue(
     settings: Settings | None = None,
     performance_engine: ChatterboxPerformanceEngine | None = None,
     style_engine: VoiceConversionEngine | None = None,
-) -> list[TtsClip]:
-    """Synthesize every adapted line in the voice of its speaker.
+) -> SynthesisResult:
+    """Synthesize every dubbable line, and report the ones that could not be.
 
     Parameters
     ----------
@@ -2170,12 +2292,14 @@ def synthesize_dialogue(
     InvalidEngineError
         An injected engine is not the expected kind of adapter.
     EngineLoadError, SynthesisError, ConversionError, MissingOutputError
-        An engine could not be loaded, failed, or wrote nothing.
+        An engine could not be loaded, or failed in a way that is not specific to
+        one line. A failure on a *single* line is reported in the result's
+        ``skipped`` rather than raised, so one unvoiceable line cannot end a run.
     """
 
     lines = _validate_dialogue(dialogue)
     if not lines:
-        return []
+        return SynthesisResult(clips=())
 
     resolved = settings if settings is not None else get_settings()
     profiles = _validate_profiles(
@@ -2205,6 +2329,10 @@ def synthesize_dialogue(
             f"than TTS_PERFORMANCE_REFERENCE_MIN_DURATION ({minimum})"
         )
     _positive("TTS_MAX_PAUSE_SECONDS", resolved.tts_max_pause_seconds)
+    min_line_seconds = _positive(
+        "TTS_MIN_LINE_SECONDS", resolved.tts_min_line_seconds
+    )
+    continue_on_failure = bool(resolved.tts_continue_on_failure)
 
     performance, style = _resolve_engines(
         settings=resolved,
@@ -2218,7 +2346,22 @@ def synthesize_dialogue(
     directories.create()
 
     clips: list[TtsClip] = []
+    skipped: list[SkippedLine] = []
     for index, line in enumerate(lines):
+        reason = _skip_reason(line, min_line_seconds=min_line_seconds)
+        if reason is not None:
+            skipped.append(
+                SkippedLine(
+                    index=index,
+                    speaker_id=line.speaker_id,
+                    start=line.start,
+                    end=line.end,
+                    amharic=line.amharic,
+                    reason=reason,
+                )
+            )
+            continue
+
         digest = _line_digest(line, model=resolved.tts_model)
         try:
             clips.append(
@@ -2236,12 +2379,58 @@ def synthesize_dialogue(
                 )
             )
         except TtsError as exc:
-            raise type(exc)(
-                f"line {index} of speaker {line.speaker_id!r} "
-                f"({line.start:.3f}s-{line.end:.3f}s): {exc}"
-            ) from exc
+            if not continue_on_failure:
+                # The line is identified so the failure can be found and the input
+                # fixed. A film's run is long, so a caller that would rather ship a
+                # dub with a reported hole can set TTS_CONTINUE_ON_FAILURE.
+                raise type(exc)(
+                    f"line {index} of speaker {line.speaker_id!r} "
+                    f"({line.start:.3f}s-{line.end:.3f}s): {exc}"
+                ) from exc
+            skipped.append(
+                SkippedLine(
+                    index=index,
+                    speaker_id=line.speaker_id,
+                    start=line.start,
+                    end=line.end,
+                    amharic=line.amharic,
+                    reason=f"{FAILURE_REASON_PREFIX}: {type(exc).__name__}: {exc}",
+                )
+            )
 
-    return clips
+    return SynthesisResult(clips=tuple(clips), skipped=tuple(skipped))
+
+
+def synthesize_dialogue(
+    dialogue: Iterable[AdaptedDialogue],
+    speech_stem: str | Path,
+    voice_profiles: Mapping[str, VoiceProfile],
+    *,
+    settings: Settings | None = None,
+    output_dir: str | Path | None = None,
+    performance_engine: ChatterboxPerformanceEngine | None = None,
+    style_engine: VoiceConversionEngine | None = None,
+) -> list[TtsClip]:
+    """Synthesize every dubbable line and return the clips.
+
+    The clips alone, in the order the lines were given. Lines the stage could not
+    voice - a window too short to hold a word, text with nothing to pronounce, or a
+    line an engine failed on - are absent rather than raising; call
+    :func:`synthesize_dialogue_detailed` when the reason for each one is wanted,
+    which is what the orchestrator does so the manifest can record them.
+    """
+
+    return list(
+        synthesize_dialogue_detailed(
+            dialogue,
+            speech_stem,
+            voice_profiles,
+            settings=settings,
+            output_dir=output_dir,
+            performance_engine=performance_engine,
+            style_engine=style_engine,
+        ).clips
+    )
 
 
 __all__ = [
@@ -2252,6 +2441,8 @@ __all__ = [
     "CFG_WEIGHT_BOUNDS",
     "CHATTERBOX_SAMPLE_RATE",
     "EXAGGERATION_BOUNDS",
+    "MINIMUM_SPEAKABLE_LINE_SECONDS",
+    "MINIMUM_SPEAKABLE_SYLLABLES",
     "PerformanceControls",
     "SEED_VC_CONVERT_STYLE",
     "SEED_VC_ENGINE_NAME",
@@ -2272,7 +2463,9 @@ __all__ = [
     "MissingOutputError",
     "MissingVoiceProfileError",
     "SeedVcV2Engine",
+    "SkippedLine",
     "SynthesisError",
+    "SynthesisResult",
     "TtsClip",
     "TtsError",
     "VoiceConversionEngine",
@@ -2283,4 +2476,5 @@ __all__ = [
     "seed_vc_revision",
     "resolve_tts_directory",
     "synthesize_dialogue",
+    "synthesize_dialogue_detailed",
 ]

@@ -1188,6 +1188,180 @@ def test_the_failing_line_is_identified_by_its_window(rig: Rig) -> None:
         rig.run()
 
 
+# ---------------------------------------------------------------------------
+# Lines that cannot be dubbed
+# ---------------------------------------------------------------------------
+
+
+def _short_line() -> AdaptedDialogue:
+    """The 0.22s fragment that fed a three-syllable line to Chatterbox.
+
+    Chatterbox produced an empty mel spectrogram for it and its vocoder died in a
+    convolution, which ended an otherwise healthy run. There is no room for a word
+    in 0.22s, so the line is not dubbable and must never reach the engine.
+    """
+
+    return _line(start=5.836, end=6.056, amharic="ዋልት።")
+
+
+def test_a_window_too_short_to_hold_a_word_is_skipped(rig: Rig) -> None:
+    result = tts.synthesize_dialogue_detailed(
+        [_short_line()],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        performance_engine=rig.chatterbox,
+        style_engine=rig.seedvc,
+    )
+
+    assert result.clips == ()
+    (skipped,) = result.skipped
+    assert skipped.index == 0
+    assert skipped.speaker_id == rig.profile.speaker_id
+    assert skipped.amharic == "ዋልት።"
+    assert skipped.duration == pytest.approx(0.22)
+    assert "cannot be dubbed" in skipped.reason
+    assert "0.220s" in skipped.reason
+    assert result.failed == ()  # refused, not failed
+
+
+def test_the_engine_is_never_called_for_a_skipped_line(rig: Rig) -> None:
+    """The guard has to run *before* the engine, or the crash it prevents returns."""
+
+    catchbox = rig.chatterbox
+
+    tts.synthesize_dialogue_detailed(
+        [_short_line()],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        performance_engine=catchbox,
+        style_engine=rig.seedvc,
+    )
+
+    assert catchbox.calls == []
+
+
+def test_a_short_line_does_not_stop_the_lines_around_it(rig: Rig) -> None:
+    result = tts.synthesize_dialogue_detailed(
+        [_line(start=2.0, end=4.0), _short_line(), _line(start=8.0, end=10.0)],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        performance_engine=rig.chatterbox,
+        style_engine=rig.seedvc,
+    )
+
+    assert [clip.index for clip in result.clips] == [0, 2]
+    assert [line.index for line in result.skipped] == [1]
+    assert result.attempted == 3
+
+
+def test_a_line_with_nothing_to_pronounce_is_skipped(rig: Rig) -> None:
+    """Punctuation only, or a stray Latin fragment, cannot become speech."""
+
+    result = tts.synthesize_dialogue_detailed(
+        [_line(amharic="።፣?!")],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        performance_engine=rig.chatterbox,
+        style_engine=rig.seedvc,
+    )
+
+    (skipped,) = result.skipped
+    assert "no syllables" in skipped.reason
+    assert result.clips == ()
+
+
+def test_a_latin_only_line_is_skipped(rig: Rig) -> None:
+    """The script has nothing to pronounce, and the engine would produce nothing."""
+
+    result = tts.synthesize_dialogue_detailed(
+        [_line(amharic="wait")],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        performance_engine=rig.chatterbox,
+        style_engine=rig.seedvc,
+    )
+
+    assert [line.reason.split(":")[0] for line in result.skipped] == ["cannot be dubbed"]
+
+
+def test_the_shortest_dubbable_window_is_configurable(rig: Rig) -> None:
+    """A pod can lower the bar for a film whose turns really are that short."""
+
+    result = tts.synthesize_dialogue_detailed(
+        [_short_line()],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(tts_min_line_seconds=0.05),
+        performance_engine=rig.chatterbox,
+        style_engine=rig.seedvc,
+    )
+
+    assert result.skipped == ()
+    assert len(result.clips) == 1
+
+
+def test_synthesize_dialogue_still_returns_the_clips(rig: Rig) -> None:
+    """The delegating function keeps its contract for existing callers."""
+
+    clips = tts.synthesize_dialogue(
+        [_line(start=2.0, end=4.0), _short_line()],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        performance_engine=rig.chatterbox,
+        style_engine=rig.seedvc,
+    )
+
+    assert isinstance(clips, list)
+    assert [clip.index for clip in clips] == [0]
+
+
+def test_an_engine_failure_is_skipped_when_the_caller_asks(rig: Rig) -> None:
+    """Off by default, because a failure should be visible - see the tests above."""
+
+    rig.chatterbox = FakeChatterbox(error=SynthesisError("no speaker tokens"), error_at=1)
+
+    result = tts.synthesize_dialogue_detailed(
+        [_line(start=2.0, end=4.0), _line(start=4.0, end=6.0)],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(tts_continue_on_failure=True),
+        performance_engine=rig.chatterbox,
+        style_engine=rig.seedvc,
+    )
+
+    assert [clip.index for clip in result.clips] == [0]
+    (skipped,) = result.skipped
+    assert skipped.index == 1
+    assert skipped.reason.startswith("synthesis failed")
+    assert "no speaker tokens" in skipped.reason
+    assert result.failed == result.skipped
+
+
+def test_a_skipped_line_is_json_safe(rig: Rig) -> None:
+    import json as _json
+
+    result = tts.synthesize_dialogue_detailed(
+        [_short_line()],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        performance_engine=rig.chatterbox,
+        style_engine=rig.seedvc,
+    )
+
+    payload = result.as_dict()
+    assert _json.loads(_json.dumps(payload)) == payload
+    assert payload["clips"] == 0
+    assert payload["skipped"] == 1
+    assert payload["skipped_lines"][0]["duration"] == 0.22
+
+
 def test_an_engine_that_writes_nothing_is_reported(rig: Rig) -> None:
     rig.chatterbox = FakeChatterbox(write=False)
 

@@ -61,6 +61,12 @@ Environment variables
                       Chatterbox, in seconds.
 ``TTS_MAX_PAUSE_SECONDS``
                       Longest pause rendered around a synthesized line.
+``TTS_MIN_LINE_SECONDS``
+                      Shortest original window that can be dubbed; shorter lines
+                      are skipped and reported rather than sent to the engine.
+``TTS_CONTINUE_ON_FAILURE``
+                      Skip and report a line an engine *fails* on instead of ending
+                      the run. Off by default, because a failure should be visible.
 ``DEVICE``            Compute device hint, ``cuda`` by default.
 ``LOG_LEVEL``         Logging verbosity, ``INFO`` by default.
 """
@@ -170,6 +176,20 @@ DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION = 12.0
 #: seconds; this bound keeps a wildly wrong estimate from becoming a hole in the
 #: dub.
 DEFAULT_TTS_MAX_PAUSE_SECONDS = 2.0
+
+#: Shortest original window that can be dubbed, in seconds. Below this the original
+#: is a fragment - a breath, a click, a sliver of a mis-diarized turn - rather than a
+#: spoken line: there is no room for a word in the time it occupied, any Amharic
+#: written for it is unintelligible, and the speech engine can fail on it outright.
+#: Chatterbox does, with an empty mel spectrogram that trips a convolution inside
+#: its vocoder, so such a line must be skipped and reported rather than attempted.
+DEFAULT_TTS_MIN_LINE_SECONDS = 0.30
+
+#: Whether a line an engine *fails* on is recorded and skipped instead of ending the
+#: run. Off by default, because hiding a failure is worse than stopping: a stage error
+#: names the line, and a dub with a hole in it is only acceptable when it was asked
+#: for. Set it on a long run where finishing matters more than a perfect first pass.
+DEFAULT_TTS_CONTINUE_ON_FAILURE = False
 
 #: How far a line's delivery may be time-stretched to fit the window of the
 #: original line, as a tempo factor. A factor below 1 slows the line down, above
@@ -384,6 +404,12 @@ class Settings:
         DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION
     )
     tts_max_pause_seconds: float = DEFAULT_TTS_MAX_PAUSE_SECONDS
+    #: Shortest original window that can be dubbed at all; shorter lines are skipped
+    #: and reported instead of being sent to the engine.
+    tts_min_line_seconds: float = DEFAULT_TTS_MIN_LINE_SECONDS
+    #: Whether a line an engine fails on is skipped and reported, rather than ending
+    #: the run. Off by default: a failure should be visible, not absorbed.
+    tts_continue_on_failure: bool = DEFAULT_TTS_CONTINUE_ON_FAILURE
     #: Timing settings for :mod:`app.pipeline.timing`: the tempo band a line may
     #: be stretched within to fit its original window.
     timing_min_tempo: float = DEFAULT_TIMING_MIN_TEMPO
@@ -477,6 +503,12 @@ class Settings:
             tts_max_pause_seconds=_read_float(
                 "TTS_MAX_PAUSE_SECONDS", DEFAULT_TTS_MAX_PAUSE_SECONDS
             ),
+            tts_min_line_seconds=_read_float(
+                "TTS_MIN_LINE_SECONDS", DEFAULT_TTS_MIN_LINE_SECONDS
+            ),
+            tts_continue_on_failure=_read_bool(
+                "TTS_CONTINUE_ON_FAILURE", DEFAULT_TTS_CONTINUE_ON_FAILURE
+            ),
             timing_min_tempo=_read_float("TIMING_MIN_TEMPO", DEFAULT_TIMING_MIN_TEMPO),
             timing_max_tempo=_read_float("TIMING_MAX_TEMPO", DEFAULT_TIMING_MAX_TEMPO),
             mix_dialogue_gain_db=_read_signed_float(
@@ -557,6 +589,8 @@ class Settings:
                 self.tts_performance_reference_max_duration
             ),
             "tts_max_pause_seconds": self.tts_max_pause_seconds,
+            "tts_min_line_seconds": self.tts_min_line_seconds,
+            "tts_continue_on_failure": self.tts_continue_on_failure,
             "timing_min_tempo": self.timing_min_tempo,
             "timing_max_tempo": self.timing_max_tempo,
             "mix_dialogue_gain_db": self.mix_dialogue_gain_db,
@@ -587,7 +621,9 @@ __all__ = [
     "DEFAULT_TRANSLATION_BASE_URL",
     "DEFAULT_TRANSLATION_BATCH_SIZE",
     "DEFAULT_TRANSLATION_MODEL",
+    "DEFAULT_TTS_CONTINUE_ON_FAILURE",
     "DEFAULT_TTS_MAX_PAUSE_SECONDS",
+    "DEFAULT_TTS_MIN_LINE_SECONDS",
     "DEFAULT_TTS_MODEL",
     "DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
     "DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION",

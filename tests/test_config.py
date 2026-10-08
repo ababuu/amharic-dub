@@ -22,6 +22,7 @@ from app.config import (
     DEFAULT_TRANSLATION_BASE_URL,
     DEFAULT_TRANSLATION_BATCH_SIZE,
     DEFAULT_TRANSLATION_MODEL,
+    DEFAULT_TTS_MIN_LINE_SECONDS,
     DEFAULT_TTS_MAX_PAUSE_SECONDS,
     DEFAULT_TTS_MODEL,
     DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION,
@@ -333,6 +334,9 @@ def test_tts_settings_are_configurable(
         == DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION
     )
     assert defaults.tts_max_pause_seconds == DEFAULT_TTS_MAX_PAUSE_SECONDS
+    assert defaults.tts_min_line_seconds == DEFAULT_TTS_MIN_LINE_SECONDS
+    # A failure should be visible, so absorbing one is opt-in.
+    assert defaults.tts_continue_on_failure is False
 
     monkeypatch.setenv("TTS_MODEL", "someone/other-adapter")
     monkeypatch.setenv("SEED_VC_REPO_PATH", "vendor/seed-vc")
@@ -341,6 +345,8 @@ def test_tts_settings_are_configurable(
     monkeypatch.setenv("TTS_PERFORMANCE_REFERENCE_MIN_DURATION", "4")
     monkeypatch.setenv("TTS_PERFORMANCE_REFERENCE_MAX_DURATION", "8.5")
     monkeypatch.setenv("TTS_MAX_PAUSE_SECONDS", "1.5")
+    monkeypatch.setenv("TTS_MIN_LINE_SECONDS", "0.45")
+    monkeypatch.setenv("TTS_CONTINUE_ON_FAILURE", "true")
 
     settings = Settings.from_env()
     assert settings.tts_model == "someone/other-adapter"
@@ -351,6 +357,8 @@ def test_tts_settings_are_configurable(
     assert settings.tts_performance_reference_min_duration == 4.0
     assert settings.tts_performance_reference_max_duration == 8.5
     assert settings.tts_max_pause_seconds == 1.5
+    assert settings.tts_min_line_seconds == 0.45
+    assert settings.tts_continue_on_failure is True
 
     payload = settings.as_dict()
     assert payload["tts_model"] == "someone/other-adapter"
@@ -359,6 +367,8 @@ def test_tts_settings_are_configurable(
     assert payload["tts_performance_reference_min_duration"] == 4.0
     assert payload["tts_performance_reference_max_duration"] == 8.5
     assert payload["tts_max_pause_seconds"] == 1.5
+    assert payload["tts_min_line_seconds"] == 0.45
+    assert payload["tts_continue_on_failure"] is True
     assert str(payload["seed_vc_repo_path"]).endswith("seed-vc")
 
 
