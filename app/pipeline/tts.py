@@ -80,6 +80,7 @@ What this stage deliberately does not do
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import importlib.util
 import json
@@ -1175,6 +1176,82 @@ class ChatterboxAmharicEngine(ChatterboxPerformanceEngine):
         return _write_mono(target, samples, self.sample_rate, label="Chatterbox take")
 
 
+#: Attributes that ``hf_hub_download`` carried before huggingface_hub 1.0, with the
+#: value used to satisfy Seed-VC's vocoder. ``proxies`` was removed outright in
+#: that release and ``resume_download`` after a deprecation, so a checkout written
+#: against the 0.x line fails on the machines this project targets.
+SEED_VC_LEGACY_DOWNLOAD_ARGS: dict[str, Any] = {
+    "proxies": None,
+    "resume_download": False,
+}
+
+#: Marks the compatibility wrapper so it is only ever installed once.
+SEED_VC_SHIM_MARKER = "_amharic_dub_hub_compatibility_shim"
+
+#: The module in the Seed-VC checkout whose ``hf_hub_download`` is adapted.
+SEED_VC_VOCODER_MODULE = "modules.bigvgan.bigvgan"
+
+
+def _satisfy_seed_vc_vocoder_args(payload: Any) -> Any:
+    """Give Seed-VC's vocoder node the two arguments modern hub no longer supplies.
+
+    ``ModelHubMixin.from_pretrained`` forwards the keyword arguments it is given
+    to ``_from_pretrained``, and Seed-VC's vocoder declares ``proxies`` and
+    ``resume_download`` as *required* keyword-only parameters. Hugging Face Hub
+    1.0 stopped passing them itself, so they have to come from the graph - which
+    is what this adds, without touching the checkout's file.
+
+    A node that already sets either argument keeps its value.
+    """
+
+    if not isinstance(payload, dict):
+        return payload
+
+    vocoder = payload.get("vocoder")
+    if isinstance(vocoder, dict):
+        for name, value in SEED_VC_LEGACY_DOWNLOAD_ARGS.items():
+            vocoder.setdefault(name, value)
+    return payload
+
+
+def _adapt_seed_vc_vocoder_downloads(repo_path: Path) -> None:
+    """Let Seed-VC's BigVGAN download with a ``huggingface_hub`` that moved on.
+
+    ``BigVGAN._from_pretrained`` passes ``proxies`` and ``resume_download`` to
+    ``hf_hub_download``. Both were removed in huggingface_hub 1.0 (``proxies``
+    outright, ``resume_download`` after a deprecation), so the call raises
+    ``TypeError: unexpected keyword argument`` before a single weight is fetched.
+    Seed-VC's own requirements ask only for ``huggingface-hub>=0.28.1``, so it was
+    written against the 0.x line.
+
+    The two arguments only ever selected defaults that hub now applies itself, so
+    dropping them changes nothing observable. The patch is confined to the vocoder
+    module rather than applied to ``huggingface_hub`` globally, so nothing else in
+    the process sees it.
+    """
+
+    try:
+        module = importlib.import_module(SEED_VC_VOCODER_MODULE)
+    except Exception as exc:
+        raise EngineLoadError(
+            f"could not import {SEED_VC_VOCODER_MODULE} from the Seed-VC checkout at "
+            f"{repo_path}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    original = getattr(module, "hf_hub_download", None)
+    if original is None or getattr(original, SEED_VC_SHIM_MARKER, False):
+        return
+
+    @functools.wraps(original)
+    def without_removed_kwargs(*args: Any, **kwargs: Any) -> Any:
+        for name in SEED_VC_LEGACY_DOWNLOAD_ARGS:
+            kwargs.pop(name, None)
+        return original(*args, **kwargs)
+
+    setattr(without_removed_kwargs, SEED_VC_SHIM_MARKER, True)
+    module.hf_hub_download = without_removed_kwargs
+
+
 def _seed_vc_runtime(repo_path: Path, config_path: Path) -> Any:
     """Instantiate Seed-VC V2's ``VCWrapper`` from its checkout.
 
@@ -1183,6 +1260,10 @@ def _seed_vc_runtime(repo_path: Path, config_path: Path) -> Any:
     wrapper itself when no explicit paths are given. Everything heavy - Hydra,
     OmegaConf, PyTorch - is imported here and nowhere else, so importing this
     module never touches the Seed-VC runtime.
+
+    Two adjustments make the checkout work with this project's ``huggingface_hub``,
+    which is newer than the one Seed-VC was written against; both are explained at
+    their definitions below.
     """
 
     import yaml  # noqa: F401 - documented part of the Seed-VC environment
@@ -1192,8 +1273,10 @@ def _seed_vc_runtime(repo_path: Path, config_path: Path) -> Any:
     if str(repo_path) not in sys.path:
         sys.path.insert(0, str(repo_path))
 
+    _adapt_seed_vc_vocoder_downloads(repo_path)
+
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    return instantiate(DictConfig(payload))
+    return instantiate(DictConfig(_satisfy_seed_vc_vocoder_args(payload)))
 
 
 def _seed_vc_dtype(device: str) -> Any:

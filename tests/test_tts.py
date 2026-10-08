@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1497,6 +1498,225 @@ def seed_vc_repo(tmp_path: Path) -> Path:
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text("_target_: modules.vc_wrapper.Wrapper\n", encoding="utf-8")
     return tmp_path / "seed-vc"
+
+
+# ---------------------------------------------------------------------------
+# The Seed-VC vocoder against a modern huggingface_hub
+# ---------------------------------------------------------------------------
+
+
+def _vocoder_payload(**node: object) -> dict[str, object]:
+    """A minimal stand-in for ``configs/v2/vc_wrapper.yaml``."""
+
+    vocoder: dict[str, object] = {
+        "_target_": "modules.bigvgan.bigvgan.BigVGAN.from_pretrained",
+        "pretrained_model_name_or_path": "nvidia/bigvgan_v2_22khz_80band_256x",
+        "use_cuda_kernel": False,
+    }
+    vocoder.update(node)
+    return {"sr": 22_050, "vocoder": vocoder}
+
+
+class FakeVendoredModule:
+    """A stand-in for the checkout's ``modules.bigvgan.bigvgan``."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hf_hub_download(self, repo_id: str, filename: str, **kwargs: object) -> str:
+        """Model hub >= 1.0: ``proxies`` and ``resume_download`` are gone."""
+
+        removed = [name for name in tts.SEED_VC_LEGACY_DOWNLOAD_ARGS if name in kwargs]
+        if removed:
+            raise TypeError(f"unexpected keyword arguments {removed}")
+        self.calls.append({"repo_id": repo_id, "filename": filename, **kwargs})
+        return f"{repo_id}/{filename}"
+
+
+@pytest.fixture
+def vendored(monkeypatch: pytest.MonkeyPatch) -> FakeVendoredModule:
+    """Install the stand-in module where the import finds it."""
+
+    module = FakeVendoredModule()
+    monkeypatch.setitem(sys.modules, tts.SEED_VC_VOCODER_MODULE, module)
+    return module
+
+
+def test_vocoder_node_gets_the_arguments_modern_hub_no_longer_passes() -> None:
+    """Hub 1.0 stopped supplying them, but the vocoder still requires them."""
+
+    payload = tts._satisfy_seed_vc_vocoder_args(_vocoder_payload())
+
+    assert payload["vocoder"]["proxies"] is None
+    assert payload["vocoder"]["resume_download"] is False
+
+
+def test_vocoder_node_keeps_values_it_already_has() -> None:
+    payload = tts._satisfy_seed_vc_vocoder_args(
+        _vocoder_payload(proxies={"https": "proxy"}, resume_download=True)
+    )
+
+    assert payload["vocoder"]["proxies"] == {"https": "proxy"}
+    assert payload["vocoder"]["resume_download"] is True
+
+
+def test_only_the_vocoder_node_is_touched() -> None:
+    payload = _vocoder_payload()
+    payload["cfm"] = {"_target_": "modules.v2.cfm.CFM"}
+
+    tts._satisfy_seed_vc_vocoder_args(payload)
+
+    assert payload["cfm"] == {"_target_": "modules.v2.cfm.CFM"}
+    assert payload["sr"] == 22_050
+
+
+def test_a_payload_without_a_vocoder_node_is_left_alone() -> None:
+    assert tts._satisfy_seed_vc_vocoder_args({"sr": 22_050}) == {"sr": 22_050}
+    assert tts._satisfy_seed_vc_vocoder_args(["not", "a", "mapping"]) == [
+        "not",
+        "a",
+        "mapping",
+    ]
+
+
+def test_our_own_config_passes_the_wrapper_the_two_arguments() -> None:
+    """The real ``configs/v2/vc_wrapper.yaml`` shape, end to end through the helpers."""
+
+    payload = {
+        "sr": 22050,
+        "hop_size": 256,
+        "vocoder": {
+            "_target_": "modules.bigvgan.bigvgan.BigVGAN.from_pretrained",
+            "pretrained_model_name_or_path": "nvidia/bigvgan_v2_22khz_80band_256x",
+            "use_cuda_kernel": False,
+        },
+    }
+
+    adjusted = tts._satisfy_seed_vc_vocoder_args(payload)
+
+    assert set(tts.SEED_VC_LEGACY_DOWNLOAD_ARGS) <= set(adjusted["vocoder"])
+
+
+def test_download_shim_makes_the_removed_arguments_harmless(
+    vendored: FakeVendoredModule,
+) -> None:
+    """The failure that aborted a real run, and its fix."""
+
+    with pytest.raises(TypeError, match="unexpected keyword arguments"):
+        vendored.hf_hub_download(
+            repo_id="nvidia/bigvgan_v2_22khz_80band_256x",
+            filename="config.json",
+            proxies=None,
+            resume_download=False,
+        )
+
+    tts._adapt_seed_vc_vocoder_downloads(Path("/checkout"))
+
+    assert (
+        vendored.hf_hub_download(
+            repo_id="nvidia/bigvgan_v2_22khz_80band_256x",
+            filename="config.json",
+            proxies=None,
+            resume_download=False,
+        )
+        == "nvidia/bigvgan_v2_22khz_80band_256x/config.json"
+    )
+    # The arguments that matter are still passed through untouched.
+    assert vendored.calls[-1]["filename"] == "config.json"
+
+
+def test_download_shim_keeps_every_other_argument(
+    vendored: FakeVendoredModule,
+) -> None:
+    tts._adapt_seed_vc_vocoder_downloads(Path("/checkout"))
+
+    vendored.hf_hub_download(
+        repo_id="r",
+        filename="bigvgan_generator.pt",
+        revision="main",
+        cache_dir="/cache",
+        force_download=False,
+        token="hf_x",
+        local_files_only=True,
+        proxies=None,
+        resume_download=False,
+    )
+
+    assert vendored.calls[-1] == {
+        "repo_id": "r",
+        "filename": "bigvgan_generator.pt",
+        "revision": "main",
+        "cache_dir": "/cache",
+        "force_download": False,
+        "token": "hf_x",
+        "local_files_only": True,
+    }
+
+
+def test_download_shim_is_installed_only_once(
+    vendored: FakeVendoredModule,
+) -> None:
+    tts._adapt_seed_vc_vocoder_downloads(Path("/checkout"))
+    once = vendored.hf_hub_download
+
+    tts._adapt_seed_vc_vocoder_downloads(Path("/checkout"))
+
+    assert vendored.hf_hub_download is once
+    assert getattr(once, tts.SEED_VC_SHIM_MARKER) is True
+
+
+def test_download_shim_reports_a_missing_vocoder_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, tts.SEED_VC_VOCODER_MODULE, None)
+
+    with pytest.raises(tts.EngineLoadError) as info:
+        tts._adapt_seed_vc_vocoder_downloads(Path("/nowhere"))
+
+    assert "bigvgan" in str(info.value)
+
+
+def test_the_runtime_applies_both_adjustments(
+    seed_vc_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_seed_vc_runtime`` must patch the module *and* adjust the graph.
+
+    The helpers are replaced with recorders here: what is under test is that the
+    runtime calls them, not what they do - that is covered above.
+    """
+
+    calls: list[str] = []
+    payload: dict[str, object] = {"vocoder": {"_target_": "modules.bigvgan.bigvgan.BigVGAN"}}
+
+    monkeypatch.setattr(
+        tts,
+        "_adapt_seed_vc_vocoder_downloads",
+        lambda repo: calls.append("patch"),
+    )
+    monkeypatch.setattr(
+        tts,
+        "_satisfy_seed_vc_vocoder_args",
+        lambda graph: calls.append("adjust") or graph,
+    )
+
+    fake_yaml = types.ModuleType("yaml")
+    fake_yaml.safe_load = lambda text: payload  # type: ignore[attr-defined]
+    fake_hydra = types.ModuleType("hydra")
+    fake_utils = types.ModuleType("hydra.utils")
+    fake_utils.instantiate = lambda config: "wrapper"  # type: ignore[attr-defined]
+    fake_hydra.utils = fake_utils  # type: ignore[attr-defined]
+    fake_omegaconf = types.ModuleType("omegaconf")
+    fake_omegaconf.DictConfig = lambda graph: graph  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "yaml", fake_yaml)
+    monkeypatch.setitem(sys.modules, "hydra", fake_hydra)
+    monkeypatch.setitem(sys.modules, "hydra.utils", fake_utils)
+    monkeypatch.setitem(sys.modules, "omegaconf", fake_omegaconf)
+
+    config = seed_vc_repo / "configs" / "v2" / "vc_wrapper.yaml"
+
+    assert tts._seed_vc_runtime(seed_vc_repo, config) == "wrapper"
+    assert calls == ["patch", "adjust"]
 
 
 @pytest.fixture
