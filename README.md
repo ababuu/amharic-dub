@@ -405,15 +405,20 @@ Two engines run per line, in this order:
 The checkout was written against `huggingface_hub` 0.x (its own requirements ask
 only for `>=0.28.1`), while this project runs the 1.x line: `transformers` 5.x,
 which Chatterbox needs, requires `huggingface-hub>=1.3.0`. Two arguments were
-removed in that major release and Seed-VC's BigVGAN vocoder still uses both -
+removed in that major release and Seed-VC's BigVGAN vocoder still uses both:
 `ModelHubMixin.from_pretrained` no longer passes `proxies` and `resume_download`
-to `_from_pretrained` (which declares them as required), and `hf_hub_download` no
-longer accepts them either. Pinning hub down is not an option, because it would
-break the engine that works, so `app.pipeline.tts` adapts the checkout at load
-time instead: the vocoder's config node gains the two arguments, and the vocoder
-module's own `hf_hub_download` drops them. Both only ever selected defaults hub now
-applies itself, and the adaptation touches nothing else in the process. It is the
-only incompatible call site in the checkout.
+to `_from_pretrained`, which declares them as required, and `hf_hub_download` no
+longer accepts them either.
+
+Pinning hub down is not an option, because it would break the engine that works, so
+`app.pipeline.tts` adapts the checkout at load time. Note that supplying the two
+arguments from the config does **not** work: hub's argument validator pops both
+names out of the keyword arguments before the call happens, which is how it retires
+them silently, so anything passed from above the method is discarded. They are
+therefore defaulted *inside* `_from_pretrained`, by wrapping it as a classmethod,
+and the vocoder module's own `hf_hub_download` drops them. Both only ever selected
+defaults hub now applies itself, and the adaptation touches nothing else in the
+process. It is the only incompatible call site in the checkout.
 
 Note that Seed-VC's `hf_utils.py` writes its checkpoints to `./checkpoints`
 relative to the current directory, so they land next to wherever a run is started
