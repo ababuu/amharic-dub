@@ -76,6 +76,16 @@ SAMPLE_RATE = 16_000
 #: before and after the words, and the words are what has to be re-timed later.
 WORD_TIMESTAMPS = True
 
+#: A diarized turn shorter than this is treated as an artefact and skipped.
+#: Speaker diarization regularly emits a handful of such turns at boundaries -
+#: the run that prompted this constant had one of 0.02 seconds. Two reasons not
+#: to transcribe them: no word fits in a window that short, so there is nothing to
+#: lose, and faster-whisper cannot word-align them anyway. Its decoder still emits
+#: a token for such a sliver, but none survives filtering, so the alignment step
+#: indexes an empty timestamp array and raises ``IndexError``, taking the whole
+#: film down with it.
+MIN_REGION_SECONDS = 0.1
+
 
 class TranscriptionError(RuntimeError):
     """Base class for every error raised by this module."""
@@ -452,6 +462,10 @@ def transcribe(
 
     transcribed: list[TranscriptSegment] = []
     for region in regions:
+        if region.end - region.start < MIN_REGION_SECONDS:
+            # A diarization artefact: too short to hold a word, and short enough
+            # to break faster-whisper's word alignment (see MIN_REGION_SECONDS).
+            continue
         samples = _region_samples(audio, region)
         if len(samples) == 0:
             continue  # the turn lies outside the decoded audio
@@ -462,6 +476,7 @@ def transcribe(
 
 
 __all__ = [
+    "MIN_REGION_SECONDS",
     "SAMPLE_RATE",
     "WORD_TIMESTAMPS",
     "AudioDecodeError",

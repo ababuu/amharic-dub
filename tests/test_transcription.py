@@ -522,6 +522,71 @@ def test_region_outside_the_decoded_audio_is_skipped(monkeypatch, tmp_path):
     assert FakeWhisperModel.calls == []
 
 
+def test_a_diarization_artefact_too_short_to_speak_is_skipped(monkeypatch, tmp_path):
+    """A 0.02s turn is not speech, and faster-whisper cannot word-align it.
+
+    This is the exact shape that aborted a real run: diarization emitted a
+    0.02-second turn, Whisper emitted a token for the sliver but none survived
+    filtering, and its alignment step then indexed an empty timestamp array.
+    """
+
+    _patch(monkeypatch)
+    _FAKE_DECODE.duration = 10.0
+    FakeWhisperModel.segments = [FakeSegment(0.0, 0.02, "Thank you")]
+
+    assert (
+        transcribe(
+            _audio(tmp_path),
+            [_region("SPEAKER_00", 8.84, 8.86)],
+            settings=_settings(tmp_path),
+        )
+        == []
+    )
+    # Skipped before Whisper is asked at all, so it cannot fail on the sliver.
+    assert FakeWhisperModel.calls == []
+
+
+def test_a_short_but_speakable_turn_is_still_transcribed(monkeypatch, tmp_path):
+    """The floor must not swallow a real short utterance such as "No!"."""
+
+    _patch(monkeypatch)
+    _FAKE_DECODE.duration = 10.0
+    FakeWhisperModel.segments = [FakeSegment(0.0, 0.2, "No!")]
+
+    rows = _rows(
+        transcribe(
+            _audio(tmp_path),
+            [_region("SPEAKER_00", 4.0, 4.2)],
+            settings=_settings(tmp_path),
+        )
+    )
+
+    assert rows == [("SPEAKER_00", 4.0, 4.2, "No!")]
+    assert len(FakeWhisperModel.calls) == 1
+
+
+def test_a_real_turn_survives_beside_a_diarization_artefact(monkeypatch, tmp_path):
+    """One spurious turn must not cost the lines around it."""
+
+    _patch(monkeypatch)
+    _FAKE_DECODE.duration = 20.0
+    FakeWhisperModel.segments = [FakeSegment(0.0, 1.0, "I love you.")]
+
+    rows = _rows(
+        transcribe(
+            _audio(tmp_path),
+            [
+                _region("SPEAKER_00", 8.84, 8.86),  # artefact
+                _region("SPEAKER_00", 9.0, 10.0),  # real line
+            ],
+            settings=_settings(tmp_path),
+        )
+    )
+
+    assert rows == [("SPEAKER_00", 9.0, 10.0, "I love you.")]
+    assert len(FakeWhisperModel.calls) == 1
+
+
 def test_word_timestamps_are_requested_and_the_task_is_transcribe(monkeypatch, tmp_path):
     _patch(monkeypatch)
 
