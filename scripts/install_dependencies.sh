@@ -85,7 +85,6 @@ if not torch.__version__.startswith("2.8"):
         "the CUDA-matched build was replaced"
     )
 PY
-PY
 
 # Informational only: the chatterbox-tts metadata conflict is intentional.
 echo "==> pip check (expected to report chatterbox-tts only)"
@@ -95,7 +94,6 @@ fi
 
 echo
 echo "Done. Next:"
-echo "  export HF_HOME=${PROJECT_ROOT}/.cache/huggingface"
-echo "  python scripts/check_environment.py --full"
-echo "  python scripts/validate_models.py"
-echo "  python scripts/test_gpu.py"
+echo "  python scripts/check_environment.py --full                  # credentials, Seed-VC, imports"
+echo "  python scripts/validate_models.py                           # load each model once"
+echo "  python -m app.pipeline.orchestrator data/input/test.mp4     # -> dubbed MP4"
