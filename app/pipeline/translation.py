@@ -155,8 +155,8 @@ how the word sounds when an Amharic speaker says it, and - because the same word
 must be pronounced the same way every time - use that same spelling every time it
 appears in the film.
 
-The only Roman text that may survive in your output is a numeral-free abbreviation
-that Amharic speakers genuinely write in Latin. When in doubt, write Fidel.
+If a word has no established Fidel spelling in Amharic speech, still write it in
+Fidel the way it sounds to an Amharic reader. Never leave it in Latin.
 
 Use linguistic and conversational judgement, not a mechanical rule. Do not drop an
 English word into every line, and do not replace a perfectly natural Amharic word
