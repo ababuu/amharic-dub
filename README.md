@@ -153,8 +153,9 @@ cp .env.example .env   # then edit .env and fill in real values
 ## Quickstart - RunPod A40 worker
 
 The pipeline runs on a GPU worker; the repository is Git-based, so the runbook is
-clone, secrets, weights, validate, run. **Everything before the last step is the
-one-time setup**; after that a run is a single command.
+create, configure, install, validate, run, collect. **Only the first three steps
+are setup** - after that a run is a single command, and the last step gets you the
+file.
 
 **1. Create the Pod.** From the official RunPod PyTorch image
 (`runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, which provides Python 3.12,
@@ -162,25 +163,38 @@ PyTorch 2.8, CUDA 12.8 and FFmpeg) on an A40, with a **network volume mounted at
 `/workspace`**. The volume is what you actually want: without one, every session
 re-downloads many gigabytes of weights before doing any work.
 
-**2. Clone and configure.** Set the two secrets, and point the model caches at the
-volume. Exporting them in the environment is enough - they do not have to go into
-a file, and they must never be committed:
+**2. Configure it through Pod environment variables, and clone both
+repositories.** Set these in the Pod's **Environment Variables** section (one
+`KEY=VALUE` per line, or a JSON object through the CLI) rather than exporting them
+in a shell later. A Pod environment variable exists before Python starts, which is
+what `HF_HOME` needs, and it survives reconnects:
 
-```bash
-git clone <your fork> /workspace/amharic-dub
-cd /workspace/amharic-dub
-export DEEPSEEK_API_KEY=...                 # dialogue adaptation
-export HUGGINGFACE_TOKEN=hf_...             # gated pyannote Community-1 weights
-export HF_HOME=/workspace/models_cache      # BEFORE any Hugging Face import
-export MODEL_CACHE_DIR=/workspace/models_cache
-git clone https://github.com/Plachtaa/seed-vc /workspace/seed-vc
-export SEED_VC_REPO_PATH=/workspace/seed-vc
+```
+DEEPSEEK_API_KEY=...                 # dialogue adaptation
+HUGGINGFACE_TOKEN=hf_...             # gated pyannote Community-1 weights
+HF_HOME=/workspace/models_cache      # must precede any Hugging Face import
+MODEL_CACHE_DIR=/workspace/models_cache
+SEED_VC_REPO_PATH=/workspace/seed-vc
 ```
 
 `HUGGINGFACE_TOKEN` only works if that account has accepted the conditions on the
 [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
-model page. `HF_HOME` is frozen when `huggingface_hub` is first imported, so it
-has to be exported before Python starts, not inside the script.
+model page.
+
+`HF_HOME` is frozen when `huggingface_hub` is first imported, so it has to be a
+real environment variable - exporting it in a shell works but has to be repeated
+every session, and putting it in `.env` does **not** work. The other four can also
+go in a `.env` in the project root, which `app.config` loads while never letting it
+override a real environment variable; `.env` is git-ignored, so it is never
+committed. Changing a running Pod's variables requires restarting it.
+
+Then clone both repositories onto the volume:
+
+```bash
+git clone <your fork> /workspace/amharic-dub
+git clone https://github.com/Plachtaa/seed-vc /workspace/seed-vc
+cd /workspace/amharic-dub
+```
 
 **3. Install.** Do not install with a plain `pip install -r requirements.txt`: the
 Chatterbox entry pins `torch==2.6.0`, `torchaudio==2.6.0` and `numpy<2`, and
@@ -236,7 +250,41 @@ and prints what each produced - while the orchestrator continues through timing,
 mixing and muxing and writes the dubbed MP4. The orchestrator reuses the clips the
 runner already wrote, so running both costs one round of synthesis, not two. For a
 first look at a long film, `--max-lines 5` voices only the first few lines and
-produces a partial dub.
+produces a partial dub. For a long film, run it under `tmux` (or `nohup` with a log
+file) so a dropped connection does not kill the run.
+
+**6. Take the result off the Pod.** The deliverable is at
+`<OUTPUT_DIR>/<source stem>/<source stem>_amharic.mp4`, which with the defaults and
+the repository on the volume is:
+
+```
+/workspace/amharic-dub/data/output/movie/movie_amharic.mp4
+```
+
+Three ways to get it, easiest first:
+
+* **JupyterLab** - on the Pods page, **Connect** → **HTTP Services** → **Jupyter
+  Lab**. Its file browser sees the whole container, so navigate to the path above
+  and download the file. No SSH setup needed.
+* **`scp`** - get the address from **Connect** → **SSH** (or
+  `runpodctl ssh info <pod-id>`) and pull the file, along with the manifest, which
+  records the per-line stretch factors, overlaps and mix peak for QA:
+
+  ```bash
+  scp -P <ssh-port> root@<pod-ip>:/workspace/amharic-dub/data/output/movie/movie_amharic.mp4 .
+  scp -P <ssh-port> root@<pod-ip>:/workspace/amharic-dub/data/output/movie/manifest.json .
+  ```
+
+* **In the browser** - serve the directory from the Pod, expose the port as HTTP,
+  and open it through the Pod's proxy:
+
+  ```bash
+  cd /workspace/amharic-dub/data/output/movie && python -m http.server 8000
+  ```
+
+Keeping the repository (and so the output) on the volume is what makes the result
+survive a stop, and findable from a later session. Anything written to the
+container disk is lost when the Pod stops.
 
 Model weights (BandIt, pyannote, faster-whisper, Chatterbox, Seed-VC) are **not**
 part of this repository. They are downloaded at runtime into `MODEL_CACHE_DIR`;
@@ -244,7 +292,7 @@ point that variable at the Pod's persistent volume so the weights survive
 restarts. `app.pipeline.tts` snapshots the Chatterbox Amharic adapter and its
 pinned base model into `MODEL_CACHE_DIR` itself; Seed-VC fetches its own
 checkpoints and vocoder through Hugging Face, which takes no cache argument, so
-export `HF_HOME=$MODEL_CACHE_DIR` in the worker environment as well.
+`HF_HOME` has to be set to the same directory as well (step 2).
 
 The pyannote Community-1 diarization checkpoint is a **gated** Hugging Face
 model, so `HUGGINGFACE_TOKEN` is required before running that stage. The token's
