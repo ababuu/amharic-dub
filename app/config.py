@@ -36,6 +36,10 @@ Environment variables
                       Consecutive dialogue lines adapted in one request.
 ``TRANSLATION_DISABLE_THINKING``
                       Set ``false`` if the API rejects the thinking toggle.
+``TRANSLATION_ENFORCE_BUDGET`` / ``TRANSLATION_ENFORCE_FIDEL_LOANWORDS``
+                      Whether a line that comes back over its syllable budget, or
+                      with a borrowed word left in Roman script, is sent back once
+                      to be fixed. Both on by default.
 ``VOICE_PROFILE_DIR`` Directory holding per-speaker voice profiles.
 ``DIALOGUE_BIBLE_PATH``
                       Persistent character/consistency state (names, address
@@ -121,6 +125,14 @@ DEFAULT_TRANSLATION_BASE_URL = "https://api.deepseek.com"
 #: Small enough to stay well inside the context window and keep a rejection
 #: cheap, large enough for the model to follow who is answering whom.
 DEFAULT_TRANSLATION_BATCH_SIZE = 10
+
+#: Whether a line that comes back too long for its window, or with a borrowed word
+#: left in Roman script, is sent back once to be fixed. Both are on by default: the
+#: first is how a line is made to fit without being stretched, and the second is how
+#: a word gets into a script the Amharic voice can actually read. Turn them off to
+#: send every line exactly once, which is cheaper and is what a comparison run wants.
+DEFAULT_TRANSLATION_ENFORCE_BUDGET = True
+DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS = True
 
 #: Directory holding the per-speaker voice profiles consumed by the TTS stage.
 DEFAULT_VOICE_PROFILE_DIR = DEFAULT_WORK_DIR / "voices"
@@ -383,6 +395,10 @@ class Settings:
     translation_base_url: str = DEFAULT_TRANSLATION_BASE_URL
     translation_batch_size: int = DEFAULT_TRANSLATION_BATCH_SIZE
     translation_disable_thinking: bool = True
+    translation_enforce_budget: bool = DEFAULT_TRANSLATION_ENFORCE_BUDGET
+    translation_enforce_fidel_loanwords: bool = (
+        DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS
+    )
     #: Voice-profile settings for :mod:`app.pipeline.voice_profiles`.
     voice_profile_dir: Path = DEFAULT_VOICE_PROFILE_DIR
     voice_reference_min_duration: float = DEFAULT_VOICE_REFERENCE_MIN_DURATION
@@ -469,6 +485,13 @@ class Settings:
                 "TRANSLATION_BATCH_SIZE", DEFAULT_TRANSLATION_BATCH_SIZE
             ),
             translation_disable_thinking=_read_bool("TRANSLATION_DISABLE_THINKING", True),
+            translation_enforce_budget=_read_bool(
+                "TRANSLATION_ENFORCE_BUDGET", DEFAULT_TRANSLATION_ENFORCE_BUDGET
+            ),
+            translation_enforce_fidel_loanwords=_read_bool(
+                "TRANSLATION_ENFORCE_FIDEL_LOANWORDS",
+                DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS,
+            ),
             voice_profile_dir=_read_path("VOICE_PROFILE_DIR", work_dir / "voices"),
             voice_reference_min_duration=_read_float(
                 "VOICE_REFERENCE_MIN_DURATION", DEFAULT_VOICE_REFERENCE_MIN_DURATION
@@ -573,6 +596,10 @@ class Settings:
             "translation_base_url": self.translation_base_url,
             "translation_batch_size": self.translation_batch_size,
             "translation_disable_thinking": self.translation_disable_thinking,
+            "translation_enforce_budget": self.translation_enforce_budget,
+            "translation_enforce_fidel_loanwords": (
+                self.translation_enforce_fidel_loanwords
+            ),
             "voice_profile_dir": str(self.voice_profile_dir),
             "voice_reference_min_duration": self.voice_reference_min_duration,
             "voice_reference_target_duration": self.voice_reference_target_duration,
@@ -620,6 +647,8 @@ __all__ = [
     "DEFAULT_TRANSCRIPTION_MODEL",
     "DEFAULT_TRANSLATION_BASE_URL",
     "DEFAULT_TRANSLATION_BATCH_SIZE",
+    "DEFAULT_TRANSLATION_ENFORCE_BUDGET",
+    "DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS",
     "DEFAULT_TRANSLATION_MODEL",
     "DEFAULT_TTS_CONTINUE_ON_FAILURE",
     "DEFAULT_TTS_MAX_PAUSE_SECONDS",

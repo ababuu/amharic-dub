@@ -117,7 +117,7 @@ from app.config import (
     Settings,
     get_settings,
 )
-from app.pipeline.amharic_text import count_syllables
+from app.pipeline.amharic_text import count_syllables, has_pronounceable_text
 from app.pipeline.translation import AdaptedDialogue
 from app.pipeline.voice_profiles import (
     VoiceProfile,
@@ -198,8 +198,9 @@ SEED_VC_CONFIG_PARTS = ("configs", "v2", "vc_wrapper.yaml")
 MINIMUM_SPEAKABLE_LINE_SECONDS = DEFAULT_TTS_MIN_LINE_SECONDS
 
 #: Shortest Amharic line worth synthesizing, in syllables. One Fidel character is one
-#: syllable, so this counts the script's own unit: text with nothing to pronounce
-#: produces no speech, and asking the engine for it is what fails.
+#: syllable, so this counts the script's own unit. Latin text counts as pronounceable
+#: too - an English-derived word is a word - so a borrowed word is never dropped for
+#: being written in Roman script; see :func:`app.pipeline.amharic_text.has_latin`.
 MINIMUM_SPEAKABLE_SYLLABLES = 1
 
 #: Seed-VC V2 runs in timbre-only mode by default: it replaces the character's
@@ -2011,9 +2012,9 @@ def _skip_reason(line: AdaptedDialogue, *, min_line_seconds: float) -> str | Non
             f"{line.duration:.3f}s, shorter than the {min_line_seconds:g}s a line "
             "needs to hold a word"
         )
-    if count_syllables(line.amharic) < MINIMUM_SPEAKABLE_SYLLABLES:
+    if not has_pronounceable_text(line.amharic):
         return (
-            f"{UNSPEAKABLE_REASON_PREFIX}: the Amharic line has no syllables to "
+            f"{UNSPEAKABLE_REASON_PREFIX}: the Amharic line has nothing to "
             "pronounce"
         )
     return None

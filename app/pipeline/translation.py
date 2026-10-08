@@ -61,6 +61,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.config import Settings, get_settings
+from app.pipeline.amharic_text import latin_spans
 from app.pipeline.dialogue_context import (
     DEFAULT_BUDGET_TOLERANCE,
     DEFAULT_SYLLABLES_PER_SECOND,
@@ -125,20 +126,42 @@ a dictionary Amharic equivalent often makes dialogue sound archaic, academic or
 simply unlike anything a real person would say.
 
 When an English word, expression, technical term, modern concept, or brand name is
-normally used in its English-derived or Anglicized form in everyday spoken
-Amharic, prefer the form speakers actually use. Keep the borrowed word when that
-is what a native speaker would naturally say in that situation. This commonly
-applies to:
+normally used in its English-derived form in everyday spoken Amharic, keep that
+word - do not translate it. This commonly applies to:
 
 - everyday loanwords that have no natural Amharic equivalent in speech;
 - technical, medical, legal, military, computing, business and sports terms;
 - modern concepts, technology and slang that speakers express with the English word;
-- brand names and product names, which are never translated.
+- brand names and product names, which are never translated;
+- people's names, place names and organisations.
+
+**Write every borrowed word in Fidel script.** This is not optional. Your output is
+spoken by an Amharic voice that reads Fidel, so a word left in Roman letters is a
+word that cannot be pronounced. Write it the way Amharic speakers actually write it
+- spelled as it sounds to an Amharic reader, with the vowels and consonants the
+Fidel characters stand for. Keep the English *word*; change only its script.
+
+Examples of the form to produce (only the script changes, never the word):
+
+- Walt -> ዋልት
+- computer -> ኮምፒውተር
+- telephone -> ቴሌፎን
+- doctor -> ዶክተር
+- okay -> ኦኬይ
+- airport -> ኤርፖርት
+
+Some words have more than one accepted spelling. Choose the one that best matches
+how the word sounds when an Amharic speaker says it, and - because the same word
+must be pronounced the same way every time - use that same spelling every time it
+appears in the film.
+
+The only Roman text that may survive in your output is a numeral-free abbreviation
+that Amharic speakers genuinely write in Latin. When in doubt, write Fidel.
 
 Use linguistic and conversational judgement, not a mechanical rule. Do not drop an
 English word into every line, and do not replace a perfectly natural Amharic word
-with English just to sound modern. When the natural Amharic word genuinely is what
-people say, use it.
+with an English one just to sound modern. When the natural Amharic word genuinely is
+what people say, use it.
 
 The target is authentic spoken Amharic. Linguistic purity is NOT a goal; sounding
 like a real person on screen IS the goal.
@@ -689,31 +712,58 @@ def _reduce_overshooting_lines(
     *,
     context: str | None,
     tolerance: float,
+    enforce_fidel_loanwords: bool = True,
 ) -> tuple[list[AdaptedDialogue], tuple[BudgetVerdict, ...]]:
-    """Ask once more for the lines that came back too long for their window.
+    """Ask once more for the lines that came back wrong, and say how.
 
-    English and Amharic do not express the same idea in the same number of
-    syllables, so a faithful adaptation routinely overshoots. The literature's
-    answer - and the one that preserves performance - is to make the *text* shorter
-    rather than the audio faster, so an overshooting line is sent back with the
-    number of syllables to cut. Only the offending lines are resent, and only once:
-    what is still too long afterwards is reported in the verdicts rather than
-    retried indefinitely.
+    Two independent problems are handled in a single pass, so a batch is never
+    re-asked twice:
+
+    * **Too long for its window.** English and Amharic do not express the same idea in
+      the same number of syllables, so a faithful adaptation routinely overshoots. The
+      literature's answer - and the one that preserves performance - is to make the
+      *text* shorter rather than the audio faster.
+    * **Roman text left in the line.** A borrowed word is meant to stay, but it must be
+      written in Fidel, because the voice that speaks it reads Fidel. A rule in the
+      prompt is not a guarantee, so this is verified rather than trusted.
+
+    Only the offending lines are resent, and only once: what is still wrong afterwards
+    is reported in the verdicts rather than retried indefinitely.
     """
 
     verdicts = tuple(
         budget.verdict(line.amharic, tolerance=tolerance)
         for budget, line in zip(budgets, adapted)
     )
-    offenders = [index for index, verdict in enumerate(verdicts) if not verdict.within_tolerance]
+    roman = tuple(
+        latin_spans(line.amharic) if enforce_fidel_loanwords else ()
+        for line in adapted
+    )
+
+    over_budget = [
+        index for index, verdict in enumerate(verdicts) if not verdict.within_tolerance
+    ]
+    with_roman = [index for index, spans in enumerate(roman) if spans]
+    offenders = sorted(set(over_budget) | set(with_roman))
     if not offenders:
         return adapted, verdicts
 
     ids = [_dialogue_id(first_position + index) for index in offenders]
-    instruction = "\n".join(
-        f"- {_dialogue_id(first_position + index)}: {verdicts[index].describe()}"
-        for index in offenders
-    )
+    instructions: list[str] = []
+    for index in offenders:
+        if index in over_budget:
+            instructions.append(
+                f"- {_dialogue_id(first_position + index)}: "
+                f"{verdicts[index].describe()}"
+            )
+        if index in with_roman:
+            instructions.append(
+                f"- {_dialogue_id(first_position + index)}: it still contains the "
+                f"Roman-script word(s) {', '.join(roman[index])}; write each of them "
+                "in Fidel the way an Amharic speaker writes it, keeping the word "
+                "itself unchanged."
+            )
+
     retried = _adapt_batch(
         client,
         settings,
@@ -722,9 +772,8 @@ def _reduce_overshooting_lines(
         context=context,
         budgets=[budgets[index] for index in offenders],
         rewrite=(
-            "These lines were longer than their window allows. Rewrite each of them "
-            "shorter, keeping the meaning, tone and character - prefer dropping "
-            "filler and restructuring over cutting meaning.\n" + instruction
+            "Rewrite each of these lines to fix the problem described against it, "
+            "keeping the meaning, tone and character:\n" + "\n".join(instructions)
         ),
     )
     for slot, line in zip(offenders, retried):
@@ -746,6 +795,7 @@ def adapt_dialogue(
     syllables_per_second: float = DEFAULT_SYLLABLES_PER_SECOND,
     budget_tolerance: float = DEFAULT_BUDGET_TOLERANCE,
     enforce_budget: bool = True,
+    enforce_fidel_loanwords: bool = True,
 ) -> list[AdaptedDialogue]:
     """Adapt transcribed dialogue into dubbing-ready Amharic.
 
@@ -776,6 +826,13 @@ def adapt_dialogue(
         When ``True`` (the default), a line that comes back too long for its window
         is re-asked once. Set ``False`` to send every line exactly once, which is
         cheaper and is the right choice for a comparison run.
+    enforce_fidel_loanwords:
+        When ``True`` (the default), a line that comes back with Roman-script text
+        in it is re-asked once to have those words written in Fidel. Borrowed
+        English words are *meant* to stay - an Amharic speaker says "ኮምፒውተር", not a
+        dictionary equivalent - but the voice that speaks the result reads Fidel, so
+        a word left in Roman letters cannot be pronounced. Sharing the same pass as
+        the budget check, so a batch is never re-asked twice.
 
     Returns
     -------
@@ -833,7 +890,7 @@ def adapt_dialogue(
         produced = _adapt_batch(
             client, settings, batch, ids, context=context, budgets=budgets
         )
-        if enforce_budget:
+        if enforce_budget or enforce_fidel_loanwords:
             produced, _ = _reduce_overshooting_lines(
                 client,
                 settings,
@@ -843,6 +900,7 @@ def adapt_dialogue(
                 budgets,
                 context=context,
                 tolerance=budget_tolerance,
+                enforce_fidel_loanwords=enforce_fidel_loanwords,
             )
 
         adapted.extend(produced)

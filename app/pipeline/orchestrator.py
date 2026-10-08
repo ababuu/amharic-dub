@@ -453,6 +453,8 @@ def run_pipeline(
             lines,
             settings=resolved,
             bible=bible,
+            enforce_budget=resolved.translation_enforce_budget,
+            enforce_fidel_loanwords=resolved.translation_enforce_fidel_loanwords,
         )
     )
     if bible:

@@ -51,6 +51,70 @@ def is_syllable(character: str) -> bool:
     return any(low <= codepoint <= high for low, high in SYLLABLE_RANGES)
 
 
+def is_latin_letter(character: str) -> bool:
+    """``True`` when ``character`` is a Latin letter."""
+
+    if not isinstance(character, str) or len(character) != 1:
+        return False
+    return "a" <= character.lower() <= "z" and character.isascii()
+
+
+def has_latin(text: str) -> bool:
+    """``True`` when ``text`` contains any Latin letter."""
+
+    if not isinstance(text, str):
+        raise InvalidTextError(f"a Latin check needs text, got {type(text).__name__}")
+    return any(is_latin_letter(character) for character in text)
+
+
+def latin_spans(text: str) -> tuple[str, ...]:
+    """Return the Roman-script runs in ``text``, in order, de-duplicated.
+
+    A *span* is a run of Latin letters, which may contain digits, apostrophes and
+    hyphens because those occur inside real names and product names ("O'Brien",
+    "Wi-Fi", "iPhone15"). It is the unit a dubbing system has to care about: a span
+    is an English-derived word that either has to be written the way Amharic
+    speakers write it, or is a word the speech engine cannot pronounce.
+
+    Whitespace ends a span, so "iPhone 15" reports ``"iPhone"``. A run that never
+    starts with a letter - a bare number, or a hyphen - is not a span at all: the
+    Amharic adapter's own normaliser expands numerals into words, so a surviving
+    digit run is not the case worth catching.
+    """
+
+    if not isinstance(text, str):
+        raise InvalidTextError(f"a span scan needs text, got {type(text).__name__}")
+
+    spans: list[str] = []
+    current: list[str] = []
+    for character in text:
+        if is_latin_letter(character) or (current and (character.isdigit() or character in "'-’")):
+            current.append(character)
+            continue
+        if current:
+            spans.append("".join(current).strip("'-’"))
+            current = []
+    if current:
+        spans.append("".join(current).strip("'-’"))
+
+    return tuple(dict.fromkeys(span for span in spans if span))
+
+
+def has_pronounceable_text(text: str) -> bool:
+    """``True`` when ``text`` holds something a voice could actually say.
+
+    True for Fidel syllables and for Roman-script words alike. The distinction
+    matters downstream: Fidel text is what the Amharic engine was trained on, so it
+    is pronounceable directly, whereas Roman text is pronounceable in principle but
+    may have to be rewritten before a Fidel-trained voice can voice it. Text with
+    neither - punctuation, whitespace, an emoji - has nothing to say at all.
+    """
+
+    if not isinstance(text, str):
+        raise InvalidTextError(f"a readability check needs text, got {type(text).__name__}")
+    return any(is_syllable(character) or is_latin_letter(character) for character in text)
+
+
 def count_syllables(text: str) -> int:
     """Return the number of syllables in ``text``.
 
@@ -94,6 +158,10 @@ __all__ = [
     "InvalidTextError",
     "count_syllables",
     "fold_homophones",
+    "has_latin",
+    "has_pronounceable_text",
+    "is_latin_letter",
     "is_syllable",
+    "latin_spans",
     "syllable_sequence",
 ]

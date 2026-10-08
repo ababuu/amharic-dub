@@ -52,6 +52,9 @@ from app.pipeline.amharic_text import (
     SYLLABLE_RANGES,
     InvalidTextError,
     count_syllables,
+    has_latin,
+    has_pronounceable_text,
+    latin_spans,
     syllable_sequence,
 )
 from app.pipeline.diarization import CrosstalkRegion
@@ -502,6 +505,8 @@ __all__ = [
     # Re-exported from ``amharic_text``: the syllable is the unit of *both* a
     # delivery rate here and a timing budget in ``dialogue_context``, and it would
     # be surprising for a caller measuring a run to reach into another module for it.
+    # The Roman-script helpers come with it, because whether a borrowed word can be
+    # read by the engine is a measurement's business too.
     "HOMOPHONE_FAMILIES",
     "PLAUSIBLE_SYLLABLES_PER_SECOND",
     "SYLLABLE_RANGES",
@@ -515,6 +520,9 @@ __all__ = [
     "build_qc_report",
     "character_error_rate",
     "count_syllables",
+    "has_latin",
+    "has_pronounceable_text",
+    "latin_spans",
     "measure_lines",
     "measure_pronunciation",
     "normalise_for_comparison",

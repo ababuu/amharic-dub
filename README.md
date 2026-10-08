@@ -141,6 +141,8 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSLATION_MODEL` | DeepSeek model for dialogue adaptation            | `deepseek-flash`   |
 | `TRANSLATION_BATCH_SIZE` | Dialogue lines adapted per request           | `10`               |
 | `TRANSLATION_DISABLE_THINKING` | Turn off reasoning/thinking mode       | `true`             |
+| `TRANSLATION_ENFORCE_BUDGET` | Send a line that is over its syllable budget back once to be shortened | `true` |
+| `TRANSLATION_ENFORCE_FIDEL_LOANWORDS` | Send a line that still carries Roman-script text back once to be written in Fidel | `true` |
 | `VOICE_PROFILE_DIR` | Per-speaker voice profiles directory                | `$WORK_DIR/voices` |
 | `VOICE_REFERENCE_MIN_DURATION` | Shortest usable voice-cloning reference  | `3.0`              |
 | `VOICE_REFERENCE_TARGET_DURATION` | Preferred reference length            | `10.0`             |
@@ -491,12 +493,18 @@ is never modified by this stage.
 `TTS_MIN_LINE_SECONDS` (0.30s by default) is a fragment, not a spoken line: there is
 no room for a word in the time it occupied, so any Amharic written for it is
 unintelligible - and Chatterbox can fail outright on it, with an empty mel
-spectrogram that trips a convolution inside its vocoder. Such a line, and a line
-whose Amharic has nothing to pronounce, is skipped *before* the engines are called,
-the lines around it are unaffected, and both the line and the reason are recorded in
-the manifest under `run.tts.skipped`. This is input validation, not failure
-tolerance: an engine that actually *fails* on a line still stops the run with that
-line named, unless `TTS_CONTINUE_ON_FAILURE=true` asks for a reported hole instead.
+spectrogram that trips a convolution inside its vocoder. Such a line, and a line with
+nothing to pronounce at all (punctuation, whitespace), is skipped *before* the engines
+are called, the lines around it are unaffected, and both the line and the reason are
+recorded in the manifest under `run.tts.skipped`. This is input validation, not
+failure tolerance: an engine that actually *fails* on a line still stops the run with
+that line named, unless `TTS_CONTINUE_ON_FAILURE=true` asks for a reported hole
+instead.
+
+Note that a line written **in Roman script is attempted, not skipped**. An
+English-derived word is a word, and silently dropping the line would be worse than
+voicing it imperfectly; getting that word into Fidel is the adaptation stage's job
+(see [Borrowed words](#borrowed-words-keep-the-word-change-the-script)).
 
 `AdaptedDialogue`'s performance metadata is mapped, not discarded. `intensity`
 moves Chatterbox's `exaggeration` and `temperature` predictably; `emotion` and
@@ -622,6 +630,41 @@ things a ten-line window cannot provide:
   needs no G2P model - and a line that comes back over budget is **sent back once
   with the number of syllables to cut**. Shortening the text is the fix the
   literature supports; `timing.py` is left to do only a small final trim.
+
+### Borrowed words: keep the word, change the script
+
+Amharic speakers say **ኮምፒውተር**, not a dictionary equivalent of "computer", and they
+say **ዋልት** for a character called Walt. So the rule is *not* "translate everything":
+a borrowed English word, a technical term and a proper noun all stay. What changes is
+the **script**.
+
+That distinction is the whole point. The output is spoken by an Amharic voice that
+reads Fidel, so `Walt` left in Roman letters is a word it cannot pronounce - while
+`ዋልት` is the same word, unchanged, in a script it can read. The system prompt now
+states this explicitly (it previously said to keep the borrowed word without saying
+in which script, which is precisely how `Walt` could come back unpronounceable), and
+because a rule in a prompt is not a guarantee it is **verified rather than trusted**:
+
+* Lines whose Amharic still contains Roman-script text are **sent back once** to have
+  those words written in Fidel, sharing the same pass as the syllable-budget check so
+  a batch is never re-asked twice.
+* The words themselves are listed in the run report and the manifest, because the
+  *same word has to be spelled the same way everywhere it appears* - otherwise a
+  character sounds like they are saying a different name each time. Pinning them in
+  the character bible's `terms` is what makes that true:
+
+```
+coverage        4/11 categories; missing ...; borrowed words to pin: Walt, iPhone
+```
+
+```json
+{"SPEAKER_03": {"name": "Walt", "terms": {"Walt": "ዋልት"}}}
+```
+
+Neither check is destructive on failure: a line that is still over budget, or still
+carries Roman text, is kept and reported rather than dropped. `TRANSLATION_ENFORCE_BUDGET`
+and `TRANSLATION_ENFORCE_FIDEL_LOANWORDS` (both `true` by default) turn the two passes
+off, which is what a comparison run wants.
 
 ```python
 # What the model receives for one line, alongside the system prompt.

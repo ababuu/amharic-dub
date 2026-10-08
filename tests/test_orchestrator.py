@@ -211,7 +211,13 @@ class Stages:
         return list(self.lines)
 
     def adapt_dialogue(
-        self, lines: object, *, settings: Settings, bible: object = None
+        self,
+        lines: object,
+        *,
+        settings: Settings,
+        bible: object = None,
+        enforce_budget: bool = True,
+        enforce_fidel_loanwords: bool = True,
     ) -> list[AdaptedDialogue]:
         self._record("translation", lines, settings, bible)
         return list(self.dialogue)

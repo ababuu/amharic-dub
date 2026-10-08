@@ -19,6 +19,9 @@ from app.pipeline.qc import (
     InvalidTextError,
     character_error_rate,
     count_syllables,
+    has_latin,
+    has_pronounceable_text,
+    latin_spans,
     measure_pronunciation,
     normalise_for_comparison,
 )
@@ -131,6 +134,71 @@ def test_combining_marks_are_not_counted_as_syllables() -> None:
 def test_syllable_counting_rejects_non_text() -> None:
     with pytest.raises(InvalidTextError, match="needs text"):
         count_syllables(None)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Roman script
+# ---------------------------------------------------------------------------
+
+
+def test_latin_text_is_detected() -> None:
+    assert has_latin("Walt") is True
+    assert has_latin("ዋልት ኮምፒውተር") is False
+    assert has_latin("ዋልት ገዛ iPhone") is True
+
+
+def test_latin_spans_are_extracted_in_order() -> None:
+    assert latin_spans("Walt ኮምፒውተር ገዛ") == ("Walt",)
+    assert latin_spans("ዋልት iPhone እና Coca-Cola አየ") == ("iPhone", "Coca-Cola")
+
+
+def test_latin_spans_keep_digits_and_internal_punctuation() -> None:
+    """Real names and product names contain them."""
+
+    assert latin_spans("iPhone15 ነው") == ("iPhone15",)
+    assert latin_spans("O'Brien መጣ") == ("O'Brien",)
+    assert latin_spans("Wi-Fi የለም") == ("Wi-Fi",)
+
+
+def test_whitespace_ends_a_span() -> None:
+    """A separate number is not part of the word, and a bare number is not a word."""
+
+    assert latin_spans("iPhone 15 ነው") == ("iPhone",)
+    assert latin_spans("15 ነው") == ()
+
+
+def test_latin_spans_are_deduplicated() -> None:
+    assert latin_spans("Walt እና Walt") == ("Walt",)
+
+
+def test_latin_spans_of_fidel_text_are_empty() -> None:
+    assert latin_spans("ዋልት ኮምፒውተር ገዛ") == ()
+    assert latin_spans("") == ()
+
+
+def test_a_trailing_separator_is_not_part_of_a_span() -> None:
+    assert latin_spans("Walt።") == ("Walt",)
+    assert latin_spans("Walt-") == ("Walt",)
+
+
+def test_a_borrowed_word_counts_as_pronounceable() -> None:
+    """An English-derived word is a word; only punctuation has nothing to say."""
+
+    assert has_pronounceable_text("Walt") is True
+    assert has_pronounceable_text("ዋልት") is True
+    assert has_pronounceable_text("ዋልት iPhone") is True
+    assert has_pronounceable_text("።፣?!") is False
+    assert has_pronounceable_text("   ") is False
+    assert has_pronounceable_text("") is False
+
+
+def test_a_latin_check_rejects_non_text() -> None:
+    with pytest.raises(InvalidTextError, match="needs text"):
+        has_latin(None)  # type: ignore[arg-type]
+    with pytest.raises(InvalidTextError, match="needs text"):
+        latin_spans(None)  # type: ignore[arg-type]
+    with pytest.raises(InvalidTextError, match="needs text"):
+        has_pronounceable_text(None)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

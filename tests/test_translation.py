@@ -511,7 +511,12 @@ def test_dialogue_is_sent_in_bounded_batches(monkeypatch):
         for index in range(1, 8)
     ]
 
-    adapt_dialogue(segments, settings=_settings(translation_batch_size=3), enforce_budget=False)
+    adapt_dialogue(
+        segments,
+        settings=_settings(translation_batch_size=3),
+        enforce_budget=False,
+        enforce_fidel_loanwords=False,
+    )
 
     assert [len(_sent_lines(request)) for request in FakeOpenAI.requests] == [3, 3, 1]
 
@@ -520,7 +525,12 @@ def test_a_whole_movie_is_never_sent_in_one_request(monkeypatch):
     _patch(monkeypatch)
     segments = [_segment(start=float(index), end=float(index) + 1.0) for index in range(100)]
 
-    adapt_dialogue(segments, settings=_settings(), enforce_budget=False)
+    adapt_dialogue(
+        segments,
+        settings=_settings(),
+        enforce_budget=False,
+        enforce_fidel_loanwords=False,
+    )
 
     assert DEFAULT_TRANSLATION_BATCH_SIZE == 10
     assert len(FakeOpenAI.requests) == 10
@@ -531,7 +541,12 @@ def test_stable_ids_are_assigned_across_batches(monkeypatch):
     _patch(monkeypatch)
     segments = [_segment(start=float(index), end=float(index) + 1.0) for index in range(4)]
 
-    adapt_dialogue(segments, settings=_settings(translation_batch_size=2), enforce_budget=False)
+    adapt_dialogue(
+        segments,
+        settings=_settings(translation_batch_size=2),
+        enforce_budget=False,
+        enforce_fidel_loanwords=False,
+    )
 
     sent_ids = [line["id"] for request in FakeOpenAI.requests for line in _sent_lines(request)]
     assert sent_ids == [
@@ -655,7 +670,7 @@ def test_an_overshooting_line_is_sent_back_once(monkeypatch):
 
     assert len(FakeOpenAI.requests) == 2
     rewrite = _payload(FakeOpenAI.requests[1])["rewrite"]
-    assert "shorter" in rewrite
+    assert "fix the problem described" in rewrite
     assert "cut at least 6 syllable(s)" in rewrite
     # Only the offending line is resent, under the id it was first given.
     assert [line["id"] for line in _sent_lines(FakeOpenAI.requests[1])] == [
@@ -707,7 +722,10 @@ def test_budget_enforcement_can_be_turned_off(monkeypatch):
     _patch(monkeypatch)
 
     adapt_dialogue(
-        [_segment(start=0.0, end=1.0)], settings=_settings(), enforce_budget=False
+        [_segment(start=0.0, end=1.0)],
+        settings=_settings(),
+        enforce_budget=False,
+        enforce_fidel_loanwords=False,
     )
 
     assert len(FakeOpenAI.requests) == 1
@@ -739,6 +757,144 @@ def test_the_scene_is_derived_when_none_is_supplied(monkeypatch):
     adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings(), scenes=())
 
     assert "context" not in _payload(FakeOpenAI.requests[0])
+
+
+# ---------------------------------------------------------------------------
+# borrowed words must be written in Fidel
+# ---------------------------------------------------------------------------
+
+
+def _fidel_responder(amharic: str):
+    """Answer with ``amharic`` on the first pass and a Fidel form on the rewrite."""
+
+    calls: list[int] = []
+
+    def transform(body):
+        calls.append(1)
+        for line in body["lines"]:
+            line["amharic"] = "ዋልት ኮምፒውተር" if len(calls) > 1 else amharic
+        return body
+
+    return transform
+
+
+def test_a_roman_script_word_is_sent_back_to_be_written_in_fidel(monkeypatch):
+    """The voice reads Fidel, so a word left in Latin cannot be pronounced.
+
+    Borrowed words are meant to survive - that is the whole point - but the *word*
+    surviving is not enough; its script has to be one the engine can read.
+    """
+
+    _patch(monkeypatch)
+    FakeOpenAI.transform = _fidel_responder("Walt ኮምፒውተር ገዛ")
+
+    adapted = adapt_dialogue(
+        [_segment(start=0.0, end=2.0)], settings=_settings(), enforce_budget=False
+    )
+
+    assert len(FakeOpenAI.requests) == 2
+    rewrite = _payload(FakeOpenAI.requests[1])["rewrite"]
+    assert "Walt" in rewrite
+    assert "Fidel" in rewrite
+    assert adapted[0].amharic == "ዋልት ኮምፒውተር"
+
+
+def test_a_line_with_no_roman_text_is_not_resent(monkeypatch):
+    _patch(monkeypatch)
+
+    def transform(body):
+        for line in body["lines"]:
+            line["amharic"] = "ዋልት ኮምፒውተር ገዛ"
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapt_dialogue(
+        [_segment(start=0.0, end=4.0)],
+        settings=_settings(),
+        enforce_budget=False,
+    )
+
+    assert len(FakeOpenAI.requests) == 1
+
+
+def test_only_the_lines_with_roman_text_are_resent(monkeypatch):
+    _patch(monkeypatch)
+    calls: list[int] = []
+
+    def transform(body):
+        calls.append(1)
+        if len(calls) == 1:
+            body["lines"][0]["amharic"] = "ኮምፒውተር ገዛ"
+            body["lines"][1]["amharic"] = "Walt መጣ"
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapt_dialogue(
+        [_segment(start=0.0, end=4.0), _segment(start=4.0, end=8.0)],
+        settings=_settings(),
+        enforce_budget=False,
+    )
+
+    resent = _sent_lines(FakeOpenAI.requests[1])
+    assert [line["id"] for line in resent] == ["dialogue_000002"]
+
+
+def test_the_two_rewrite_reasons_share_one_pass(monkeypatch):
+    """A batch is never re-asked twice: both problems go back together."""
+
+    _patch(monkeypatch)
+    calls: list[int] = []
+
+    def transform(body):
+        calls.append(1)
+        for line in body["lines"]:
+            # Over budget for a 1s window, and carrying Roman script.
+            line["amharic"] = "Walt ኮምፒውተር ገዛ እና ተመለሰ"
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
+
+    assert len(FakeOpenAI.requests) == 2
+    rewrite = _payload(FakeOpenAI.requests[1])["rewrite"]
+    assert "cut at least" in rewrite  # the budget problem
+    assert "Walt" in rewrite  # and the script problem
+
+
+def test_roman_script_enforcement_can_be_turned_off(monkeypatch):
+    _patch(monkeypatch)
+    FakeOpenAI.transform = _fidel_responder("Walt ገዛ")
+
+    adapt_dialogue(
+        [_segment(start=0.0, end=2.0)],
+        settings=_settings(),
+        enforce_budget=False,
+        enforce_fidel_loanwords=False,
+    )
+
+    assert len(FakeOpenAI.requests) == 1
+
+
+def test_a_numeral_free_line_with_no_latin_is_untouched(monkeypatch):
+    """Fidel-only script is already what the engine needs."""
+
+    _patch(monkeypatch)
+
+    def transform(body):
+        for line in body["lines"]:
+            line["amharic"] = "ዋልት ኮምፒውተር ገዛ"
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapted = adapt_dialogue(
+        [_segment(start=0.0, end=4.0)], settings=_settings(), enforce_budget=False
+    )
+
+    assert adapted[0].amharic == "ዋልት ኮምፒውተር ገዛ"
 
 
 # ---------------------------------------------------------------------------

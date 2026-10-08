@@ -40,6 +40,7 @@ from pathlib import Path
 from statistics import fmean, pstdev
 from typing import Any
 
+from app.pipeline.amharic_text import latin_spans
 from app.pipeline.prosody import (
     PitchProfile,
     ProsodyComparison,
@@ -119,6 +120,20 @@ class CoverageReport:
 
     counts: Mapping[str, int]
     lines: int
+    latin_spans: tuple[str, ...] = ()
+
+    @property
+    def borrowed_words(self) -> tuple[str, ...]:
+        """The Roman-script words the Amharic still contains, de-duplicated.
+
+        These are the borrowed words and names a film leans on - "Walt", "iPhone" -
+        and they are worth listing for one reason: the same word has to be *spelled
+        the same way* everywhere it appears, or a character sounds like they are
+        saying a different name each time. Pinning them in the character bible's
+        ``terms`` is what makes that true, and this is the list to pin.
+        """
+
+        return self.latin_spans
 
     @property
     def missing(self) -> tuple[str, ...]:
@@ -162,20 +177,30 @@ class CoverageReport:
             "missing": list(self.missing),
             "covered_ratio": round(self.covered_ratio, 4),
             "representative": self.representative,
+            # The borrowed words and names to pin in the character bible's terms, so
+            # their spelling - and therefore their pronunciation - cannot drift.
+            "borrowed_words": list(self.latin_spans),
         }
 
     def summary(self) -> str:
         """Return the one-line summary a run prints."""
 
+        parts: list[str] = []
         if self.representative:
-            return (
+            parts.append(
                 f"coverage: all {len(GOLDEN_CATEGORIES)} categories represented "
                 f"across {self.lines} line(s)"
             )
-        return (
-            f"coverage: {len(self.covered)}/{len(GOLDEN_CATEGORIES)} categories; "
-            f"missing {', '.join(self.missing)}"
-        )
+        else:
+            parts.append(
+                f"coverage: {len(self.covered)}/{len(GOLDEN_CATEGORIES)} categories; "
+                f"missing {', '.join(self.missing)}"
+            )
+        if self.latin_spans:
+            shown = ", ".join(self.latin_spans[:8])
+            more = f" (+{len(self.latin_spans) - 8} more)" if len(self.latin_spans) > 8 else ""
+            parts.append(f"borrowed words to pin: {shown}{more}")
+        return "; ".join(parts)
 
 
 def _text_of(line: AdaptedDialogue) -> str:
@@ -203,6 +228,10 @@ def measure_coverage(
     counts = {category: 0 for category in GOLDEN_CATEGORIES}
     if not dialogue:
         return CoverageReport(counts=counts, lines=0)
+
+    borrowed: list[str] = []
+    for line in dialogue:
+        borrowed.extend(latin_spans(line.amharic))
 
     windows = [line.duration for line in dialogue]
     speakers = [line.speaker_id for line in dialogue]
@@ -246,7 +275,11 @@ def measure_coverage(
     if len(set(speakers)) >= CROWDED_SCENE_SPEAKERS:
         counts["crowded_scene"] = len(set(speakers))
 
-    return CoverageReport(counts=counts, lines=len(dialogue))
+    return CoverageReport(
+        counts=counts,
+        lines=len(dialogue),
+        latin_spans=tuple(dict.fromkeys(borrowed)),
+    )
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:

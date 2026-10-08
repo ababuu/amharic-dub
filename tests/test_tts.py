@@ -1258,7 +1258,7 @@ def test_a_short_line_does_not_stop_the_lines_around_it(rig: Rig) -> None:
 
 
 def test_a_line_with_nothing_to_pronounce_is_skipped(rig: Rig) -> None:
-    """Punctuation only, or a stray Latin fragment, cannot become speech."""
+    """Punctuation and whitespace cannot become speech."""
 
     result = tts.synthesize_dialogue_detailed(
         [_line(amharic="።፣?!")],
@@ -1270,15 +1270,21 @@ def test_a_line_with_nothing_to_pronounce_is_skipped(rig: Rig) -> None:
     )
 
     (skipped,) = result.skipped
-    assert "no syllables" in skipped.reason
+    assert "nothing to pronounce" in skipped.reason
     assert result.clips == ()
 
 
-def test_a_latin_only_line_is_skipped(rig: Rig) -> None:
-    """The script has nothing to pronounce, and the engine would produce nothing."""
+def test_a_latin_only_line_is_attempted_rather_than_dropped(rig: Rig) -> None:
+    """An English-derived word is a word, and dropping the line would be worse.
+
+    A borrowed word is meant to survive - an Amharic speaker says "ኮምፒውተር", not a
+    dictionary equivalent - so a line that arrives in Roman script is voiced and
+    reported, not silently removed. Getting it into Fidel is the adaptation stage's
+    job, not this one's.
+    """
 
     result = tts.synthesize_dialogue_detailed(
-        [_line(amharic="wait")],
+        [_line(amharic="Walt")],
         rig.stem,
         {rig.profile.speaker_id: rig.profile},
         settings=rig.settings(),
@@ -1286,7 +1292,24 @@ def test_a_latin_only_line_is_skipped(rig: Rig) -> None:
         style_engine=rig.seedvc,
     )
 
-    assert [line.reason.split(":")[0] for line in result.skipped] == ["cannot be dubbed"]
+    assert result.skipped == ()
+    assert len(result.clips) == 1
+
+
+def test_a_mixed_script_line_is_attempted(rig: Rig) -> None:
+    """Fidel plus a borrowed word is the normal case, not an error."""
+
+    result = tts.synthesize_dialogue_detailed(
+        [_line(amharic="ዋልት ኮምፒውተር ገዛ")],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        performance_engine=rig.chatterbox,
+        style_engine=rig.seedvc,
+    )
+
+    assert result.skipped == ()
+    assert len(result.clips) == 1
 
 
 def test_the_shortest_dubbable_window_is_configurable(rig: Rig) -> None:
