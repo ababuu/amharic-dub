@@ -67,7 +67,8 @@ RUNTIME_MODULES: dict[str, str] = {
     "yaml": "Seed-VC",
     "librosa": "Seed-VC / Chatterbox",
     "pydub": "Seed-VC",
-    "transformers": "Seed-VC / Chatterbox",
+    "transformers": "Seed-VC / Chatterbox / OmniVoice",
+    "omnivoice": "OmniVoice synthesis",
     "einops": "Seed-VC",
     "scipy": "Seed-VC",
     "munch": "Seed-VC",
@@ -309,7 +310,6 @@ def check_seed_vc() -> bool:
             f"Seed-VC checkout: not used by TTS_ENGINE={settings.tts_engine}  [SKIP]"
         )
         return True
-
     repo = Path(settings.seed_vc_repo_path)
     if not repo.is_dir():
         print(f"Seed-VC checkout: {repo}  [FAIL] (not a directory)")

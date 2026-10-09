@@ -112,10 +112,18 @@ def report_settings(settings: Settings) -> None:
     _info("translation backend", settings.translation_backend)
     _info("translation model", settings.translation_model)
     _info("tts engine", settings.tts_engine)
-    _info("tts model", settings.tts_model)
-    if settings.tts_engine == "chatterbox":
+    if settings.tts_engine == "omnivoice":
+        _info("omnivoice model", settings.omnivoice_model)
+        _info(
+            "omnivoice steps",
+            f"{settings.omnivoice_steps} @ guidance "
+            f"{settings.omnivoice_guidance_scale:g}",
+        )
+    elif settings.tts_engine == "chatterbox":
         _info("chatterbox model", settings.chatterbox_model)
         _info("seed-vc checkout", settings.seed_vc_repo_path)
+    else:
+        _info("tts model", settings.tts_model)
 
     # The check is configuration-aware, so this names only what this run will
     # actually read: the token always, the DeepSeek key only under the
@@ -215,6 +223,8 @@ def _engine_label(settings: Settings) -> str:
 
     if settings.tts_engine == "chatterbox":
         return "Chatterbox Amharic -> Seed-VC V2"
+    if settings.tts_engine == "omnivoice":
+        return f"OmniVoice cloned voice ({settings.omnivoice_model})"
     return f"{settings.tts_engine} ({settings.tts_model})"
 
 
@@ -321,13 +331,13 @@ def run(source: Path, output_dir: Path, max_lines: int | None) -> int:
             raise RuntimeError("adaptation produced no lines")
 
         stage = "voice profiles"
-        # Only a per-character engine reads an identity reference. A single-voice
-        # engine speaks every line the same way, so building profiles for it would
-        # burn minutes and a model download on references nothing reads - which is
+        # Only an engine that reads a per-speaker reference needs an identity built for
+        # it. A single-voice engine speaks every line the same way, so building profiles
+        # would burn minutes and a model download on references nothing reads - which is
         # also why the orchestrator skips the stage.
-        single_voice = settings.tts_engine != "chatterbox"
+        needs_profiles = tts.engine_needs_profiles(settings.tts_engine)
         profiles: dict[str, VoiceProfile] = {}
-        if single_voice:
+        if not needs_profiles:
             _rule("5. Voice profiles - skipped")
             _info(
                 "reason", f"{settings.tts_engine} is single-voice, one voice for all"

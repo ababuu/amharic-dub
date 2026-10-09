@@ -108,6 +108,13 @@ sentencepiece
 # against the model's own expectations.
 uroman
 
+# --- Amharic speech synthesis (OmniVoice, the default engine) --------------
+# OmniVoice is published as a package, so the default engine needs no checkout of
+# its own. It is what clones a per-character voice and accepts a per-line length,
+# which is why it is the default. Note its own floor is transformers>=5.3, and that
+# the model weights it downloads are CC-BY-NC.
+omnivoice
+
 # --- Audio I/O and numerics ------------------------------------------------
 soundfile
 # NumPy 2.x is the verified baseline: the pyannote stack needs it, and the

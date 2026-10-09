@@ -88,6 +88,10 @@ dependencies = [
   "sentencepiece",
   # uroman romanises Fidel script into the Latin alphabet that MMS-TTS Amharic takes.
   "uroman",
+  # OmniVoice is the default speech engine: it clones a per-character voice from a
+  # short reference and accepts a per-line length, which is what the timing stage
+  # relies on. Published as a package, so it needs no checkout of its own.
+  "omnivoice",
 
   # --- Audio I/O and numerics ----------------------------------------------
   "soundfile",

@@ -100,7 +100,7 @@ import json
 import math
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -212,6 +212,18 @@ MINIMUM_SPEAKABLE_LINE_SECONDS = DEFAULT_TTS_MIN_LINE_SECONDS
 #: too - an English-derived word is a word - so a borrowed word is never dropped for
 #: being written in Roman script; see :func:`app.pipeline.amharic_text.has_latin`.
 MINIMUM_SPEAKABLE_SYLLABLES = 1
+
+#: Syllables per second an Amharic performer delivers, used to estimate how long a line
+#: would naturally take before a rate is requested of the engine. Measured at ~4.6
+#: syllables/second on real synthesized output; the value here is a little slower on
+#: purpose, because asking for a line that comes out too fast is worse than one that
+#: comes out slightly short and is then fitted.
+RATE_ESTIMATE_SYLLABLES_PER_SECOND = 4.0
+
+#: How far from the requested length a line has to be before a rate is worth asking
+#: for, as a fraction. Below this the request would spend a different generation on a
+#: difference nobody can hear.
+RATE_REQUEST_TOLERANCE = 0.02
 
 #: Seed-VC V2 runs in timbre-only mode by default: it replaces the character's
 #: voice and leaves the take's delivery alone. The flag means "also convert the
@@ -2041,6 +2053,317 @@ class MmsAmharicEngine(TextToSpeechEngine):
 
 
 # ---------------------------------------------------------------------------
+# OmniVoice
+# ---------------------------------------------------------------------------
+
+#: The OmniVoice engine name recorded in clip metadata.
+OMNIVOICE_ENGINE_NAME = "omnivoice"
+
+#: OmniVoice's own code for Amharic. Its language map is keyed by name
+#: (``"amharic": "am"``), so the ISO 639-3 code ``amh`` is *not* what it accepts.
+OMNIVOICE_AMHARIC = "am"
+
+#: The rate OmniVoice generates at.
+OMNIVOICE_SAMPLE_RATE = 24_000
+
+
+def _require_omnivoice() -> tuple[Any, Any, Any]:
+    """Return ``(torch, OmniVoice, OmniVoiceGenerationConfig)``, or say what is missing."""
+
+    try:
+        import torch
+        from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+    except ImportError as exc:  # pragma: no cover - only without the runtime
+        raise EngineLoadError(
+            "the OmniVoice engine needs the 'omnivoice' package; install the runtime "
+            f"dependencies before running speech synthesis ({type(exc).__name__}: {exc})"
+        ) from exc
+
+    return torch, OmniVoice, OmniVoiceGenerationConfig
+
+
+class VoiceCloningEngine(ABC):
+    """An engine that speaks text in a voice taken from a reference recording.
+
+    This is a third contract, and it exists because the other two cannot express what
+    a zero-shot cloning model does:
+
+    * :class:`ChatterboxPerformanceEngine` follows a *performance* prompt and leaves
+      identity to a conversion stage, so the take is not the character's voice.
+    * :class:`TextToSpeechEngine` has one voice for the whole film.
+    * Here the reference *is* the identity. Passing the same reference for every line
+      of a speaker is what makes a character sound like one person across a film.
+
+    ``reference_text`` is the transcript of the reference when it is known. It is
+    optional, but supplying it is what keeps a run from loading an ASR model just to
+    transcribe a clip the project already has a transcript for.
+    """
+
+    #: Short, stable name recorded in the clip metadata.
+    name: str
+
+    @property
+    @abstractmethod
+    def is_loaded(self) -> bool:
+        """``True`` once the underlying model has actually been loaded."""
+
+    @property
+    @abstractmethod
+    def sample_rate(self) -> int:
+        """Sample rate of the audio this engine writes."""
+
+    @property
+    def supports_speaking_rate(self) -> bool:
+        """``True`` when :meth:`synthesize` can honour a requested rate.
+
+        A rate asked of the model *before* synthesis is the difference between a line
+        that fits its window and a line that has to be time-stretched into it, so it is
+        reported rather than assumed by the caller.
+        """
+
+        return False
+
+    @abstractmethod
+    def synthesize(
+        self,
+        *,
+        text: str,
+        voice_reference: Path,
+        destination: Path,
+        speaking_rate: float | None = None,
+        reference_text: str | None = None,
+    ) -> Path:
+        """Speak ``text`` as the voice heard in ``voice_reference``."""
+
+
+class OmniVoiceEngine(VoiceCloningEngine):
+    """Amharic speech in a cloned voice, through k2-fsa's OmniVoice.
+
+    OmniVoice is a zero-shot text-to-speech model spanning hundreds of languages -
+    Amharic among them - which clones a voice from a short reference recording. It is
+    the engine the project reaches for when each character must keep one voice for a
+    whole film, because it takes that voice from the character's own audio rather than
+    converting a take afterwards.
+
+    Two of its properties are used deliberately here:
+
+    * **A requested rate.** ``speed`` is passed to the model, so a line can be asked
+      for at the length its window allows instead of being stretched into it. Whether
+      the request can be honoured is a property of the installed build, so it is
+      probed rather than assumed - see :meth:`supports_speaking_rate`.
+    * **A deterministic mode.** The model samples by default; both temperatures are
+      pinned to zero so the same line, reference and rate give the same audio twice.
+      Without that, a re-run could not be compared with the run it is meant to improve.
+
+    The voice design mode (``instruct=``) is *not* used: the model was trained for it
+    on English and Chinese only, so asking it for "whispering" in Amharic would be a
+    request it cannot reliably honour. Emotion is left to the pacing and mixing stages
+    rather than faked here.
+    """
+
+    name = OMNIVOICE_ENGINE_NAME
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        device: str = "cuda",
+        steps: int = 32,
+        guidance_scale: float = 2.0,
+        torch_dtype: str = "float16",
+    ) -> None:
+        if not isinstance(model, str) or not model.strip():
+            raise ConfigurationError("the OmniVoice model must be a non-empty id")
+        if not isinstance(device, str) or not device.strip():
+            raise ConfigurationError("the TTS device must be a non-empty string")
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ConfigurationError(
+                f"OMNIVOICE_STEPS must be a positive integer, got {steps!r}"
+            )
+        if not math.isfinite(guidance_scale) or guidance_scale <= 0:
+            raise ConfigurationError(
+                f"OMNIVOICE_GUIDANCE_SCALE must be positive, got {guidance_scale!r}"
+            )
+
+        self._model = model.strip()
+        self._device = device.strip()
+        self._steps = steps
+        self._guidance_scale = float(guidance_scale)
+        self._torch_dtype = torch_dtype
+        self._torch: Any | None = None
+        self._network: Any | None = None
+        self._config_class: Any | None = None
+        #: Cloning prompts, one per (reference, transcript). Encoding a reference is
+        #: the per-speaker cost, so a film pays it once per character, not per line.
+        self._prompts: dict[tuple[str, str], Any] = {}
+
+    @property
+    def model(self) -> str:
+        """The checkpoint this engine was constructed for."""
+
+        return self._model
+
+    @property
+    def device(self) -> str:
+        """The device this engine runs on."""
+
+        return self._device
+
+    @property
+    def is_loaded(self) -> bool:
+        """``True`` once the weights are in memory."""
+
+        return self._network is not None
+
+    @property
+    def sample_rate(self) -> int:
+        """OmniVoice generates at 24 kHz."""
+
+        return OMNIVOICE_SAMPLE_RATE
+
+    @property
+    def supports_speaking_rate(self) -> bool:
+        """``True``: OmniVoice accepts a per-item ``speed`` on its generate call."""
+
+        return True
+
+    def _load(self) -> tuple[Any, Any, Any]:
+        """Load the model once and return it with torch and the config class."""
+
+        if self._network is not None and self._config_class is not None:
+            return self._torch, self._network, self._config_class
+
+        torch, model_class, config_class = _require_omnivoice()
+        self._torch = torch
+        self._config_class = config_class
+
+        dtype = getattr(torch, self._torch_dtype, None)
+        if dtype is None:
+            raise ConfigurationError(
+                f"OMNIVOICE_TORCH_DTYPE={self._torch_dtype!r} is not a torch dtype"
+            )
+
+        try:
+            self._network = model_class.from_pretrained(
+                self._model, device_map=self._device, dtype=dtype
+            )
+        except Exception as exc:
+            raise EngineLoadError(
+                f"could not load the OmniVoice model {self._model!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        return self._torch, self._network, self._config_class
+
+    def _prompt_for(self, reference: Path, reference_text: str | None) -> Any:
+        """Return the cached cloning prompt for one reference recording.
+
+        The prompt is what carries a character's identity, so it is created once per
+        speaker and reused for every line. ``reference_text`` is passed through when it
+        is known: without it the model transcribes the reference with an ASR model of
+        its own, which is both slower and one more download.
+        """
+
+        key = (str(reference), (reference_text or "").strip())
+        prompt = self._prompts.get(key)
+        if prompt is not None:
+            return prompt
+
+        _torch, network, _config = self._load()
+        text = key[1] or None
+        try:
+            prompt = network.create_voice_clone_prompt(
+                ref_audio=str(reference), ref_text=text
+            )
+        except Exception as exc:
+            raise SynthesisError(
+                f"OmniVoice could not build a voice from {reference}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        self._prompts[key] = prompt
+        return prompt
+
+    def synthesize(
+        self,
+        *,
+        text: str,
+        voice_reference: Path,
+        destination: Path,
+        speaking_rate: float | None = None,
+        reference_text: str | None = None,
+    ) -> Path:
+        """Speak ``text`` as the voice in ``voice_reference``, at ``speaking_rate``."""
+
+        if not isinstance(text, str) or not text.strip():
+            raise InvalidInputError("there is nothing to synthesize")
+
+        target = Path(destination)
+        reference = _validate_audio_file(
+            Path(voice_reference), label="the voice reference"
+        )
+
+        rate: float | None = None
+        if speaking_rate is not None:
+            candidate = float(speaking_rate)
+            if not math.isfinite(candidate) or candidate <= 0:
+                raise ConfigurationError(
+                    f"a speaking rate must be a positive number, got {speaking_rate!r}"
+                )
+            rate = candidate
+
+        _torch, network, config_class = self._load()
+        prompt = self._prompt_for(reference, reference_text)
+
+        # Both temperatures at zero is what makes the result reproducible: `generate`
+        # samples by default, and an unseeded run could not be compared with the run it
+        # is meant to improve.
+        config = config_class(
+            num_step=self._steps,
+            guidance_scale=self._guidance_scale,
+            position_temperature=0.0,
+            class_temperature=0.0,
+        )
+        request: dict[str, Any] = {
+            "text": text,
+            "language": OMNIVOICE_AMHARIC,
+            "voice_clone_prompt": prompt,
+            "generation_config": config,
+        }
+        if rate is not None:
+            request["speed"] = rate
+
+        try:
+            produced = network.generate(**request)
+        except Exception as exc:
+            raise SynthesisError(
+                f"OmniVoice failed to synthesize {text!r}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        samples = _first_waveform(produced, engine="OmniVoice", text=text)
+        return _write_mono(target, samples, self.sample_rate, label="OmniVoice take")
+
+
+def _first_waveform(produced: Any, *, engine: str, text: str) -> np.ndarray:
+    """Return the first waveform of a batch result as a mono ``float32`` array.
+
+    OmniVoice returns a list of arrays, one per input text. One line is requested at a
+    time here, so anything other than a non-empty result is a bug worth naming rather
+    than a shape to guess at.
+    """
+
+    if isinstance(produced, (list, tuple)):
+        if not produced:
+            raise SynthesisError(f"{engine} returned no audio for {text!r}")
+        produced = produced[0]
+
+    samples = _as_samples(produced).squeeze()
+    if samples.size == 0:
+        raise SynthesisError(f"{engine} returned an empty waveform for {text!r}")
+    return samples
+
+
+# ---------------------------------------------------------------------------
 # Engine cache
 # ---------------------------------------------------------------------------
 
@@ -2050,6 +2373,8 @@ _CHATTERBOX_ENGINES: dict[tuple[str, str], ChatterboxAmharicEngine] = {}
 _SEED_VC_ENGINES: dict[tuple[str, str, int, bool], SeedVcV2Engine] = {}
 #: Single-voice engines, keyed by the settings that shape one.
 _MMS_ENGINES: dict[tuple[str, str, int, float], MmsAmharicEngine] = {}
+#: Voice-cloning engines, keyed by the settings that shape one.
+_OMNIVOICE_ENGINES: dict[tuple[str, str, int, float, str], OmniVoiceEngine] = {}
 
 
 def load_chatterbox_engine(*, settings: Settings | None = None) -> ChatterboxAmharicEngine:
@@ -2061,11 +2386,11 @@ def load_chatterbox_engine(*, settings: Settings | None = None) -> ChatterboxAmh
     """
 
     resolved = settings if settings is not None else get_settings()
-    key = (resolved.device, resolved.tts_model)
+    key = (resolved.device, resolved.chatterbox_model)
     engine = _CHATTERBOX_ENGINES.get(key)
     if engine is None:
         engine = ChatterboxAmharicEngine(
-            model=resolved.tts_model,
+            model=resolved.chatterbox_model,
             device=resolved.device,
             cache_dir=Path(resolved.model_cache_dir),
         )
@@ -2118,6 +2443,37 @@ def load_mms_engine(*, settings: Settings | None = None) -> MmsAmharicEngine:
     return engine
 
 
+def load_omnivoice_engine(*, settings: Settings | None = None) -> OmniVoiceEngine:
+    """Return the process-wide OmniVoice engine for these settings.
+
+    The model's own downloads follow ``HF_HOME`` rather than ``MODEL_CACHE_DIR``: the
+    OmniVoice loader resolves a repository id through ``snapshot_download`` and takes
+    no cache directory of its own, so there is nothing here to point at the project's
+    cache. A Pod that sets ``HF_HOME`` on the volume - as the runbook requires - keeps
+    these weights there with everything else.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    key = (
+        resolved.device,
+        resolved.omnivoice_model,
+        resolved.omnivoice_steps,
+        resolved.omnivoice_guidance_scale,
+        resolved.omnivoice_torch_dtype,
+    )
+    engine = _OMNIVOICE_ENGINES.get(key)
+    if engine is None:
+        engine = OmniVoiceEngine(
+            model=resolved.omnivoice_model,
+            device=resolved.device,
+            steps=resolved.omnivoice_steps,
+            guidance_scale=resolved.omnivoice_guidance_scale,
+            torch_dtype=resolved.omnivoice_torch_dtype,
+        )
+        _OMNIVOICE_ENGINES[key] = engine
+    return engine
+
+
 def load_tts_engine(*, settings: Settings | None = None) -> TextToSpeechEngine:
     """Return the single-voice engine named by ``TTS_ENGINE``.
 
@@ -2136,16 +2492,63 @@ def load_tts_engine(*, settings: Settings | None = None) -> TextToSpeechEngine:
     )
 
 
+#: Engines that speak in a voice taken from a per-speaker reference recording.
+VOICE_CLONING_ENGINES: tuple[str, ...] = ("omnivoice",)
+
+#: Engines that need a per-speaker voice reference at all: the cloning engines, which
+#: speak *as* that voice, and ``chatterbox``, which converts a take into it. ``mms``
+#: needs none - it has one voice for the whole film - so a run using it skips the
+#: voice-profile stage instead of building references nothing would read.
+PROFILE_ENGINES: tuple[str, ...] = ("chatterbox",) + VOICE_CLONING_ENGINES
+
+#: Every engine ``TTS_ENGINE`` may name.
+SUPPORTED_ENGINES: tuple[str, ...] = ("chatterbox", "mms") + VOICE_CLONING_ENGINES
+
+#: Loaders for the voice-cloning engines, by the ``TTS_ENGINE`` value selecting them.
+VOICE_CLONING_LOADERS: dict[str, Callable[..., VoiceCloningEngine]] = {
+    "omnivoice": load_omnivoice_engine,
+}
+
+
+def engine_needs_profiles(engine: str) -> bool:
+    """``True`` when a run with this engine reads a per-speaker voice reference.
+
+    The orchestrator asks this before deciding whether to build voice profiles: doing
+    that work for an engine that cannot read them would spend minutes and a model
+    download on references nothing uses.
+    """
+
+    return engine in PROFILE_ENGINES
+
+
+def artifact_model_name(engine: str, *, settings: Settings | None = None) -> str:
+    """Return the checkpoint id that shapes this engine's takes.
+
+    Per-line artifacts are content-addressed from their text *and* this string, so
+    switching engine cannot silently reuse another engine's audio for the same line.
+    Naming the engine as well as the checkpoint is what distinguishes two engines that
+    happen to share a repository id.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    if engine == "chatterbox":
+        return f"{engine}:{resolved.chatterbox_model}"
+    if engine == "omnivoice":
+        return f"{engine}:{resolved.omnivoice_model}"
+    return f"{engine}:{resolved.tts_model}"
+
+
 def reset_engine_cache() -> None:
     """Drop every cached engine and loader, releasing the loaded models.
 
     An engine is useless once its model is gone, so the cache is cleared as a
-    whole. The next call to :func:`load_chatterbox_engine` or
-    :func:`load_seed_vc_engine` starts from a clean slate.
+    whole. The next call to a ``load_*_engine`` function starts from a clean slate.
     """
 
     _CHATTERBOX_ENGINES.clear()
     _SEED_VC_ENGINES.clear()
+    _MMS_ENGINES.clear()
+    _OMNIVOICE_ENGINES.clear()
     _LOADER_MODULES.clear()
 
 
@@ -2623,6 +3026,120 @@ def _synthesize_line_single_voice(
     )
 
 
+def requested_speaking_rate(
+    dialogue: AdaptedDialogue,
+    *,
+    minimum: float,
+    maximum: float,
+    syllables_per_second: float = RATE_ESTIMATE_SYLLABLES_PER_SECOND,
+) -> float | None:
+    """Return the rate to ask an engine for, or ``None`` to leave the model alone.
+
+    Asking a model for a duration is materially better than stretching its output
+    afterwards: the rate changes how the line is *spoken*, while a time-stretch changes
+    the audio that was already spoken. The estimate here is deliberately coarse - the
+    syllable count of the Amharic divided by a speaking rate - because it only has to
+    be good enough to move the line near its window, after which
+    :mod:`app.pipeline.timing` fits the residual.
+
+    ``minimum`` and ``maximum`` are the same bounds the timing stage stretches within,
+    so one policy governs how far a performance may be pushed. A ratio inside
+    :data:`RATE_REQUEST_TOLERANCE` of 1.0 returns ``None``: there is nothing to fix, and
+    a needless request would spend a different generation on a difference nobody hears.
+    """
+
+    syllables = count_syllables(dialogue.amharic)
+    available = dialogue.end - dialogue.start
+    if syllables < MINIMUM_SPEAKABLE_SYLLABLES or available <= 0:
+        return None
+
+    natural = syllables / syllables_per_second
+    ratio = natural / available
+    if not math.isfinite(ratio) or ratio <= 0:
+        return None
+    if abs(ratio - 1.0) <= RATE_REQUEST_TOLERANCE:
+        return None
+
+    return min(max(ratio, minimum), maximum)
+
+
+def _synthesize_line_cloned(
+    index: int,
+    dialogue: AdaptedDialogue,
+    *,
+    name: str,
+    directories: _TtsDirectories,
+    engine: VoiceCloningEngine,
+    profile: VoiceProfile,
+    settings: Settings,
+) -> TtsClip:
+    """Speak one line as its character, cloning the voice from their reference.
+
+    The character's reference recording *is* the voice: the same reference for every
+    line of a speaker is what keeps a character recognisable across a film, which is
+    the property the performance-prompt-and-convert path approximates from the other
+    direction.
+
+    ``VoiceProfile.reference_text`` is passed along when it is known, so the engine does
+    not have to transcribe a clip the project already has a transcript for - which is
+    both a saved model download and a better prompt.
+    """
+
+    take = directories.takes / f"{name}.wav"
+    if not _usable_audio(take):
+        request: dict[str, Any] = {
+            "text": dialogue.amharic,
+            "voice_reference": profile.resolve_reference_audio(),
+            "destination": take,
+        }
+        reference_text = (profile.reference_text or "").strip()
+        if reference_text:
+            request["reference_text"] = reference_text
+
+        # Ask for a length only when the engine can honour one: an engine that cannot
+        # would either ignore the request or fail on it, and the timing stage still
+        # fits whatever comes back. See :data:`DEFAULT_TTS_REQUEST_RATE`.
+        if settings.tts_request_rate and engine.supports_speaking_rate:
+            rate = requested_speaking_rate(
+                dialogue,
+                minimum=settings.timing_min_tempo,
+                maximum=settings.timing_max_tempo,
+            )
+            if rate is not None:
+                request["speaking_rate"] = rate
+
+        engine.synthesize(**request)
+        _require_output(take, what="take", engine=engine.name)
+
+    clip_path = directories.clips / f"{name}.wav"
+    speech_duration, lead, trail = _render_clip(
+        take,
+        clip_path,
+        pause_before=dialogue.pause_before,
+        pause_after=dialogue.pause_after,
+        max_pause=settings.tts_max_pause_seconds,
+    )
+
+    _, clip_rate = _read_audio_info(clip_path, label="the dubbed clip")
+    return TtsClip(
+        index=index,
+        dialogue=dialogue,
+        performance=PerformanceControls.from_dialogue(
+            dialogue, seed=int(name[:8], 16) if _hex_prefix(name) else 0
+        ),
+        audio_path=clip_path,
+        take_path=take,
+        performance_reference_path=None,
+        voice_reference_path=profile.resolve_reference_audio(),
+        sample_rate=clip_rate,
+        speech_duration=speech_duration,
+        rendered_pause_before=lead,
+        rendered_pause_after=trail,
+        performance_engine=engine.name,
+        style_engine="none",
+    )
+
+
 def _hex_prefix(name: str) -> bool:
     """``True`` when ``name`` starts with at least eight hex characters."""
 
@@ -2782,7 +3299,37 @@ def synthesize_dialogue_detailed(
         return SynthesisResult(clips=())
 
     resolved = settings if settings is not None else get_settings()
-    single_voice = tts_engine is not None or resolved.tts_engine != "chatterbox"
+
+    # Three ways to speak a line, and which one is in use decides whether the
+    # voice-profile stage has anything to do:
+    #   chatterbox  prompt a take with the performance, then convert its identity
+    #   omnivoice   clone the character's own voice and speak as it
+    #   mms         one voice for the whole film
+    # The first two both read a per-speaker reference; the third has none to read.
+    cloning_engine: VoiceCloningEngine | None = None
+    single_voice = False
+    if tts_engine is not None:
+        # An engine handed in directly is classified by what it *is* rather than by
+        # the configured name: a caller that passes one is stating which contract it
+        # meets, and the two contracts need different stages.
+        if isinstance(tts_engine, VoiceCloningEngine):
+            cloning_engine = tts_engine
+        elif isinstance(tts_engine, TextToSpeechEngine):
+            single_voice = True
+        else:
+            raise InvalidEngineError(
+                "tts_engine must implement VoiceCloningEngine or TextToSpeechEngine, "
+                f"got {type(tts_engine).__name__}"
+            )
+    elif resolved.tts_engine in VOICE_CLONING_LOADERS:
+        cloning_engine = VOICE_CLONING_LOADERS[resolved.tts_engine](settings=resolved)
+    elif resolved.tts_engine == "mms":
+        single_voice = True
+    elif resolved.tts_engine != "chatterbox":
+        raise ConfigurationError(
+            f"TTS_ENGINE must be one of {', '.join(SUPPORTED_ENGINES)}, got "
+            f"{resolved.tts_engine!r}"
+        )
 
     if single_voice:
         # A single-voice engine has no use for voice profiles, and requiring them
@@ -2808,24 +3355,32 @@ def synthesize_dialogue_detailed(
                 reference, label=f"the voice reference of speaker {speaker_id!r}"
             )
 
-        minimum = _positive(
-            "TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
-            resolved.tts_performance_reference_min_duration,
-        )
-        maximum = _positive(
-            "TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
-            resolved.tts_performance_reference_max_duration,
-        )
-        if maximum < minimum:
-            raise ConfigurationError(
-                f"TTS_PERFORMANCE_REFERENCE_MAX_DURATION ({maximum}) must not be "
-                f"smaller than TTS_PERFORMANCE_REFERENCE_MIN_DURATION ({minimum})"
+        if cloning_engine is not None:
+            # A cloning engine takes the character's reference and speaks as it, so
+            # there is no performance prompt to cut and no conversion to run. The
+            # prompt bounds below describe the Chatterbox prompt, so they are not
+            # validated here - a run that cannot use them should not fail on them.
+            performance = None
+            style = None
+        else:
+            minimum = _positive(
+                "TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
+                resolved.tts_performance_reference_min_duration,
             )
-        performance, style = _resolve_engines(
-            settings=resolved,
-            performance_engine=performance_engine,
-            style_engine=style_engine,
-        )
+            maximum = _positive(
+                "TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
+                resolved.tts_performance_reference_max_duration,
+            )
+            if maximum < minimum:
+                raise ConfigurationError(
+                    f"TTS_PERFORMANCE_REFERENCE_MAX_DURATION ({maximum}) must not be "
+                    f"smaller than TTS_PERFORMANCE_REFERENCE_MIN_DURATION ({minimum})"
+                )
+            performance, style = _resolve_engines(
+                settings=resolved,
+                performance_engine=performance_engine,
+                style_engine=style_engine,
+            )
 
     _positive("TTS_MAX_PAUSE_SECONDS", resolved.tts_max_pause_seconds)
     min_line_seconds = _positive(
@@ -2833,14 +3388,26 @@ def synthesize_dialogue_detailed(
     )
     continue_on_failure = bool(resolved.tts_continue_on_failure)
 
-    engine = tts_engine if tts_engine is not None else (
-        load_tts_engine(settings=resolved) if single_voice else None
-    )
+    if cloning_engine is not None:
+        engine = None
+    elif tts_engine is not None:
+        engine = tts_engine
+    elif single_voice:
+        engine = load_tts_engine(settings=resolved)
+    else:
+        engine = None
     if engine is not None and not isinstance(engine, TextToSpeechEngine):
         raise InvalidEngineError(
             f"tts_engine must be a TextToSpeechEngine adapter, got "
             f"{type(engine).__name__}"
         )
+
+    if cloning_engine is not None:
+        artifact_model = f"{cloning_engine.name}:{cloning_engine.model}"
+    elif engine is not None:
+        artifact_model = f"{engine.name}:{resolved.tts_model}"
+    else:
+        artifact_model = artifact_model_name("chatterbox", settings=resolved)
 
     directories = _TtsDirectories.under(
         resolve_tts_directory(output_dir=output_dir, settings=resolved)
@@ -2864,16 +3431,30 @@ def synthesize_dialogue_detailed(
             )
             continue
 
-        digest = _line_digest(line, model=resolved.tts_model)
+        digest = _line_digest(line, model=artifact_model)
         try:
             if engine is not None:
                 clips.append(
                     _synthesize_line_single_voice(
                         index,
                         line,
-                        name=_line_artifact_name(line, model=resolved.tts_model),
+                        name=_line_artifact_name(line, model=artifact_model),
                         directories=directories,
                         engine=engine,
+                        settings=resolved,
+                    )
+                )
+                continue
+
+            if cloning_engine is not None:
+                clips.append(
+                    _synthesize_line_cloned(
+                        index,
+                        line,
+                        name=_line_artifact_name(line, model=artifact_model),
+                        directories=directories,
+                        engine=cloning_engine,
+                        profile=profiles[line.speaker_id],
                         settings=resolved,
                     )
                 )
@@ -2883,7 +3464,7 @@ def synthesize_dialogue_detailed(
                 _synthesize_line(
                     index,
                     line,
-                    name=_line_artifact_name(line, model=resolved.tts_model),
+                    name=_line_artifact_name(line, model=artifact_model),
                     digest=digest,
                     stem=stem,
                     profile=profiles[line.speaker_id],

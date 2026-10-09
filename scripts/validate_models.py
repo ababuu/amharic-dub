@@ -225,6 +225,58 @@ def load_mms() -> None:
     _report("loaded", f"synthesized at {engine.sample_rate} Hz")
 
 
+def load_omnivoice() -> None:
+    """Load OmniVoice and synthesize one word in a cloned voice.
+
+    Cloning is exercised, not just loading: the project's whole reason for choosing
+    this engine is that it speaks as a specific voice, and a load alone would not show
+    whether the reference was accepted.
+    """
+
+    from app.pipeline import tts
+
+    settings = tts.get_settings()
+    _report("model", settings.omnivoice_model)
+    _report("device", settings.device)
+    _report("steps / guidance", f"{settings.omnivoice_steps} / {settings.omnivoice_guidance_scale:g}")
+
+    if settings.tts_engine != "omnivoice":
+        raise RuntimeError(
+            f"TTS_ENGINE is {settings.tts_engine!r}, so the OmniVoice engine is not "
+            "what a run would use; validate that engine instead"
+        )
+
+    engine = tts.load_omnivoice_engine(settings=settings)
+
+    import tempfile
+    from pathlib import Path as _Path
+
+    with tempfile.TemporaryDirectory() as directory:
+        import numpy as _np
+        import soundfile as _sf
+
+        root = _Path(directory)
+        # A reference is required: this engine has no voice of its own to fall back on,
+        # which is precisely the difference from the single-voice engines.
+        reference = root / "reference.wav"
+        rate = 24_000
+        seconds = 5.0
+        tone = 0.4 * _np.sin(
+            2.0 * _np.pi * 150.0 * _np.arange(int(seconds * rate)) / rate
+        )
+        _sf.write(str(reference), tone.astype(_np.float32), rate, subtype="PCM_16")
+
+        written = engine.synthesize(
+            text="ሰላም",
+            voice_reference=reference,
+            destination=root / "probe.wav",
+        )
+        if not written.is_file() or written.stat().st_size == 0:
+            raise RuntimeError("OmniVoice wrote no audio for the probe line")
+
+    _report("loaded", f"synthesized a cloned line at {engine.sample_rate} Hz")
+
+
 def load_deepseek() -> None:
     """Build the DeepSeek client and confirm the key is accepted.
 
@@ -304,6 +356,12 @@ CONFIGURED_STEPS: tuple[tuple[str, str, object, str], ...] = (
         load_deepseek,
         "openai",
     ),
+    (
+        "omnivoice",
+        "OmniVoice cloned-voice synthesis (TTS_ENGINE=omnivoice)",
+        load_omnivoice,
+        "omnivoice",
+    ),
     ("mms", "MMS-TTS Amharic synthesis (TTS_ENGINE=mms)", load_mms, "mms"),
     (
         "chatterbox",
@@ -324,6 +382,7 @@ CONFIGURED_STEPS: tuple[tuple[str, str, object, str], ...] = (
 ACTIVATION: dict[str, str] = {
     "nllb": "set TRANSLATION_BACKEND=nllb",
     "deepseek": "set TRANSLATION_BACKEND=openai",
+    "omnivoice": "set TTS_ENGINE=omnivoice",
     "mms": "set TTS_ENGINE=mms",
     "chatterbox": "set TTS_ENGINE=chatterbox",
     "seed-vc": "set TTS_ENGINE=chatterbox",
@@ -347,7 +406,7 @@ def configured_steps() -> tuple[tuple[str, str, object], ...]:
     for name, description, loader, wanted in CONFIGURED_STEPS:
         if name in ("nllb", "deepseek") and wanted != backend:
             continue
-        if name in ("mms", "chatterbox", "seed-vc") and wanted != engine:
+        if name in ("mms", "omnivoice", "chatterbox", "seed-vc") and wanted != engine:
             continue
         selected.append((name, description, loader))
     return tuple(selected)

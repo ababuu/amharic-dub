@@ -22,9 +22,9 @@ flowchart LR
     V["Source video"] --> SEP["Source separation<br/>BandIt v2 Multi"]
     SEP -->|dialogue| DIA["Speaker diarization<br/>pyannote Community-1"]
     DIA --> ASR["Transcription<br/>faster-whisper large-v3"]
-    ASR --> TR["Adapt + translate to Amharic<br/>NLLB or an LLM with scene +<br/>character bible + syllable budget"]
-    TR --> VP["Voice profiles<br/>best clean reference per speaker<br/>per-character engines only"]
-    VP --> TTS["Speech synthesis<br/>MMS-TTS Amharic or<br/>Chatterbox Amharic &#8594; Seed-VC V2"]
+    ASR --> TR["Adapt + translate to Amharic<br/>NLLB-200 3.3B or an LLM with<br/>scene + character bible"]
+    TR --> VP["Voice profiles<br/>best clean reference per speaker"]
+    VP --> TTS["Speech synthesis<br/>OmniVoice cloned voice per character"]
     TTS --> TIM["Timing alignment"]
     TIM --> MIX["Mixing"]
     SEP -->|music + effects| MIX
@@ -43,8 +43,8 @@ flowchart LR
 | Source separation    | BandIt v2 Multi                         |
 | Diarization          | pyannote Community-1                    |
 | Transcription        | faster-whisper large-v3                 |
-| Translation/adaptation | **NLLB-200 distilled 1.3B** (default, local) or any OpenAI-compatible endpoint (opt-in) |
-| Speech synthesis     | **MMS-TTS Amharic** (`facebook/mms-tts-amh`, default) or Chatterbox + the Amharic adapter (opt-in) |
+| Translation/adaptation | **NLLB-200 3.3B** (default, local) or any OpenAI-compatible endpoint (opt-in) |
+| Speech synthesis     | **OmniVoice** (`k2-fsa/OmniVoice`, default, cloned voice per character) - or Chatterbox + the Amharic adapter, or MMS-TTS Amharic (single voice) |
 | Voice conversion     | Seed-VC V2 (timbre-only) - only used by the Chatterbox path |
 | Quality control      | `qc.py` (model-free; pronunciation measurement is injected) |
 
@@ -68,32 +68,83 @@ so it cannot keep a joke, match a register, or shorten a line to fit - and the
 performance fields on each line are neutral defaults rather than anything the model
 decided. That is the real cost of the default, and it is stated rather than hidden.
 
+**Why NLLB, and why 3.3B.** This was checked against published Amharic numbers rather
+than assumed. NLLB-200 beats every open instruction-following model tried on Amharic:
+on AFRIDOC-MT's document-level metric the 3.3B checkpoint scores **52.2** (d-chrF,
+eng→amh) against 49.3 for the distilled 1.3B, and AfriScience-MT put the best open LLM
+(AfriqueLlama-8B) about four points of SSA-COMET behind NLLB-1.3B zero-shot while
+Gemma-2-9B collapsed to **6.5** d-chrF on this direction. Two of the newest "flagship"
+translation models - Tencent **Hunyuan-MT** and ByteDance **Seed-X** - do not support
+Amharic at all, verified from their own language tables, and `Gemma`/`Qwen` language
+counts never name it. The 3.3B checkpoint costs ~6.6 GB in bf16, which the 48 GB card
+carries without displacing anything else. Weights are **CC-BY-NC-4.0**.
+
+**What is still missing.** No Amharic dialogue, subtitle or dubbing MT benchmark exists
+anywhere - closest proxies are document-level health/scientific corpora - so "natural
+cinematic Amharic dialogue" cannot be verified from the literature, only from a
+native-speaker read of your own output. The measured path forward is *instruction
+control*: a 2M-parameter LoRA on a permissively licensed 8B model has been measured at
+**58.27 SSA-COMET** eng→amh, i.e. ~93 % of NLLB-1.3B's 62.8 while *also* being able to
+be told to shorten a line or hold a register. That is the next real upgrade here, and it
+is a fine-tuning job, not a model swap.
+
 ## Choosing a speech engine
 
-`TTS_ENGINE` selects between two very different capabilities:
+`TTS_ENGINE` selects between three genuinely different capabilities:
 
-| | `mms` (default) | `chatterbox` |
-| --- | --- | --- |
-| Voice(s) | **one for the whole film** | one per character |
-| Speaker identity | none - single-speaker VITS | cloned from the character's own audio |
-| Actor performance preserved | no | yes, prompted with the original line |
-| Input script | Fidel, romanised with `uroman` | Fidel |
-| Voice profiles needed | no | yes, one per speaker |
-| Determinism | seeded duration predictor | seeded sampling controls |
+| | `omnivoice` (default) | `chatterbox` | `mms` |
+| --- | --- | --- | --- |
+| Voice(s) | **one per character, cloned** | one per character, converted | one for the whole film |
+| Where the voice comes from | the character's own reference audio | the actor's line, converted to the character | nowhere - it has one |
+| Per-line length control | **yes** (`speed`) | no | film-wide only (`MMS_SPEAKING_RATE`) |
+| Output rate | 24 kHz | 24 kHz | 16 kHz |
+| Voice profiles needed | yes | yes | no |
+| Deterministic | **yes** (temperatures pinned) | seeded sampling | seeded duration predictor |
+| Amharic quality evidence | **none published** | CER 0.095, UTMOS 2.711, speaker sim 0.860 (held-out, on `gabar-tech/chatterbox-amharic`) | none published |
 
-MMS-TTS Amharic is a VITS model trained on a **single speaker**, so every character
-comes out in the same voice. The pipeline says so rather than pretending otherwise:
-with `TTS_ENGINE=mms` the voice-profile stage is skipped, the clip records no
-identity or performance reference, and `coverage` reports what the material
-exercised. Per-character voices require `TTS_ENGINE=chatterbox`.
+**Why OmniVoice is the default, and what that costs.** It is the only option that
+clones a voice *and* accepts a per-line length, which matters because the two worst
+defects in the last real run were unfitted lines (27 of 38) and a single flat voice.
+OmniVoice is a genuine k2-fsa release - paper, package, 600+ languages, Amharic among
+them - but its Amharic rests on about **12.8 hours** of its training data and has
+**never been evaluated**. So this is a bet on architecture and controllability, not on
+measured Amharic quality, and it is stated that way rather than dressed up.
 
-`MMS_SPEAKING_RATE` is asked of the model's duration predictor *before* synthesis,
-through the forward call that actually reads it, so the model is asked for a
-duration rather than the audio being stretched to reach one. It is a single
-delivery speed for the whole film, not a per-line fit: a rate of 1.2 makes every
-line roughly 16 % shorter and 0.8 roughly 16 % longer (measured), and each line
-still has to be fitted to its own window by `timing.py`. Per-line rate requests are
-the obvious next step here, and are not implemented.
+**The measured alternative is one variable away.** `gabar-tech/chatterbox-amharic` is
+the only Amharic TTS with published evaluation, and it is strong: character error rate
+**0.095** on held-out speaker-disjoint clips, speaker similarity **0.860** - the highest
+of any Amharic model found - for a LoRA adapter plus a Fidel tokenizer on Chatterbox v3.
+Its own authors call it "intelligible Amharic, not yet fully natural". Note that stock
+Chatterbox Multilingual v3 does **not** support Amharic at all (its 23 languages include
+Swahili, not Amharic; its tokenizer maps every Ge'ez character to `[UNK]`), so the
+adapter is doing all of the work.
+
+To compare them on your own film, change one variable:
+
+```bash
+TTS_ENGINE=chatterbox python -m app.pipeline.orchestrator data/input/test.mp4 --out runs/ab-chatterbox
+# and, for the unmeasured-but-cheaper Amharic-only OmniVoice fine-tune:
+TTS_ENGINE=omnivoice OMNIVOICE_MODEL=african-low-resource/omnivoice-amharic \
+  python -m app.pipeline.orchestrator data/input/test.mp4 --out runs/ab-finetune
+```
+
+`african-low-resource/omnivoice-amharic` (identical weights to `Lab-et/omnivoice-amharic`)
+is trained on far more Amharic - ~331 h against the base model's 12.8 h - but its model
+card reports **every** metric as "TBD", ships no samples, names no datasets, and its
+training corpus has been described as synthetic. It is a lead worth a listen, not an
+engine to trust; which is why it is not the default in either direction.
+
+`mms` is retained for a single-narrator dub. It is a single-speaker VITS model, so every
+character comes out in the same voice; with it the voice-profile stage is skipped, the
+clip records no identity reference, and `coverage` reports what the material exercised.
+
+**Per-line length, and why it is now asked for.** A cloning engine that can honour a
+rate is *asked* for a duration before synthesis, using the line's own syllable count and
+window clamped to the same `TIMING_MIN_TEMPO`/`TIMING_MAX_TEMPO` band the timing stage
+uses. Asking a model for a duration changes how a line is **spoken**; time-stretching
+changes audio that has already been spoken. This is the documented single biggest quality
+gap between this pipeline and the best public dubbing projects, and
+`TTS_REQUEST_RATE=false` switches it off for a controlled comparison.
 | Delivery (later)     | Bunny Stream                            |
 
 Target GPU: **NVIDIA RTX A40 (48 GB VRAM)**.
@@ -439,13 +490,15 @@ Keeping the repository (and so the output) on the volume is what makes the resul
 survive a stop, and findable from a later session. Anything written to the
 container disk is lost when the Pod stops.
 
-Model weights (BandIt, pyannote, faster-whisper, Chatterbox, Seed-VC) are **not**
-part of this repository. They are downloaded at runtime into `MODEL_CACHE_DIR`;
-point that variable at the Pod's persistent volume so the weights survive
-restarts. `app.pipeline.tts` snapshots the Chatterbox Amharic adapter and its
+Model weights (BandIt, pyannote, faster-whisper, NLLB, OmniVoice, Chatterbox,
+Seed-VC) are **not** part of this repository. They are downloaded at runtime into
+`MODEL_CACHE_DIR`; point that variable at the Pod's persistent volume so the weights
+survive restarts. `app.pipeline.tts` snapshots the Chatterbox Amharic adapter and its
 pinned base model into `MODEL_CACHE_DIR` itself; Seed-VC fetches its own
 checkpoints and vocoder through Hugging Face, which takes no cache argument, so
-`HF_HOME` has to be set to the same directory as well (step 2).
+`HF_HOME` has to be set to the same directory as well (step 2). OmniVoice is the
+same: its loader resolves a repository id through `snapshot_download` and takes no
+cache directory of its own, so it lands under `HF_HOME` too.
 
 The pyannote Community-1 diarization checkpoint is a **gated** Hugging Face
 model, so `HUGGINGFACE_TOKEN` is required before running that stage. The token's
@@ -491,8 +544,9 @@ takes reference audio directly, so `clone_prompt_path` may stay `None`.
 
 ### Speech synthesis (`tts.py`)
 
-The default engine runs alone: MMS-TTS Amharic speaks every line in one voice, so
-there is no conversion step - see [Choosing a speech engine](#choosing-a-speech-engine).
+The default engine runs alone: OmniVoice speaks each line in the voice cloned from
+that character's own reference recording, so there is no conversion step - see
+[Choosing a speech engine](#choosing-a-speech-engine).
 
 `TTS_ENGINE=chatterbox` instead runs two engines per line, in this order, which is
 what preserves the original actor's performance:
@@ -876,6 +930,8 @@ pytest tests/test_config.py
 - [x] `prosody` + `evaluation`: coverage, identity consistency, performance
       preservation, and baseline comparison
 - [x] `nllb`: local NLLB-200 translation as the default backend
+- [x] `omnivoice`: cloned-voice synthesis, one voice per character, with a per-line
+      length request instead of stretching afterwards
 - [x] `mms`: MMS-TTS Amharic single-voice engine (and the `chatterbox` alternative)
 - [x] Peak limiting so a clip is attenuated, never silently truncated
 - [ ] Record a scored baseline on real material with the new engines
@@ -922,10 +978,17 @@ merit. What is currently in use, so the obligations are known rather than assume
 | BandIt v2 (`v2-multi`) | code Apache-2.0, weights **CC-BY-SA-4.0** | share-alike on derivatives; the original BandIt's weights are CC-BY-NC-4.0 and are *not* used |
 | pyannote Community-1 | **CC-BY-4.0**, gated | requires accepting the model card; the HF token must have read access |
 | faster-whisper `large-v3` | MIT | not gated |
-| Chatterbox Multilingual v3 | MIT | base model |
+| NLLB-200 (`3.3B`) | **CC-BY-NC-4.0** | non-commercial weights; the code is MIT |
+| `k2-fsa/OmniVoice` | code Apache-2.0, weights **CC-BY-NC-4.0** | non-commercial because of its training data (Emilia) |
+| `african-low-resource/omnivoice-amharic` | card claims Apache-2.0, **unverifiable** | trained on the OmniVoice recipe, whose released weights are CC-BY-NC; no datasets named |
+| Chatterbox Multilingual v3 | MIT | base model; does **not** support Amharic on its own |
 | `gabar-tech/chatterbox-amharic` adapter | **CC-BY-SA-4.0** | share-alike propagates from WaxalNLP |
-| Seed-VC V2 | **GPL-3.0**, *archived* | read-only upstream since April 2025; pin the commit (`provenance.seed_vc_revision`) |
+| Seed-VC V2 | **GPL-3.0**, *archived* | read-only upstream since April 2025; only used by the `chatterbox` engine, so the default run never touches it |
 | DeepSeek API | proprietary service | the adaptation baseline; swappable for a local OpenAI-compatible server |
+
+Two of the defaults (NLLB and OmniVoice weights) are **non-commercial only**. For a
+personal, non-commercial dub that is fine, and licences here are documented rather than
+used to rank anything - but it is worth knowing that neither is usable in a product.
 
 Cloning real performers' voices carries likeness and publicity considerations that
 a software licence does not address. That is worth stating plainly for a

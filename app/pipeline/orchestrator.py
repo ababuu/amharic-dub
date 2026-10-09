@@ -480,12 +480,13 @@ def run_pipeline(
         raise EmptyStageError("adaptation produced no lines; nothing to synthesize")
 
     # Voice profiles answer "what should this character sound like?" - a question only
-    # a per-character engine can act on. A single-voice engine speaks everyone the
-    # same way, so building identities for it would be work whose only result is a
-    # set of references nothing reads.
-    single_voice = resolved.tts_engine != "chatterbox"
+    # an engine that reads a per-speaker reference can act on. A single-voice engine
+    # speaks everyone the same way, so building identities for it would be work whose
+    # only result is a set of references nothing reads. Which engines those are is the
+    # TTS stage's own contract, asked rather than assumed here.
+    needs_profiles = tts.engine_needs_profiles(resolved.tts_engine)
     profiles: Mapping[str, VoiceProfile] = {}
-    if single_voice:
+    if not needs_profiles:
         seconds["voice_profiles"] = 0.0
         report(f"  voice profiles: skipped ({resolved.tts_engine} is single-voice)")
     else:

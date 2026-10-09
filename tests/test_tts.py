@@ -1044,8 +1044,17 @@ def test_a_different_line_gets_a_different_path(rig: Rig) -> None:
 
 
 def test_a_different_model_gets_a_different_path(rig: Rig) -> None:
+    """Artifacts are keyed by the engine *and* the checkpoint that shapes them.
+
+    Which setting names that checkpoint depends on the engine: this rig drives the
+    prompt-and-convert path, so it is the Chatterbox adapter. Naming ``tts_model``
+    here would change nothing, which is the property the other test below pins.
+    """
+
     (default,) = rig.run(_line(), settings=rig.settings())
-    (other,) = rig.run(_line(), settings=rig.settings(tts_model="someone/else"))
+    (other,) = rig.run(
+        _line(), settings=rig.settings(chatterbox_model="someone/else")
+    )
 
     assert default.audio_path != other.audio_path
 

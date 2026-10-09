@@ -123,11 +123,21 @@ DEFAULT_TRANSCRIPTION_COMPUTE_TYPE = "float16"
 #: borrowed-word policy, and per-line performance metadata.
 DEFAULT_TRANSLATION_BACKEND = "nllb"
 
-#: NLLB-200 distilled at 1.3B parameters. The distilled sizes are 600M, 1.3B and
-#: 3.3B: 600M is markedly weaker on low-resource pairs such as Amharic, and 3.3B is
-#: roughly 2.5x the memory and compute for a smaller gain, so 1.3B is the balance.
-#: Amharic (``amh_Ethi``) has real parallel data behind it in NLLB-200.
-DEFAULT_TRANSLATION_MODEL = "facebook/nllb-200-distilled-1.3B"
+#: NLLB-200 at 3.3B parameters.
+#:
+#: Chosen over the distilled 1.3B on measured Amharic, not on size. On FLORES-200
+#: (chrF++, eng->amh) 3.3B scores 37.9 against 37.2 for both the 1.3B and 600M
+#: checkpoints, and on AFRIDOC-MT's document-level metric the gap is wider: 52.2
+#: against 49.3. Document-level context is the part that matters for dialogue, and
+#: NLLB is the only model family with published Amharic numbers that beat every open
+#: instruction-following model tried on it (AFRIDOC-MT measured Gemma-2-9B at 6.5
+#: d-chrF on this direction, and AfriScience-MT put the best open LLM about 27 points
+#: of SSA-COMET behind NLLB).
+#:
+#: It costs ~6.6 GB in bf16, which the target 48 GB card carries without displacing
+#: anything else. Amharic (``amh_Ethi``) has real parallel data behind it in NLLB-200.
+#: The weights are CC-BY-NC-4.0.
+DEFAULT_TRANSLATION_MODEL = "facebook/nllb-200-3.3B"
 
 #: Beam search width. ``1`` is greedy, which is deterministic - the same line always
 #: translates the same way, so two runs can be compared against one another. Raise it
@@ -176,23 +186,57 @@ DEFAULT_VOICE_REFERENCE_MAX_DURATION = 15.0
 
 #: Amharic speech engine consumed by :mod:`app.pipeline.tts`.
 #:
-#: ``"mms"`` is Meta's MMS-TTS Amharic: a VITS model trained on Amharic alone. It is
-#: a **single-speaker** model - one voice for the whole film, with no cloning and no
-#: per-character identity - and it needs its text romanised first (see the module).
+#: ``"omnivoice"`` is k2-fsa's OmniVoice: a zero-shot model covering hundreds of
+#: languages that clones a voice from a short reference and accepts a per-line rate.
+#: Cloning from each character's own audio is what keeps one voice per character for a
+#: whole film, and the rate is what lets a line be asked for at the length its window
+#: allows instead of being stretched into it.
 #: ``"chatterbox"`` is the Chatterbox Multilingual v3 + Amharic LoRA pair, which does
-#: per-character voices by prompting with the original actor's audio and converting
-#: the timbre afterwards, and is kept as the alternative.
-DEFAULT_TTS_ENGINE = "mms"
+#: per-character voices by prompting with the original actor's audio and converting the
+#: timbre afterwards. It has the strongest *published* Amharic numbers of the three
+#: (a held-out character error rate of 0.095 and speaker similarity of 0.860), so it is
+#: kept as the measured alternative to OmniVoice's unmeasured one.
+#: ``"mms"`` is Meta's MMS-TTS Amharic: a VITS model trained on Amharic alone. It is a
+#: **single-speaker** model - one voice for the whole film, with no cloning and no
+#: per-character identity - and it needs its text romanised first (see the module).
+DEFAULT_TTS_ENGINE = "omnivoice"
 
 #: The Amharic TTS checkpoint. Which model this id should name depends on
-#: ``TTS_ENGINE``: an MMS-TTS checkpoint for ``mms``, the Chatterbox Amharic adapter
-#: for ``chatterbox``.
+#: ``TTS_ENGINE``: an MMS-TTS checkpoint for ``mms``. The ``chatterbox`` and
+#: ``omnivoice`` engines name their models through their own settings.
 DEFAULT_TTS_MODEL = "facebook/mms-tts-amh"
 
 #: The Chatterbox Amharic adapter, used when ``TTS_ENGINE=chatterbox``. It is a LoRA
 #: delta plus a Fidel tokenizer applied on top of Chatterbox Multilingual v3 at
 #: runtime, so only the adapter is named here.
 DEFAULT_CHATTERBOX_MODEL = "gabar-tech/chatterbox-amharic"
+
+#: The OmniVoice checkpoint used when ``TTS_ENGINE=omnivoice``.
+#:
+#: ``k2-fsa/OmniVoice`` is the base model: hundreds of languages, Amharic among them,
+#: zero-shot cloning from a short reference. It is the safer default of the two
+#: OmniVoice options because it is a maintained release with a paper and a package
+#: behind it. What is *not* established is how well its Amharic performs: its language
+#: list gives Amharic about 12.8 hours of the data it was trained on, and no Amharic
+#: evaluation has been published for it. Treat any Amharic claim here as unmeasured.
+#:
+#: ``african-low-resource/omnivoice-amharic`` (also published as
+#: ``Lab-et/omnivoice-amharic``, same weights) is Amharic-only and trained on far more
+#: Amharic audio, so it is worth an A/B - but its model card reports every evaluation
+#: metric as "TBD", ships no samples, and names no datasets, so its quality is
+#: unverified in both directions. It is not the default for that reason.
+DEFAULT_OMNIVOICE_MODEL = "k2-fsa/OmniVoice"
+
+#: Diffusion steps for OmniVoice. The model's own default is 32; 16 is the documented
+#: faster setting. Quality is traded for speed here, so the default is left alone.
+DEFAULT_OMNIVOICE_STEPS = 32
+
+#: Classifier-free guidance scale. The model's default is 2.0.
+DEFAULT_OMNIVOICE_GUIDANCE_SCALE = 2.0
+
+#: Precision for the OmniVoice weights. ``float16`` halves the footprint; the model
+#: card documents it, so it is what a run uses.
+DEFAULT_OMNIVOICE_TORCH_DTYPE = "float16"
 
 #: Sample rate MMS-TTS produces, in Hz. VITS models are trained per language and this
 #: one is trained at 16 kHz, so the pipeline resamples its output rather than
@@ -254,6 +298,13 @@ DEFAULT_TTS_MIN_LINE_SECONDS = 0.30
 #: names the line, and a dub with a hole in it is only acceptable when it was asked
 #: for. Set it on a long run where finishing matters more than a perfect first pass.
 DEFAULT_TTS_CONTINUE_ON_FAILURE = False
+
+#: Whether the TTS stage asks a cloning engine for a per-line length before the timing
+#: stage falls back to stretching. Asking a model for a duration changes how the line is
+#: *spoken*; time-stretching changes audio that has already been spoken, which is why
+#: the first is worth doing whenever an engine can honour it. Exposed as a flag so a
+#: comparison run can switch it off and attribute a difference to it.
+DEFAULT_TTS_REQUEST_RATE = True
 
 #: How far a line's delivery may be time-stretched to fit the window of the
 #: original line, as a tempo factor. A factor below 1 slows the line down, above
@@ -490,6 +541,10 @@ class Settings:
     tts_model: str = DEFAULT_TTS_MODEL
     tts_engine: str = DEFAULT_TTS_ENGINE
     chatterbox_model: str = DEFAULT_CHATTERBOX_MODEL
+    omnivoice_model: str = DEFAULT_OMNIVOICE_MODEL
+    omnivoice_steps: int = DEFAULT_OMNIVOICE_STEPS
+    omnivoice_guidance_scale: float = DEFAULT_OMNIVOICE_GUIDANCE_SCALE
+    omnivoice_torch_dtype: str = DEFAULT_OMNIVOICE_TORCH_DTYPE
     mms_sample_rate: int = DEFAULT_MMS_SAMPLE_RATE
     mms_seed: int = DEFAULT_MMS_SEED
     mms_speaking_rate: float = DEFAULT_MMS_SPEAKING_RATE
@@ -509,6 +564,7 @@ class Settings:
     #: Whether a line an engine fails on is skipped and reported, rather than ending
     #: the run. Off by default: a failure should be visible, not absorbed.
     tts_continue_on_failure: bool = DEFAULT_TTS_CONTINUE_ON_FAILURE
+    tts_request_rate: bool = DEFAULT_TTS_REQUEST_RATE
     #: Timing settings for :mod:`app.pipeline.timing`: the tempo band a line may
     #: be stretched within to fit its original window.
     timing_min_tempo: float = DEFAULT_TIMING_MIN_TEMPO
@@ -606,6 +662,18 @@ class Settings:
                 _read_env("CHATTERBOX_MODEL", DEFAULT_CHATTERBOX_MODEL)
                 or DEFAULT_CHATTERBOX_MODEL
             ),
+            omnivoice_model=(
+                _read_env("OMNIVOICE_MODEL", DEFAULT_OMNIVOICE_MODEL)
+                or DEFAULT_OMNIVOICE_MODEL
+            ),
+            omnivoice_steps=_read_int("OMNIVOICE_STEPS", DEFAULT_OMNIVOICE_STEPS),
+            omnivoice_guidance_scale=_read_float(
+                "OMNIVOICE_GUIDANCE_SCALE", DEFAULT_OMNIVOICE_GUIDANCE_SCALE
+            ),
+            omnivoice_torch_dtype=(
+                _read_env("OMNIVOICE_TORCH_DTYPE", DEFAULT_OMNIVOICE_TORCH_DTYPE)
+                or DEFAULT_OMNIVOICE_TORCH_DTYPE
+            ),
             mms_sample_rate=_read_int("MMS_SAMPLE_RATE", DEFAULT_MMS_SAMPLE_RATE),
             mms_seed=_read_nonnegative_int("MMS_SEED", DEFAULT_MMS_SEED),
             mms_speaking_rate=_read_float(
@@ -636,6 +704,9 @@ class Settings:
             ),
             tts_continue_on_failure=_read_bool(
                 "TTS_CONTINUE_ON_FAILURE", DEFAULT_TTS_CONTINUE_ON_FAILURE
+            ),
+            tts_request_rate=_read_bool(
+                "TTS_REQUEST_RATE", DEFAULT_TTS_REQUEST_RATE
             ),
             timing_min_tempo=_read_float("TIMING_MIN_TEMPO", DEFAULT_TIMING_MIN_TEMPO),
             timing_max_tempo=_read_float("TIMING_MAX_TEMPO", DEFAULT_TIMING_MAX_TEMPO),
@@ -723,6 +794,10 @@ class Settings:
             "tts_model": self.tts_model,
             "tts_engine": self.tts_engine,
             "chatterbox_model": self.chatterbox_model,
+            "omnivoice_model": self.omnivoice_model,
+            "omnivoice_steps": self.omnivoice_steps,
+            "omnivoice_guidance_scale": self.omnivoice_guidance_scale,
+            "omnivoice_torch_dtype": self.omnivoice_torch_dtype,
             "mms_sample_rate": self.mms_sample_rate,
             "mms_seed": self.mms_seed,
             "mms_speaking_rate": self.mms_speaking_rate,
@@ -738,6 +813,7 @@ class Settings:
             "tts_max_pause_seconds": self.tts_max_pause_seconds,
             "tts_min_line_seconds": self.tts_min_line_seconds,
             "tts_continue_on_failure": self.tts_continue_on_failure,
+            "tts_request_rate": self.tts_request_rate,
             "timing_min_tempo": self.timing_min_tempo,
             "timing_max_tempo": self.timing_max_tempo,
             "mix_dialogue_gain_db": self.mix_dialogue_gain_db,
@@ -754,6 +830,10 @@ def get_settings() -> Settings:
 
 __all__ = [
     "DEFAULT_CHATTERBOX_MODEL",
+    "DEFAULT_OMNIVOICE_GUIDANCE_SCALE",
+    "DEFAULT_OMNIVOICE_MODEL",
+    "DEFAULT_OMNIVOICE_STEPS",
+    "DEFAULT_OMNIVOICE_TORCH_DTYPE",
     "DEFAULT_DIALOGUE_BIBLE_FILENAME",
     "DEFAULT_DIALOGUE_BIBLE_PATH",
     "DEFAULT_DIARIZATION_MAX_SPEAKERS",
@@ -780,6 +860,7 @@ __all__ = [
     "DEFAULT_TTS_CONTINUE_ON_FAILURE",
     "DEFAULT_TTS_MAX_PAUSE_SECONDS",
     "DEFAULT_TTS_MIN_LINE_SECONDS",
+    "DEFAULT_TTS_REQUEST_RATE",
     "DEFAULT_TTS_MODEL",
     "DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
     "DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
