@@ -124,6 +124,11 @@ from app.config import (
     get_settings,
 )
 from app.pipeline.amharic_text import count_syllables, has_pronounceable_text
+from app.pipeline.dialogue_context import (
+    DEFAULT_SYLLABLES_PER_SECOND,
+    PacingPlan,
+    plan_pacing,
+)
 from app.pipeline.translation import AdaptedDialogue
 from app.pipeline.voice_profiles import (
     VoiceProfile,
@@ -217,13 +222,9 @@ MINIMUM_SPEAKABLE_SYLLABLES = 1
 #: would naturally take before a rate is requested of the engine. Measured at ~4.6
 #: syllables/second on real synthesized output; the value here is a little slower on
 #: purpose, because asking for a line that comes out too fast is worse than one that
-#: comes out slightly short and is then fitted.
-RATE_ESTIMATE_SYLLABLES_PER_SECOND = 4.0
-
-#: How far from the requested length a line has to be before a rate is worth asking
-#: for, as a fraction. Below this the request would spend a different generation on a
-#: difference nobody can hear.
-RATE_REQUEST_TOLERANCE = 0.02
+#: comes out slightly short and is then fitted. The film-wide part of the pacing policy
+#: lives in :mod:`app.pipeline.dialogue_context`, which owns how long a line should be.
+RATE_ESTIMATE_SYLLABLES_PER_SECOND = DEFAULT_SYLLABLES_PER_SECOND
 
 #: Seed-VC V2 runs in timbre-only mode by default: it replaces the character's
 #: voice and leaves the take's delivery alone. The flag means "also convert the
@@ -2785,6 +2786,9 @@ class SynthesisResult:
 
     clips: tuple[TtsClip, ...]
     skipped: tuple[SkippedLine, ...] = ()
+    #: The film-wide delivery plan these clips were spoken to. Recorded so a run can say
+    #: what rate it asked for rather than leaving it to be inferred from the audio.
+    pacing: PacingPlan | None = None
 
     @property
     def attempted(self) -> int:
@@ -3029,38 +3033,43 @@ def _synthesize_line_single_voice(
 def requested_speaking_rate(
     dialogue: AdaptedDialogue,
     *,
-    minimum: float,
-    maximum: float,
-    syllables_per_second: float = RATE_ESTIMATE_SYLLABLES_PER_SECOND,
+    plan: PacingPlan,
 ) -> float | None:
     """Return the rate to ask an engine for, or ``None`` to leave the model alone.
 
     Asking a model for a duration is materially better than stretching its output
     afterwards: the rate changes how the line is *spoken*, while a time-stretch changes
-    the audio that was already spoken. The estimate here is deliberately coarse - the
-    syllable count of the Amharic divided by a speaking rate - because it only has to
-    be good enough to move the line near its window, after which
-    :mod:`app.pipeline.timing` fits the residual.
+    the audio that was already spoken.
 
-    ``minimum`` and ``maximum`` are the same bounds the timing stage stretches within,
-    so one policy governs how far a performance may be pushed. A ratio inside
-    :data:`RATE_REQUEST_TOLERANCE` of 1.0 returns ``None``: there is nothing to fix, and
-    a needless request would spend a different generation on a difference nobody hears.
+    The rate comes from the film's :class:`~app.pipeline.dialogue_context.PacingPlan`
+    rather than from this line alone - see that class for why two levels are used instead
+    of one. The estimate behind it is deliberately coarse, since it only has to move the
+    line near its window before :mod:`app.pipeline.timing` fits the residual.
     """
 
-    syllables = count_syllables(dialogue.amharic)
-    available = dialogue.end - dialogue.start
-    if syllables < MINIMUM_SPEAKABLE_SYLLABLES or available <= 0:
-        return None
+    return plan.rate_for(
+        seconds=dialogue.end - dialogue.start,
+        syllables=count_syllables(dialogue.amharic),
+    )
 
-    natural = syllables / syllables_per_second
-    ratio = natural / available
-    if not math.isfinite(ratio) or ratio <= 0:
-        return None
-    if abs(ratio - 1.0) <= RATE_REQUEST_TOLERANCE:
-        return None
 
-    return min(max(ratio, minimum), maximum)
+def pacing_plan_for(
+    lines: Iterable[AdaptedDialogue], *, settings: Settings
+) -> PacingPlan:
+    """Measure a whole film's dialogue and return the delivery plan for it.
+
+    Called once per run, before any line is synthesized, so every line is spoken to the
+    same film-wide policy instead of each one negotiating its own.
+    """
+
+    return plan_pacing(
+        (
+            (max(line.end - line.start, 0.0), count_syllables(line.amharic))
+            for line in lines
+        ),
+        minimum=settings.timing_min_tempo,
+        maximum=settings.timing_max_tempo,
+    )
 
 
 def _synthesize_line_cloned(
@@ -3072,6 +3081,7 @@ def _synthesize_line_cloned(
     engine: VoiceCloningEngine,
     profile: VoiceProfile,
     settings: Settings,
+    pacing: PacingPlan,
 ) -> TtsClip:
     """Speak one line as its character, cloning the voice from their reference.
 
@@ -3100,11 +3110,7 @@ def _synthesize_line_cloned(
         # would either ignore the request or fail on it, and the timing stage still
         # fits whatever comes back. See :data:`DEFAULT_TTS_REQUEST_RATE`.
         if settings.tts_request_rate and engine.supports_speaking_rate:
-            rate = requested_speaking_rate(
-                dialogue,
-                minimum=settings.timing_min_tempo,
-                maximum=settings.timing_max_tempo,
-            )
+            rate = requested_speaking_rate(dialogue, plan=pacing)
             if rate is not None:
                 request["speaking_rate"] = rate
 
@@ -3409,6 +3415,11 @@ def synthesize_dialogue_detailed(
     else:
         artifact_model = artifact_model_name("chatterbox", settings=resolved)
 
+    # Measured over the whole film, once, before any line is spoken: the film-wide rate
+    # is what absorbs the systematic difference between Amharic and the English it
+    # replaces, so every line is delivered to one policy rather than negotiating its own.
+    pacing = pacing_plan_for(lines, settings=resolved)
+
     directories = _TtsDirectories.under(
         resolve_tts_directory(output_dir=output_dir, settings=resolved)
     )
@@ -3456,6 +3467,7 @@ def synthesize_dialogue_detailed(
                         engine=cloning_engine,
                         profile=profiles[line.speaker_id],
                         settings=resolved,
+                        pacing=pacing,
                     )
                 )
                 continue
@@ -3494,7 +3506,7 @@ def synthesize_dialogue_detailed(
                 )
             )
 
-    return SynthesisResult(clips=tuple(clips), skipped=tuple(skipped))
+    return SynthesisResult(clips=tuple(clips), skipped=tuple(skipped), pacing=pacing)
 
 
 def synthesize_dialogue(
@@ -3561,6 +3573,8 @@ __all__ = [
     "MissingVoiceProfileError",
     "SeedVcV2Engine",
     "MmsAmharicEngine",
+    "OmniVoiceEngine",
+    "VoiceCloningEngine",
     "SkippedLine",
     "SynthesisError",
     "SynthesisResult",
@@ -3568,11 +3582,18 @@ __all__ = [
     "TtsError",
     "VoiceConversionEngine",
     "TextToSpeechEngine",
+    "engine_needs_profiles",
+    "artifact_model_name",
     "extract_performance_reference",
     "load_chatterbox_engine",
     "load_mms_engine",
+    "load_omnivoice_engine",
     "load_seed_vc_engine",
     "load_tts_engine",
+    "SUPPORTED_ENGINES",
+    "PROFILE_ENGINES",
+    "pacing_plan_for",
+    "requested_speaking_rate",
     "reset_engine_cache",
     "seed_vc_revision",
     "resolve_tts_directory",

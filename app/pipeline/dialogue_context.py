@@ -501,6 +501,157 @@ def syllable_budget(
     return SyllableBudget(window=window, syllables=syllables, rate=rate)
 
 
+#: How far one line may leave the film's own delivery speed. Narrow on purpose: the
+#: film-wide rate absorbs the systematic difference between Amharic and the English it
+#: replaces, so this is only for the lines that are individually unusual.
+DEFAULT_LOCAL_TEMPO_MIN = 0.9
+DEFAULT_LOCAL_TEMPO_MAX = 1.1
+
+#: How far a line's estimated length has to be from its window before it is worth
+#: changing anything, as a fraction. Below this the change would be inaudible, and
+#: asking for it costs a different generation.
+DEFAULT_PACING_TOLERANCE = 0.02
+
+
+@dataclass(frozen=True, slots=True)
+class PacingPlan:
+    """How fast a whole film is delivered, and how far one line may leave that.
+
+    Two levels, rather than one rule applied per line. Amharic is systematically longer
+    or shorter than the English it replaces, and that bias belongs to the *film* rather
+    than to any line: paying it once, as a single delivery speed, keeps the dialogue
+    even. Letting every line find its own speed to fit its own window - which is what a
+    single per-line rule amounts to - makes the delivery wander from line to line, and
+    that wander is heard as unnatural pacing even when every line individually fits.
+
+    Which is not a detail of arithmetic: the two-level form and the single-level form
+    give the *same* rate for a line that needs no local correction. What differs is the
+    clamping. Here the film rate is bounded once and each line only departs from it by
+    ``local_minimum``..``local_maximum``, so the usual line barely moves.
+    """
+
+    film_rate: float = 1.0
+    #: The band the *total* rate must stay inside, so one policy governs both this
+    #: request and the stretch the timing stage may apply afterwards.
+    minimum: float = 0.8
+    maximum: float = 1.25
+    local_minimum: float = DEFAULT_LOCAL_TEMPO_MIN
+    local_maximum: float = DEFAULT_LOCAL_TEMPO_MAX
+    tolerance: float = DEFAULT_PACING_TOLERANCE
+    syllables_per_second: float = DEFAULT_SYLLABLES_PER_SECOND
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe view of the plan."""
+
+        return {
+            "film_rate": round(self.film_rate, 4),
+            "minimum": self.minimum,
+            "maximum": self.maximum,
+            "local_minimum": self.local_minimum,
+            "local_maximum": self.local_maximum,
+            "syllables_per_second": self.syllables_per_second,
+        }
+
+    def rate_for(self, *, seconds: float, syllables: int) -> float | None:
+        """Return the rate to deliver one line at, or ``None`` to leave it as it comes.
+
+        ``None`` means "ask for nothing", which is the right answer for a line whose
+        estimate already lands within :attr:`tolerance` of its window: a needless request
+        would spend a different generation on a difference nobody can hear.
+        """
+
+        if isinstance(syllables, bool) or not isinstance(syllables, int):
+            return None
+        if syllables < 1 or not math.isfinite(seconds) or seconds <= 0:
+            return None
+
+        natural = syllables / self.syllables_per_second
+        if not math.isfinite(natural) or natural <= 0:
+            return None
+
+        # The rate that would make this line exactly fill its window...
+        wanted = natural / seconds
+        if not math.isfinite(wanted) or wanted <= 0:
+            return None
+
+        # ...reached from the film's own speed, by a correction small enough that the
+        # delivery stays even. Bounded at both ends: by the local band, so one line
+        # cannot wander off alone, and by the global band, because when the film rate is
+        # already at its limit there is no headroom left for a local correction to use -
+        # without that second clamp a typical line would be asked for 1.375, past the
+        # limit the timing stage is allowed to stretch to.
+        local = min(max(wanted / self.film_rate, self.local_minimum), self.local_maximum)
+        rate = min(max(self.film_rate * local, self.minimum), self.maximum)
+
+        if abs(rate - 1.0) <= self.tolerance:
+            # Nothing worth asking for.
+            return None
+        return rate
+
+
+def plan_pacing(
+    measured: Iterable[tuple[float, int]],
+    *,
+    minimum: float,
+    maximum: float,
+    syllables_per_second: float = DEFAULT_SYLLABLES_PER_SECOND,
+    tolerance: float = DEFAULT_PACING_TOLERANCE,
+) -> PacingPlan:
+    """Return the delivery plan for a whole film.
+
+    ``measured`` is one ``(window_seconds, syllables)`` pair per line. The film rate is
+    the total syllables divided by the total window - the single speed at which the
+    film's dialogue, taken as a whole, exactly fills the time it has - clamped to
+    ``minimum``..``maximum``. Those bounds are the same ones the timing stage stretches
+    within, so one policy governs how far a performance may be pushed anywhere.
+
+    An empty or unusable input returns the natural pace, which is the honest answer: with
+    nothing to measure there is no bias to absorb.
+    """
+
+    if not math.isfinite(minimum) or not math.isfinite(maximum) or minimum <= 0:
+        raise InvalidBudgetError(
+            f"pacing bounds must be positive numbers, got {minimum!r}..{maximum!r}"
+        )
+    if maximum < minimum:
+        raise InvalidBudgetError(
+            f"the pacing maximum ({maximum}) must not be below the minimum ({minimum})"
+        )
+    if not math.isfinite(syllables_per_second) or syllables_per_second <= 0:
+        raise InvalidBudgetError(
+            f"rate must be a positive number, got {syllables_per_second!r}"
+        )
+
+    total_window = 0.0
+    total_natural = 0.0
+    for seconds, syllables in measured:
+        if isinstance(syllables, bool) or not isinstance(syllables, int):
+            continue
+        if syllables < 1 or not math.isfinite(seconds) or seconds <= 0:
+            continue
+        total_window += seconds
+        total_natural += syllables / syllables_per_second
+
+    if total_window <= 0 or total_natural <= 0:
+        return PacingPlan(
+            minimum=minimum,
+            maximum=maximum,
+            syllables_per_second=syllables_per_second,
+            tolerance=tolerance,
+        )
+
+    film_rate = total_natural / total_window
+    return PacingPlan(
+        film_rate=min(max(film_rate, minimum), maximum),
+        minimum=minimum,
+        maximum=maximum,
+        local_minimum=DEFAULT_LOCAL_TEMPO_MIN,
+        local_maximum=DEFAULT_LOCAL_TEMPO_MAX,
+        tolerance=tolerance,
+        syllables_per_second=syllables_per_second,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class BudgetVerdict:
     """Whether one line's Amharic fits the time its original took."""
@@ -566,6 +717,9 @@ def _seconds(name: str, value: object) -> float:
 
 __all__ = [
     "DEFAULT_BUDGET_TOLERANCE",
+    "DEFAULT_LOCAL_TEMPO_MAX",
+    "DEFAULT_LOCAL_TEMPO_MIN",
+    "DEFAULT_PACING_TOLERANCE",
     "DEFAULT_SCENE_GAP_SECONDS",
     "DEFAULT_SCENE_MAX_SECONDS",
     "DEFAULT_SYLLABLES_PER_SECOND",
@@ -577,6 +731,8 @@ __all__ = [
     "InvalidBudgetError",
     "InvalidCharacterError",
     "InvalidSceneError",
+    "PacingPlan",
+    "plan_pacing",
     "Scene",
     "SyllableBudget",
     "TimedLine",

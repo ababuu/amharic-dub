@@ -529,6 +529,10 @@ def run_pipeline(
     )
     clips = tuple(synthesized.clips)
     skipped = tuple(synthesized.skipped)
+    if synthesized.pacing is not None:
+        # Reported, not silent: "the whole film is being delivered 8% faster" is a
+        # decision about the performance, and it should not have to be inferred.
+        report(f"  pacing: film rate {synthesized.pacing.film_rate:.3f}")
     if skipped:
         report(
             f"  skipped: {len(skipped)} line(s) could not be voiced "

@@ -140,11 +140,22 @@ clip records no identity reference, and `coverage` reports what the material exe
 
 **Per-line length, and why it is now asked for.** A cloning engine that can honour a
 rate is *asked* for a duration before synthesis, using the line's own syllable count and
-window clamped to the same `TIMING_MIN_TEMPO`/`TIMING_MAX_TEMPO` band the timing stage
-uses. Asking a model for a duration changes how a line is **spoken**; time-stretching
-changes audio that has already been spoken. This is the documented single biggest quality
-gap between this pipeline and the best public dubbing projects, and
+window. Asking a model for a duration changes how a line is **spoken**; time-stretching
+changes audio that has already been spoken. This was the documented single biggest
+quality gap between this pipeline and the best public dubbing projects.
 `TTS_REQUEST_RATE=false` switches it off for a controlled comparison.
+
+It is asked in **two levels, not one**, and the difference is audible. The film-wide rate
+is measured once from the whole dialogue - total syllables over total window, clamped to
+the same `TIMING_MIN_TEMPO`/`TIMING_MAX_TEMPO` band the timing stage stretches within -
+and each line is then corrected only within a narrow `0.9`-`1.1` band around it. Amharic
+is systematically longer or shorter than the English it replaces, and that bias belongs
+to the *film*: paying it once, as a single delivery speed, keeps the pacing even. A
+single per-line rule gives the same rate to a line that needs no correction, but it lets
+every line pick its own speed up to the global limit - so the delivery wanders line to
+line, which is heard as unnatural pacing even when each line individually fits. The run
+reports the film rate it used (`pacing: film rate 1.083`) rather than leaving it to be
+inferred from the audio.
 | Delivery (later)     | Bunny Stream                            |
 
 Target GPU: **NVIDIA RTX A40 (48 GB VRAM)**.
@@ -949,6 +960,8 @@ pytest tests/test_config.py
 - [x] `nllb`: local NLLB-200 translation as the default backend
 - [x] `omnivoice`: cloned-voice synthesis, one voice per character, with a per-line
       length request instead of stretching afterwards
+- [x] Two-level delivery pacing: one film-wide rate absorbing the systematic bias,
+      with a narrow per-line correction around it
 - [x] `mms`: MMS-TTS Amharic single-voice engine (and the `chatterbox` alternative)
 - [x] Peak limiting so a clip is attenuated, never silently truncated
 - [ ] Record a scored baseline on real material with the new engines

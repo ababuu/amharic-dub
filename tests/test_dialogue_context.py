@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 
 from app.pipeline.dialogue_context import (
+    DEFAULT_LOCAL_TEMPO_MAX,
+    DEFAULT_LOCAL_TEMPO_MIN,
     DEFAULT_SYLLABLES_PER_SECOND,
     MAXIMUM_SYLLABLE_BUDGET,
     Character,
@@ -19,7 +21,9 @@ from app.pipeline.dialogue_context import (
     InvalidBudgetError,
     InvalidCharacterError,
     InvalidSceneError,
+    PacingPlan,
     SyllableBudget,
+    plan_pacing,
     segment_scenes,
     syllable_budget,
 )
@@ -350,3 +354,119 @@ def test_a_budget_verdict_is_json_safe() -> None:
 def test_a_budget_needs_a_positive_window() -> None:
     with pytest.raises(InvalidBudgetError, match="window must be positive"):
         SyllableBudget(window=0.0, syllables=1, rate=4.0)
+
+
+# ---------------------------------------------------------------------------
+# Delivery pacing: one speed for the film, a small correction per line
+# ---------------------------------------------------------------------------
+
+
+def test_a_film_that_already_fits_is_delivered_at_its_natural_pace() -> None:
+    # 8 syllables at 4/second is 2 seconds, exactly the window, for every line.
+    plan = plan_pacing([(2.0, 8)] * 20, minimum=0.8, maximum=1.25)
+
+    assert plan.film_rate == 1.0
+    assert plan.rate_for(seconds=2.0, syllables=8) is None
+
+
+def test_a_systematically_long_film_is_speeded_up_once_not_per_line() -> None:
+    """The bias belongs to the film, so it is paid once as one delivery speed."""
+
+    # Every line needs 4 s of speech in 2 s of window.
+    plan = plan_pacing([(2.0, 16)] * 20, minimum=0.8, maximum=1.25)
+
+    assert plan.film_rate == 1.25
+    assert plan.rate_for(seconds=2.0, syllables=16) == 1.25
+
+
+def test_a_typical_line_barely_moves_when_the_film_carries_the_bias() -> None:
+    """This is the whole point of two levels: the usual line stays near the film rate."""
+
+    # 9 syllables in 2 s is a mild systematic overshoot.
+    plan = plan_pacing([(2.0, 9)] * 20, minimum=0.8, maximum=1.25)
+
+    assert plan.film_rate == 1.125
+    typical = plan.rate_for(seconds=2.0, syllables=9)
+    assert typical == 1.125
+    # An individually long line departs by the local band only, not to the global limit.
+    outlier = plan.rate_for(seconds=2.0, syllables=16)
+    assert outlier is not None
+    assert typical < outlier < 1.25
+
+
+def test_no_line_is_ever_asked_for_more_than_the_global_band_allows() -> None:
+    """The request and the later stretch share one limit, so neither can exceed it."""
+
+    plan = plan_pacing([(2.0, 40)] * 20, minimum=0.8, maximum=1.25)
+
+    for syllables in (1, 4, 8, 16, 64):
+        rate = plan.rate_for(seconds=2.0, syllables=syllables)
+        if rate is not None:
+            assert 0.8 <= rate <= 1.25
+
+
+def test_a_film_whose_translation_came_out_short_is_slowed_down() -> None:
+    plan = plan_pacing([(4.0, 4)] * 20, minimum=0.8, maximum=1.25)
+
+    assert plan.film_rate == 0.8
+    assert plan.rate_for(seconds=4.0, syllables=4) == 0.8
+
+
+def test_the_local_band_bounds_an_outlier() -> None:
+    plan = PacingPlan(film_rate=1.0, minimum=0.8, maximum=1.25)
+    # Wants 4.0 on its own; the local band stops it at the maximum.
+    rate = plan.rate_for(seconds=1.0, syllables=16)
+
+    assert rate == DEFAULT_LOCAL_TEMPO_MAX
+    assert DEFAULT_LOCAL_TEMPO_MIN < DEFAULT_LOCAL_TEMPO_MAX
+
+
+def test_a_plan_with_nothing_to_measure_is_the_natural_pace() -> None:
+    plan = plan_pacing([], minimum=0.8, maximum=1.25)
+
+    assert plan.film_rate == 1.0
+    assert plan.rate_for(seconds=2.0, syllables=8) is None
+
+
+def test_unusable_measurements_are_ignored_rather_than_skewing_the_plan() -> None:
+    plan = plan_pacing(
+        [(2.0, 8), (0.0, 8), (2.0, 0), (-1.0, 8)],
+        minimum=0.8,
+        maximum=1.25,
+    )
+
+    assert plan.film_rate == 1.0
+
+
+def test_a_line_with_no_window_or_no_text_asks_for_nothing() -> None:
+    plan = PacingPlan(film_rate=1.0, minimum=0.8, maximum=1.25)
+
+    assert plan.rate_for(seconds=0.0, syllables=8) is None
+    assert plan.rate_for(seconds=2.0, syllables=0) is None
+    assert plan.rate_for(seconds=float("nan"), syllables=8) is None
+
+
+def test_the_plan_is_reportable() -> None:
+    """A run says what rate it asked for instead of leaving it to be inferred."""
+
+    plan = plan_pacing([(2.0, 9)] * 20, minimum=0.8, maximum=1.25)
+    payload = plan.as_dict()
+
+    assert payload["film_rate"] == 1.125
+    assert payload["minimum"] == 0.8
+    assert payload["maximum"] == 1.25
+    assert json.loads(json.dumps(payload)) == payload
+
+
+@pytest.mark.parametrize(
+    "minimum,maximum",
+    [(0.0, 1.25), (0.8, 0.5), (float("nan"), 1.0)],
+)
+def test_unusable_pacing_bounds_are_rejected(minimum: float, maximum: float) -> None:
+    with pytest.raises(InvalidBudgetError):
+        plan_pacing([(2.0, 8)], minimum=minimum, maximum=maximum)
+
+
+def test_an_unusable_speaking_rate_is_rejected() -> None:
+    with pytest.raises(InvalidBudgetError, match="rate must be a positive number"):
+        plan_pacing([(2.0, 8)], minimum=0.8, maximum=1.25, syllables_per_second=0.0)

@@ -28,6 +28,7 @@ from app.pipeline.tts import (
 )
 from app.pipeline.translation import AdaptedDialogue
 from app.pipeline.voice_profiles import VoiceProfile
+from app.pipeline.dialogue_context import PacingPlan
 
 SPEAKER = "SPEAKER_00"
 OTHER_SPEAKER = "SPEAKER_01"
@@ -685,30 +686,38 @@ def test_resetting_the_cache_drops_the_engine(
 # ---------------------------------------------------------------------------
 
 
-def test_a_line_that_is_too_long_asks_for_a_faster_rate() -> None:
-    """Four syllables per second over a two-second window is the reference point."""
+def test_a_long_line_is_corrected_within_the_local_band() -> None:
+    """A single long line moves by the local band; the film rate carries any real bias.
 
+    Asking for the full 4.0 this line "wants" would be a request the timing stage's own
+    limits would not allow, and it would make this line's delivery unlike every other.
+    """
+
+    plan = PacingPlan(film_rate=1.0, minimum=0.8, maximum=1.25)
     # 16 syllables at 4/second is 4 seconds of speech in a 2-second window.
     line = _line(start=0.0, end=2.0, amharic="ሰ" * 16)
 
-    assert tts.requested_speaking_rate(line, minimum=0.8, maximum=1.25) == 1.25
+    assert tts.requested_speaking_rate(line, plan=plan) == 1.1
 
 
-def test_the_rate_is_clamped_to_the_policy_the_timing_stage_uses() -> None:
-    """One bound governs both, so a line is never pushed further by one than the other."""
+def test_the_rate_never_leaves_the_band_the_timing_stage_uses() -> None:
+    """One policy governs both this request and the stretch applied afterwards."""
 
+    plan = PacingPlan(film_rate=1.25, minimum=0.8, maximum=1.25)
     line = _line(start=0.0, end=1.0, amharic="ሰ" * 40)
 
-    asked = tts.requested_speaking_rate(line, minimum=0.8, maximum=1.25)
+    asked = tts.requested_speaking_rate(line, plan=plan)
 
-    assert asked == 1.25
+    assert asked is not None
+    assert 0.8 <= asked <= 1.25
 
 
 def test_a_slow_line_asks_for_a_slower_rate() -> None:
+    plan = PacingPlan(film_rate=1.0, minimum=0.8, maximum=1.25)
     # 4 syllables at 4/second is 1 second of speech in a 4-second window.
     line = _line(start=0.0, end=4.0, amharic="ሰ" * 4)
 
-    asked = tts.requested_speaking_rate(line, minimum=0.8, maximum=1.25)
+    asked = tts.requested_speaking_rate(line, plan=plan)
 
     assert asked is not None
     assert 0.8 <= asked < 1.0
@@ -717,16 +726,32 @@ def test_a_slow_line_asks_for_a_slower_rate() -> None:
 def test_a_line_that_already_fits_asks_for_nothing() -> None:
     """A needless request would spend a different generation on an inaudible change."""
 
+    plan = PacingPlan(film_rate=1.0, minimum=0.8, maximum=1.25)
     # 8 syllables at 4/second is 2 seconds, exactly the window.
     line = _line(start=0.0, end=2.0, amharic="ሰ" * 8)
 
-    assert tts.requested_speaking_rate(line, minimum=0.8, maximum=1.25) is None
+    assert tts.requested_speaking_rate(line, plan=plan) is None
+
+
+def test_an_outlier_line_only_moves_slightly_from_the_film_rate() -> None:
+    """The film rate does the work; one line is not allowed to wander off on its own."""
+
+    plan = PacingPlan(film_rate=1.1, minimum=0.8, maximum=1.25)
+    # This line on its own would want 4.0; the local band caps how far it may go.
+    line = _line(start=0.0, end=2.0, amharic="ሰ" * 32)
+
+    asked = tts.requested_speaking_rate(line, plan=plan)
+
+    assert asked is not None
+    assert asked < 4.0
+    assert asked <= 1.25
 
 
 def test_a_line_with_nothing_to_say_asks_for_nothing() -> None:
+    plan = PacingPlan(film_rate=1.0, minimum=0.8, maximum=1.25)
     line = _line(start=0.0, end=2.0, amharic="።")
 
-    assert tts.requested_speaking_rate(line, minimum=0.8, maximum=1.25) is None
+    assert tts.requested_speaking_rate(line, plan=plan) is None
 
 
 def test_the_rate_is_asked_for_through_the_engine(
