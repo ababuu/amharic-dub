@@ -156,6 +156,19 @@ every line pick its own speed up to the global limit - so the delivery wanders l
 line, which is heard as unnatural pacing even when each line individually fits. The run
 reports the film rate it used (`pacing: film rate 1.083`) rather than leaving it to be
 inferred from the audio.
+
+A line that already fits is **not** sped up by the film rate. That rate exists to spread
+the cost of a language that runs long; applying it to comfortable dialogue would rush
+lines that need nothing, which is heard as a rushed line rather than a consistent film.
+Lines that run *short* are likewise left alone, since fitting one down into a longer
+window is the timing stage's job.
+
+**Why nothing is widened to make it fit.** Raising the request band is tempting - asking
+for 1.5x would trim less - but it was measured on a real failing run and rejected:
+against 144.8s of Amharic needing to fit 87.3s of available time, requesting 1.25x leaves
+38.6s cut across 29 lines, and requesting 1.5x still leaves 22.6s cut across 27 lines
+while rushing the entire film by half again. The band stays at 1.25 and the remaining
+time comes out of the *text*, which is what the shortening pass below is for.
 | Delivery (later)     | Bunny Stream                            |
 
 Target GPU: **NVIDIA RTX A40 (48 GB VRAM)**.
@@ -248,10 +261,17 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
 | `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |
 | `TRANSLATION_BACKEND` | `nllb` (local translation) or `openai` (instruction-following adaptation) | `nllb` |
-| `TRANSLATION_MODEL`  | Model for the selected backend                | `facebook/nllb-200-distilled-1.3B` |
+| `TRANSLATION_MODEL`  | Model for the selected backend                | `facebook/nllb-200-3.3B` |
 | `TRANSLATION_NUM_BEAMS` | NLLB beam width; `1` is greedy and deterministic | `1` |
 | `TRANSLATION_MAX_NEW_TOKENS` | Longest NLLB output per chunk, in tokens | `512` |
-| `TTS_ENGINE`        | `mms` (single voice) or `chatterbox` (per character) | `mms` |
+| `TRANSLATION_LENGTH_PENALTY` | NLLB's preference over output length; `<1` favours brevity | `1.0` |
+| `TRANSLATION_SHORTEN_PENALTY` | The penalty a line that will not fit is re-translated with | `0.6` |
+| `TRANSLATION_SYLLABLES_PER_SECOND` | Amharic delivery rate used to turn time into a syllable budget | `4.0` |
+| `TTS_ENGINE`        | `omnivoice` (cloned, per character) or `chatterbox` or `mms` (single voice) | `omnivoice` |
+| `OMNIVOICE_MODEL`   | OmniVoice checkpoint used when `TTS_ENGINE=omnivoice` | `k2-fsa/OmniVoice` |
+| `OMNIVOICE_STEPS`   | Diffusion steps; `16` is the faster documented setting | `32` |
+| `OMNIVOICE_GUIDANCE_SCALE` | Classifier-free guidance scale         | `2.0` |
+| `OMNIVOICE_TORCH_DTYPE` | Precision of the OmniVoice weights          | `float16` |
 | `MMS_SEED`          | Fixes the MMS duration predictor, so a line is the same length every run | `0` |
 | `MMS_SPEAKING_RATE` | Delivery speed for the whole film, asked of the MMS duration predictor before synthesis (`1.2` is ~16% faster; measured, not assumed) | `1.0` |
 | `CHATTERBOX_MODEL`  | The Amharic adapter used when `TTS_ENGINE=chatterbox` | `gabar-tech/chatterbox-amharic` |
@@ -265,7 +285,7 @@ environment, so values configured on the RunPod pod always win.
 | `VOICE_REFERENCE_TARGET_DURATION` | Preferred reference length            | `10.0`             |
 | `VOICE_REFERENCE_MAX_DURATION` | Longest reference kept (a longer continuous turn is scanned with a sliding window) | `15.0` |
 | `DIALOGUE_BIBLE_PATH` | Persistent character/consistency state for adaptation (see [Cinematic dialogue adaptation](#cinematic-dialogue-adaptation-dialogue_contextpy)) | `$WORK_DIR/dialogue_bible.json` |
-| `TTS_MODEL` | Amharic speech adapter used by the TTS stage   | `gabar-tech/chatterbox-amharic` |
+| `TTS_MODEL` | The single-voice engine's checkpoint, used when `TTS_ENGINE=mms` | `facebook/mms-tts-amh` |
 | `SEED_VC_REPO_PATH` | Seed-VC checkout for the identity-conversion step | `$MODEL_CACHE_DIR/seed-vc` |
 | `SEED_VC_DIFFUSION_STEPS` | Diffusion steps of the Seed-VC V2 converter | `30` |
 | `SEED_VC_CONVERT_STYLE` | Also convert the *reference's* accent and style. **Keep this off** - see [Speech synthesis](#speech-synthesis-ttspy) | `false` |
@@ -273,8 +293,10 @@ environment, so values configured on the RunPod pod always win.
 | `TTS_MAX_PAUSE_SECONDS` | Longest pause rendered around a synthesized line | `2.0` |
 | `TTS_MIN_LINE_SECONDS` | Shortest original window that can be dubbed; shorter lines are skipped and reported | `0.30` |
 | `TTS_CONTINUE_ON_FAILURE` | Skip and report a line an engine fails on instead of ending the run | `false` |
+| `TTS_REQUEST_RATE` | Ask a cloning engine for a per-line length before falling back to stretching | `true` |
 | `TIMING_MIN_TEMPO` | Slowest a line may be stretched to fit its window | `0.80` |
 | `TIMING_MAX_TEMPO` | Fastest a line may be stretched to fit its window | `1.25` |
+| `TIMING_MIN_LINE_GAP` | Silence kept between one dubbed line and the next, so two voices never sound at once | `0.12` |
 | `MIX_DIALOGUE_GAIN_DB` | Dialogue level in the final mix (signed dB)     | `0.0`              |
 | `MIX_DUCK_DB`       | How far music/effects are ducked under dialogue    | `6.0`              |
 | `DEVICE`            | `cuda` on a GPU worker, `cpu` for CPU-only checks   | `cuda`             |
@@ -705,14 +727,35 @@ into `MODEL_CACHE_DIR`; Seed-VC's own downloads follow `HF_HOME` (see
 
 ### Timing, mixing and muxing (`timing.py`, `mixing.py`, `video.py`)
 
-Alignment fits each line to the window of the line it replaces. Only the **speech**
-is time-stretched, with FFmpeg's pitch-preserving `atempo`; the rendered pauses
-keep their length, and a line's leading pause shifts the file rather than the line,
-so the speech still lands on its original start. A line that would need more than
-the `TIMING_MIN_TEMPO`/`TIMING_MAX_TEMPO` band is clamped and **reported** as not
-fitting - the run records by how much, in the manifest - because mangling a
-performance to fit a window is worse than being 0.4 s long. `atempo` accepts
-0.5-2.0, so a wider band is rejected rather than passed through.
+Alignment gives each line a **deadline**, not just a window. The room a line has runs from
+its own start to `TIMING_MIN_LINE_GAP` (default `0.12s`) before the next line begins -
+including that next line's leading pause, since that is when its audio starts and so is the
+earliest moment two lines could collide. The original actor spoke English, and Amharic does
+not express the same idea in the same number of syllables, so a faithful translation
+routinely overruns the window the English occupied. Aiming at the window alone is what made
+a real run sound broken: lines were fitted to their own window, could not fit, and simply
+overran into the next one, so two voices spoke at once.
+
+Three things happen in order, and only ever as far as needed:
+
+1. **The silence between lines is used.** It is already empty, and it costs nothing: a line
+   that needs 2.0s in a 0.8s window is delivered at its natural pace if 2.0s is free before
+   the next line. On the failing run this reclaimed **24s**.
+2. **Only then is the line speeded up**, within `TIMING_MIN_TEMPO`/`TIMING_MAX_TEMPO`, with
+   pitch-preserving `atempo`. Only the speech is stretched; the rendered pauses keep their
+   length, and a line's leading pause shifts the file rather than the line, so the speech
+   still lands on its original start.
+3. **Only a line that still cannot fit is cut short**, with a 25ms fade, and the cut is
+   reported in the manifest and in the run summary. Cutting is the last resort because two
+   voices at once is unintelligible while a clipped ending is merely abrupt - but it is
+   never silent, because a non-zero `trimmed` means the Amharic was longer than its time.
+
+A line with no successor - the last in the film, or a clip aligned on its own - is
+**never** cut: it harms nobody by running past its own window, and cutting would be
+mangling for no benefit. `atempo` accepts 0.5-2.0, so a wider band is rejected rather than
+passed through.
+
+Measured on a real failing run of the test clip: **28 overlapping lines became 0.**
 
 Mixing places every aligned line at its own timestamp into a continuous dialogue
 stem, then sums that with the **music and effects only**. The original English
@@ -962,6 +1005,9 @@ pytest tests/test_config.py
       length request instead of stretching afterwards
 - [x] Two-level delivery pacing: one film-wide rate absorbing the systematic bias,
       with a narrow per-line correction around it
+- [x] A per-line placement deadline: lines use the silence after them, and never
+      speak over the next one (28 overlapping lines -> 0 on the real test clip)
+- [x] Re-ask NLLB for a shorter rendering when a line cannot fit its available time
 - [x] `mms`: MMS-TTS Amharic single-voice engine (and the `chatterbox` alternative)
 - [x] Peak limiting so a clip is attenuated, never silently truncated
 - [ ] Record a scored baseline on real material with the new engines

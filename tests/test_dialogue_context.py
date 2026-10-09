@@ -23,6 +23,7 @@ from app.pipeline.dialogue_context import (
     InvalidSceneError,
     PacingPlan,
     SyllableBudget,
+    placement_windows,
     plan_pacing,
     segment_scenes,
     syllable_budget,
@@ -405,11 +406,15 @@ def test_no_line_is_ever_asked_for_more_than_the_global_band_allows() -> None:
             assert 0.8 <= rate <= 1.25
 
 
-def test_a_film_whose_translation_came_out_short_is_slowed_down() -> None:
+def test_a_film_whose_translation_came_out_short_is_measured_but_not_drawled() -> None:
+    """A film that runs short is reported as such; fitting it down is timing's job."""
+
     plan = plan_pacing([(4.0, 4)] * 20, minimum=0.8, maximum=1.25)
 
     assert plan.film_rate == 0.8
-    assert plan.rate_for(seconds=4.0, syllables=4) == 0.8
+    # No request is made: asking the model to speak slowly buys nothing over letting the
+    # timing stage place the line, and it would cost a generation per line.
+    assert plan.rate_for(seconds=4.0, syllables=4) is None
 
 
 def test_the_local_band_bounds_an_outlier() -> None:
@@ -470,3 +475,56 @@ def test_unusable_pacing_bounds_are_rejected(minimum: float, maximum: float) -> 
 def test_an_unusable_speaking_rate_is_rejected() -> None:
     with pytest.raises(InvalidBudgetError, match="rate must be a positive number"):
         plan_pacing([(2.0, 8)], minimum=0.8, maximum=1.25, syllables_per_second=0.0)
+
+
+# ---------------------------------------------------------------------------
+# The room each line has before the next one starts
+# ---------------------------------------------------------------------------
+
+
+def test_a_line_gets_the_room_up_to_the_next_one() -> None:
+    """The number the pipeline aims at is not a line's own window - it is the gap too."""
+
+    windows = placement_windows([(5.0, 5.8), (9.0, 9.8)], gap=0.12)
+
+    assert windows[0] == pytest.approx(9.0 - 5.0 - 0.12)
+    # The last line has no successor, so it keeps its own window.
+    assert windows[1] == pytest.approx(0.8)
+
+
+def test_back_to_back_lines_get_no_extra_room() -> None:
+    """Nothing to reclaim when the next line starts the moment this one ends."""
+
+    windows = placement_windows([(5.0, 5.8), (5.8, 6.6)], gap=0.12)
+
+    assert windows[0] == pytest.approx(0.68)
+
+
+def test_the_room_never_collapses_to_nothing() -> None:
+    """A pathological transcript must not produce a zero-length target."""
+
+    windows = placement_windows([(5.0, 5.8), (5.0, 5.8)], gap=0.12)
+
+    assert windows[0] > 0
+
+
+def test_a_single_line_keeps_its_own_window() -> None:
+    assert placement_windows([(5.0, 5.8)]) == pytest.approx((0.8,))
+
+
+def test_an_empty_transcript_has_no_windows() -> None:
+    assert placement_windows([]) == ()
+
+
+def test_unusable_spans_are_rejected() -> None:
+    with pytest.raises(InvalidBudgetError, match="cannot end"):
+        placement_windows([(5.0, 4.0)])
+    with pytest.raises(InvalidBudgetError, match="non-negative"):
+        placement_windows([(5.0, 5.8)], gap=-1.0)
+
+
+def test_the_gap_is_configurable() -> None:
+    tight = placement_windows([(5.0, 5.8), (9.0, 9.8)], gap=0.01)
+    loose = placement_windows([(5.0, 5.8), (9.0, 9.8)], gap=1.0)
+
+    assert tight[0] > loose[0]

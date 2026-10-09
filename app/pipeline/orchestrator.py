@@ -63,6 +63,8 @@ from app.pipeline import (
     video,
     voice_profiles,
 )
+from app.pipeline.amharic_text import count_syllables
+from app.pipeline.dialogue_context import placement_windows
 from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
 from app.pipeline.mixing import MixResult
 from app.pipeline.timing import AlignedClip
@@ -329,6 +331,50 @@ def _dialogue_dict(line: AdaptedDialogue) -> dict[str, Any]:
     }
 
 
+def _report_dialogue_fit(
+    dialogue: Sequence[Any],
+    settings: Any,
+    report: Callable[[str], None],
+) -> None:
+    """Say whether the Amharic can be spoken in the time the film gives it.
+
+    This is the measurement that decides what the rest of the run can do. Amharic does not
+    express the same idea in the same number of syllables as English, so a faithful
+    translation of film dialogue is routinely longer than the lines it replaces - and if
+    the total is longer than the time available, *something* has to give: the delivery is
+    sped up, or lines are cut short, or two voices end up overlapping. Stating the ratio
+    here means that is a known quantity from the adaptation stage onward rather than
+    something inferred from an audio artefact at the end.
+    """
+
+    spans = [(line.start, line.end) for line in dialogue]
+    if not spans:
+        return
+    rooms = placement_windows(spans, gap=settings.timing_min_line_gap)
+    rate = settings.translation_syllables_per_second
+    needed = sum(count_syllables(line.amharic) / rate for line in dialogue)
+    available = sum(rooms)
+    if available <= 0:
+        return
+
+    over = sum(
+        1
+        for line, room in zip(dialogue, rooms)
+        if count_syllables(line.amharic) > max(1, round(room * rate))
+    )
+    ratio = needed / available
+    report(
+        f"  dialogue fit: {needed:.1f}s of Amharic in {available:.1f}s available "
+        f"({ratio:.2f}x), {over} line(s) over their own time"
+    )
+    if ratio > 1.0:
+        report(
+            "        - the Amharic is longer than the film's dialogue time; the timing "
+            "stage will use the silence between lines first, then speed lines up to "
+            f"{settings.timing_max_tempo:g}x, and only then cut a line short"
+        )
+
+
 def run_pipeline(
     source: str | Path,
     *,
@@ -474,6 +520,10 @@ def run_pipeline(
             "  adaptation: NLLB translates line by line; scene/character context and "
             "length enforcement are not applied"
         )
+        # Whether the Amharic can be spoken in the time the film gives it is the number
+        # that decides whether the dub fits or has to be squashed, so it is measured and
+        # stated here rather than left to be discovered from the timing report later.
+        _report_dialogue_fit(dialogue, resolved, report)
     elif bible:
         report(f"  dialogue bible: {len(bible)} character(s) applied")
     if not dialogue:

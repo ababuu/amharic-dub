@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import types
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -1319,3 +1320,100 @@ def test_a_failing_batch_fails_the_whole_call(monkeypatch):
 
     # The call stops at the failure instead of returning a partial adaptation.
     assert len(FakeOpenAI.requests) == 2
+
+
+# ---------------------------------------------------------------------------
+# Re-asking NLLB for a shorter rendering of a line that will not fit
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedTranslator:
+    """Returns a chosen rendering per length penalty, so a retry can be observed."""
+
+    def __init__(self, plain: str, shorter: str | None) -> None:
+        self.plain = plain
+        self.shorter = shorter
+        self.calls: list[float | None] = []
+
+    def translate(self, text: str, *, length_penalty: float | None = None):
+        self.calls.append(length_penalty)
+        body = self.plain if length_penalty is None else (self.shorter or self.plain)
+        return SimpleNamespace(text=body, source_text=text, chunks=1)
+
+
+def _nllb_settings(**overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "input_dir": "input",
+        "work_dir": "work",
+        "output_dir": "output",
+        "model_cache_dir": "models",
+        "translation_backend": "nllb",
+        "timing_min_line_gap": 0.12,
+        "translation_syllables_per_second": 4.0,
+        "translation_shorten_penalty": 0.6,
+    }
+    values.update(overrides)
+    return Settings(**values)  # type: ignore[arg-type]
+
+
+def _transcript(start: float, end: float, text: str = "hello there"):
+    return [TranscriptSegment(speaker_id="SPEAKER_00", start=start, end=end, text=text)]
+
+
+def test_a_line_that_fits_is_translated_once() -> None:
+    """The extra pass costs a generation, so it is only spent where it is needed."""
+
+    engine = _ScriptedTranslator("ሰላም።", "ሰላም።")
+
+    translation.adapt_dialogue(_transcript(0.0, 5.0), settings=_nllb_settings(),
+                               translator=engine)
+
+    assert engine.calls == [None]
+
+
+def test_a_line_that_cannot_fit_is_re_asked_for_a_shorter_rendering() -> None:
+    """A shorter rendering of the same sentence is the cheapest place to find time."""
+
+    # A 1.0s window: 4 syllables is the budget, so 12 will not fit.
+    over = "ሰላም ሰላም ሰላም ሰላም ሰላም ሰላም።"
+    engine = _ScriptedTranslator(over, "ሰላም።")
+
+    dialogue = translation.adapt_dialogue(
+        _transcript(0.0, 1.0), settings=_nllb_settings(), translator=engine
+    )
+
+    assert engine.calls == [None, 0.6]
+    assert dialogue[0].amharic == "ሰላም።"
+
+
+def test_a_retry_that_is_not_shorter_is_discarded() -> None:
+    """The first rendering stays unless the second really improves the length."""
+
+    over = "ሰላም ሰላም ሰላም ሰላም ሰላም ሰላም።"
+    engine = _ScriptedTranslator(over, "ጣፋጭ ጣፋጭ ጣፋጭ ጣፋጭ ጣፋጭ ጣፋጭ።")
+
+    dialogue = translation.adapt_dialogue(
+        _transcript(0.0, 1.0), settings=_nllb_settings(), translator=engine
+    )
+
+    assert dialogue[0].amharic == over
+
+
+def test_a_failed_retry_leaves_the_usable_rendering_in_place() -> None:
+    """A best-effort improvement must never lose a line that already translated."""
+
+    class _Failing(_ScriptedTranslator):
+        def translate(self, text, *, length_penalty=None):
+            self.calls.append(length_penalty)
+            if length_penalty is not None:
+                raise RuntimeError("boom")
+            return SimpleNamespace(text=self.plain, source_text=text, chunks=1)
+
+    over = "ሰላም ሰላም ሰላም ሰላም ሰላም ሰላም።"
+    engine = _Failing(over, None)
+
+    dialogue = translation.adapt_dialogue(
+        _transcript(0.0, 1.0), settings=_nllb_settings(), translator=engine
+    )
+
+    assert dialogue[0].amharic == over

@@ -712,15 +712,28 @@ def test_the_rate_never_leaves_the_band_the_timing_stage_uses() -> None:
     assert 0.8 <= asked <= 1.25
 
 
-def test_a_slow_line_asks_for_a_slower_rate() -> None:
+def test_a_slow_line_is_left_to_the_timing_stage() -> None:
+    """Fitting one down into a longer window needs no request to the model.
+
+    Drawing a line out by asking for a slower rate buys nothing over letting the timing
+    stage place it, and it costs a generation.
+    """
+
     plan = PacingPlan(film_rate=1.0, minimum=0.8, maximum=1.25)
     # 4 syllables at 4/second is 1 second of speech in a 4-second window.
     line = _line(start=0.0, end=4.0, amharic="ሰ" * 4)
 
-    asked = tts.requested_speaking_rate(line, plan=plan)
+    assert tts.requested_speaking_rate(line, plan=plan) is None
 
-    assert asked is not None
-    assert 0.8 <= asked < 1.0
+
+def test_a_line_that_needs_nothing_is_not_speed_up_by_the_film_rate() -> None:
+    """A comfortable line must not inherit a film-wide speed-up it does not need."""
+
+    plan = PacingPlan(film_rate=1.25, minimum=0.8, maximum=1.25)
+    # 8 syllables at 4/second is 2 seconds, exactly the window.
+    line = _line(start=0.0, end=2.0, amharic="ሰ" * 8)
+
+    assert tts.requested_speaking_rate(line, plan=plan) is None
 
 
 def test_a_line_that_already_fits_asks_for_nothing() -> None:

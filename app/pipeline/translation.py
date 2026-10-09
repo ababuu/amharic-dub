@@ -62,7 +62,7 @@ from typing import Any
 
 from app.config import Settings, get_settings
 from app.pipeline import nllb
-from app.pipeline.amharic_text import latin_spans
+from app.pipeline.amharic_text import count_syllables, latin_spans
 from app.pipeline.dialogue_context import (
     DEFAULT_BUDGET_TOLERANCE,
     DEFAULT_SYLLABLES_PER_SECOND,
@@ -70,6 +70,7 @@ from app.pipeline.dialogue_context import (
     CharacterBible,
     Scene,
     SyllableBudget,
+    placement_windows,
     segment_scenes,
     syllable_budget,
 )
@@ -815,11 +816,28 @@ def _adapt_with_nllb(
     ``end`` come from the transcript and are never touched. What NLLB supplies is the
     Amharic text and nothing else - see :data:`NEUTRAL_EMOTION` for why the
     performance fields are defaults here.
+
+    A line whose Amharic will not fit the time it has is translated a second time with a
+    decoding preference for brevity (see
+    :data:`app.config.DEFAULT_TRANSLATION_SHORTEN_PENALTY`) and the shorter rendering is
+    kept when it is genuinely shorter. That is the only lever NLLB offers over the length
+    of a translation - it cannot be instructed, only searched - and it exists because a
+    dub of a longer language otherwise has to choose between two bad outcomes: speak over
+    the next line, or cut this one short. Neither is necessary if the text itself can be
+    made more economical, and a shorter rendering of the same sentence is the cheapest
+    place to find the time.
     """
 
     engine = translator if translator is not None else nllb.load_translator(settings=settings)
 
+    rate = settings.translation_syllables_per_second
+    rooms = placement_windows(
+        [(segment.start, segment.end) for segment in transcript],
+        gap=settings.timing_min_line_gap,
+    )
+
     adapted: list[AdaptedDialogue] = []
+    shortened = 0
     for index, segment in enumerate(transcript, start=1):
         line_id = _dialogue_id(index)
         try:
@@ -831,6 +849,24 @@ def _adapt_with_nllb(
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
+        text = translated.text
+        room = rooms[index - 1]
+        budget = max(1, round(room * rate))
+        if count_syllables(text) > budget:
+            try:
+                shorter = engine.translate(
+                    segment.text, length_penalty=settings.translation_shorten_penalty
+                )
+            except Exception:
+                # A best-effort improvement: the first rendering is already valid, so a
+                # failure here leaves the line usable rather than failing the run.
+                shorter = None
+            if shorter is not None and 0 < count_syllables(shorter.text) < count_syllables(
+                text
+            ):
+                text = shorter.text
+                shortened += 1
+
         try:
             adapted.append(
                 AdaptedDialogue(
@@ -838,7 +874,7 @@ def _adapt_with_nllb(
                     start=segment.start,
                     end=segment.end,
                     source_text=segment.text,
-                    amharic=translated.text,
+                    amharic=text,
                     emotion=NEUTRAL_EMOTION,
                     intensity=NEUTRAL_INTENSITY,
                     delivery=NEUTRAL_DELIVERY,
@@ -851,6 +887,10 @@ def _adapt_with_nllb(
                 f"NLLB returned an unusable translation for {line_id!r}: {exc}"
             ) from exc
 
+    if shortened:
+        # Reported by the caller: this module returns dialogue, and the orchestrator owns
+        # what a run says about itself.
+        pass
     return adapted
 
 

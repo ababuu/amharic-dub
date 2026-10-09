@@ -16,6 +16,10 @@ from app.config import (
     DEFAULT_SEED_VC_DIFFUSION_STEPS,
     DEFAULT_SEED_VC_REPO_NAME,
     DEFAULT_TIMING_MAX_TEMPO,
+    DEFAULT_TIMING_MIN_LINE_GAP,
+    DEFAULT_TRANSLATION_LENGTH_PENALTY,
+    DEFAULT_TRANSLATION_SHORTEN_PENALTY,
+    DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND,
     DEFAULT_TIMING_MIN_TEMPO,
     DEFAULT_TRANSCRIPTION_COMPUTE_TYPE,
     DEFAULT_TRANSCRIPTION_MODEL,
@@ -526,3 +530,26 @@ def test_a_malformed_mix_level_is_rejected(
 
 def test_get_settings_is_cached() -> None:
     assert get_settings() is get_settings()
+
+
+def test_the_syllable_prior_matches_the_adaptation_prompt() -> None:
+    """Two copies of one prior, so they must not drift apart."""
+
+    from app.pipeline.dialogue_context import DEFAULT_SYLLABLES_PER_SECOND
+
+    assert (
+        DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND == DEFAULT_SYLLABLES_PER_SECOND
+    )
+
+
+def test_the_default_length_penalty_leaves_the_model_alone() -> None:
+    """Only a line that will not fit should be searched for brevity."""
+
+    assert DEFAULT_TRANSLATION_LENGTH_PENALTY == 1.0
+    assert 0.0 < DEFAULT_TRANSLATION_SHORTEN_PENALTY < 1.0
+
+
+def test_the_line_gap_is_positive_and_small() -> None:
+    """It exists to keep two voices apart without giving up usable silence."""
+
+    assert 0.0 < DEFAULT_TIMING_MIN_LINE_GAP <= 0.5

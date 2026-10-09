@@ -149,6 +149,34 @@ DEFAULT_TRANSLATION_NUM_BEAMS = 1
 #: shape it.
 DEFAULT_TRANSLATION_MAX_NEW_TOKENS = 512
 
+#: NLLB's decoding preference over the *length* of its output. ``1.0`` is the model's own
+#: balance; below it the search favours shorter renderings, above it longer ones.
+#:
+#: This matters more here than in ordinary translation. Amharic does not express the same
+#: idea in the same number of syllables as English, so a faithful translation of film
+#: dialogue routinely needs about twice the time the English line occupied - measured on a
+#: real run, the delivered speech came to 117s against 63s of original window. A dub can
+#: recover about a third of that from the silence between lines, and the rest has to come
+#: out of the text. NLLB cannot be *told* to be brief, but it can be *searched* for
+#: brevity, and this is that control. Left at the model's own default; see
+#: :data:`DEFAULT_TRANSLATION_SHORTEN_PENALTY` for the second pass.
+DEFAULT_TRANSLATION_LENGTH_PENALTY = 1.0
+
+#: The length penalty a line is re-translated with when it will not fit the time it has.
+#: Below 1.0, because the only thing wrong with the first attempt is that it is too long.
+#: The shorter rendering is used only if it is actually shorter and still non-empty, and
+#: the choice is reported, so this trades a little literalness for a line that can be
+#: spoken in the time available.
+DEFAULT_TRANSLATION_SHORTEN_PENALTY = 0.6
+
+#: Syllables per second an Amharic performer delivers, used to turn a span of time into a
+#: syllable budget. Measured at about 4.6 syllables/second on real synthesized output, and
+#: kept a little slower than that on purpose: asking a line to fit when it comfortably
+#: can is harmless, while asking one to fit when it cannot leads to it being cut.
+#: ``app.pipeline.dialogue_context.DEFAULT_SYLLABLES_PER_SECOND`` holds the same prior
+#: for the adaptation prompt, and a test keeps the two in step.
+DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND = 4.0
+
 #: DeepSeek API endpoint. The official endpoint is OpenAI-compatible.
 DEFAULT_TRANSLATION_BASE_URL = "https://api.deepseek.com"
 
@@ -314,6 +342,15 @@ DEFAULT_TTS_REQUEST_RATE = True
 #: accepts factors between 0.5 and 2.0, which bounds any configuration here.
 DEFAULT_TIMING_MIN_TEMPO = 0.80
 DEFAULT_TIMING_MAX_TEMPO = 1.25
+
+#: Silence kept between one dubbed line and the next, in seconds.
+#:
+#: A line may run past its own original window into the silence that follows it, which is
+#: what keeps a language longer than English from being squashed, but it must stop this
+#: far short of the next line. Below the guard, two voices are audible at once and the
+#: dub stops being intelligible; the guard is small because the silence between film
+#: lines is usually short and worth using.
+DEFAULT_TIMING_MIN_LINE_GAP = 0.12
 
 #: Level of the dubbed dialogue in the final mix, in dB relative to the clips the
 #: TTS stage produced. Never a boost by default: the dialogue was generated at a
@@ -524,6 +561,9 @@ class Settings:
     translation_disable_thinking: bool = True
     translation_num_beams: int = DEFAULT_TRANSLATION_NUM_BEAMS
     translation_max_new_tokens: int = DEFAULT_TRANSLATION_MAX_NEW_TOKENS
+    translation_length_penalty: float = DEFAULT_TRANSLATION_LENGTH_PENALTY
+    translation_shorten_penalty: float = DEFAULT_TRANSLATION_SHORTEN_PENALTY
+    translation_syllables_per_second: float = DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND
     translation_enforce_budget: bool = DEFAULT_TRANSLATION_ENFORCE_BUDGET
     translation_enforce_fidel_loanwords: bool = (
         DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS
@@ -566,9 +606,11 @@ class Settings:
     tts_continue_on_failure: bool = DEFAULT_TTS_CONTINUE_ON_FAILURE
     tts_request_rate: bool = DEFAULT_TTS_REQUEST_RATE
     #: Timing settings for :mod:`app.pipeline.timing`: the tempo band a line may
-    #: be stretched within to fit its original window.
+    #: be stretched within to fit the time it has, and the silence kept before
+    #: the next line so two voices are never heard at once.
     timing_min_tempo: float = DEFAULT_TIMING_MIN_TEMPO
     timing_max_tempo: float = DEFAULT_TIMING_MAX_TEMPO
+    timing_min_line_gap: float = DEFAULT_TIMING_MIN_LINE_GAP
     #: Mix settings for :mod:`app.pipeline.mixing`: the dialogue level and how far
     #: the music and effects are ducked under it.
     mix_dialogue_gain_db: float = DEFAULT_MIX_DIALOGUE_GAIN_DB
@@ -633,6 +675,16 @@ class Settings:
             ),
             translation_max_new_tokens=_read_int(
                 "TRANSLATION_MAX_NEW_TOKENS", DEFAULT_TRANSLATION_MAX_NEW_TOKENS
+            ),
+            translation_length_penalty=_read_float(
+                "TRANSLATION_LENGTH_PENALTY", DEFAULT_TRANSLATION_LENGTH_PENALTY
+            ),
+            translation_shorten_penalty=_read_float(
+                "TRANSLATION_SHORTEN_PENALTY", DEFAULT_TRANSLATION_SHORTEN_PENALTY
+            ),
+            translation_syllables_per_second=_read_float(
+                "TRANSLATION_SYLLABLES_PER_SECOND",
+                DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND,
             ),
             translation_enforce_budget=_read_bool(
                 "TRANSLATION_ENFORCE_BUDGET", DEFAULT_TRANSLATION_ENFORCE_BUDGET
@@ -710,6 +762,9 @@ class Settings:
             ),
             timing_min_tempo=_read_float("TIMING_MIN_TEMPO", DEFAULT_TIMING_MIN_TEMPO),
             timing_max_tempo=_read_float("TIMING_MAX_TEMPO", DEFAULT_TIMING_MAX_TEMPO),
+            timing_min_line_gap=_read_float(
+                "TIMING_MIN_LINE_GAP", DEFAULT_TIMING_MIN_LINE_GAP
+            ),
             mix_dialogue_gain_db=_read_signed_float(
                 "MIX_DIALOGUE_GAIN_DB", DEFAULT_MIX_DIALOGUE_GAIN_DB
             ),
@@ -782,6 +837,9 @@ class Settings:
             "translation_disable_thinking": self.translation_disable_thinking,
             "translation_num_beams": self.translation_num_beams,
             "translation_max_new_tokens": self.translation_max_new_tokens,
+            "translation_length_penalty": self.translation_length_penalty,
+            "translation_shorten_penalty": self.translation_shorten_penalty,
+            "translation_syllables_per_second": self.translation_syllables_per_second,
             "translation_enforce_budget": self.translation_enforce_budget,
             "translation_enforce_fidel_loanwords": (
                 self.translation_enforce_fidel_loanwords
@@ -816,6 +874,7 @@ class Settings:
             "tts_request_rate": self.tts_request_rate,
             "timing_min_tempo": self.timing_min_tempo,
             "timing_max_tempo": self.timing_max_tempo,
+            "timing_min_line_gap": self.timing_min_line_gap,
             "mix_dialogue_gain_db": self.mix_dialogue_gain_db,
             "mix_duck_db": self.mix_duck_db,
         }
@@ -856,7 +915,10 @@ __all__ = [
     "DEFAULT_TRANSLATION_BATCH_SIZE",
     "DEFAULT_TRANSLATION_ENFORCE_BUDGET",
     "DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS",
+    "DEFAULT_TRANSLATION_LENGTH_PENALTY",
     "DEFAULT_TRANSLATION_MODEL",
+    "DEFAULT_TRANSLATION_SHORTEN_PENALTY",
+    "DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND",
     "DEFAULT_TTS_CONTINUE_ON_FAILURE",
     "DEFAULT_TTS_MAX_PAUSE_SECONDS",
     "DEFAULT_TTS_MIN_LINE_SECONDS",
@@ -865,6 +927,7 @@ __all__ = [
     "DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
     "DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
     "DEFAULT_TIMING_MAX_TEMPO",
+    "DEFAULT_TIMING_MIN_LINE_GAP",
     "DEFAULT_TIMING_MIN_TEMPO",
     "DEFAULT_VOICE_PROFILE_DIR",
     "DEFAULT_VOICE_REFERENCE_MAX_DURATION",

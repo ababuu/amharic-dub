@@ -512,6 +512,64 @@ DEFAULT_LOCAL_TEMPO_MAX = 1.1
 #: asking for it costs a different generation.
 DEFAULT_PACING_TOLERANCE = 0.02
 
+#: Silence kept between one dubbed line and the next, in seconds.
+#:
+#: A line may run past its own original window into the silence that follows it - that
+#: silence is there, and using it is what keeps a longer language from being squashed -
+#: but it must stop this far short of the next line, or two voices speak at once.
+DEFAULT_MIN_LINE_GAP = 0.12
+
+#: Floor for the room a line is told it has. Never used in practice - a line with no
+#: room at all is rejected upstream as unspeakable - but it keeps the arithmetic below
+#: from dividing by zero on a pathological transcript.
+MINIMUM_PLACEMENT_WINDOW = 0.05
+
+
+def placement_windows(
+    spans: Sequence[tuple[float, float]],
+    *,
+    gap: float = DEFAULT_MIN_LINE_GAP,
+) -> tuple[float, ...]:
+    """Return how long each line's speech may run before the next line starts.
+
+    ``spans`` is one ``(start, end)`` pair per line on the source timeline, in order.
+    Each line is told the room it has from its own start up to ``gap`` seconds before the
+    next line begins. The last line has no successor, so it keeps its own window.
+
+    This is the number the whole pipeline should be aiming at, and it is not the same as
+    a line's own window. The original actor spoke English, and Amharic does not fit the
+    same idea into the same number of syllables - so a faithful translation routinely
+    overruns the window the English occupied. What it must not do is overrun into the
+    *next* line, because that is two voices at once. The silence between lines is spare
+    room that a dub is entitled to use: it is already empty, and using it is what lets a
+    longer language keep its natural pace instead of being squashed to fit.
+    """
+
+    if not math.isfinite(gap) or gap < 0:
+        raise InvalidBudgetError(
+            f"the minimum line gap must be a non-negative number, got {gap!r}"
+        )
+
+    ordered: list[tuple[float, float]] = []
+    for start, end in spans:
+        begin = _seconds("start", start)
+        finish = _seconds("end", end)
+        if finish < begin:
+            raise InvalidBudgetError(
+                f"a line cannot end ({finish}) before it starts ({begin})"
+            )
+        ordered.append((begin, finish))
+
+    windows: list[float] = []
+    for index, (begin, finish) in enumerate(ordered):
+        own = finish - begin
+        if index + 1 < len(ordered):
+            room = ordered[index + 1][0] - begin - gap
+        else:
+            room = own
+        windows.append(max(room, MINIMUM_PLACEMENT_WINDOW))
+    return tuple(windows)
+
 
 @dataclass(frozen=True, slots=True)
 class PacingPlan:
@@ -574,12 +632,21 @@ class PacingPlan:
         if not math.isfinite(wanted) or wanted <= 0:
             return None
 
+        # A line that already fits is left at the model's own pace. The film rate exists
+        # to spread the cost of a language that runs long, and applying it to a line that
+        # needs nothing would speed up comfortable dialogue for no reason - the audience
+        # hears a rushed line, not a consistent film. A line that is *short* is likewise
+        # left alone: fitting one down into a longer window is the timing stage's job, and
+        # it does it without asking the model to drawl.
+        if wanted <= 1.0 + self.tolerance:
+            return None
+
         # ...reached from the film's own speed, by a correction small enough that the
-        # delivery stays even. Bounded at both ends: by the local band, so one line
-        # cannot wander off alone, and by the global band, because when the film rate is
-        # already at its limit there is no headroom left for a local correction to use -
-        # without that second clamp a typical line would be asked for 1.375, past the
-        # limit the timing stage is allowed to stretch to.
+        # delivery stays even. Bounded at both ends: by the local band, so one line cannot
+        # wander off alone, and by the global band, because when the film rate is already
+        # at its limit there is no headroom left for a local correction to use - without
+        # that second clamp a typical line would be asked for 1.375, past the limit the
+        # timing stage is allowed to stretch to.
         local = min(max(wanted / self.film_rate, self.local_minimum), self.local_maximum)
         rate = min(max(self.film_rate * local, self.minimum), self.maximum)
 
@@ -719,7 +786,9 @@ __all__ = [
     "DEFAULT_BUDGET_TOLERANCE",
     "DEFAULT_LOCAL_TEMPO_MAX",
     "DEFAULT_LOCAL_TEMPO_MIN",
+    "DEFAULT_MIN_LINE_GAP",
     "DEFAULT_PACING_TOLERANCE",
+    "MINIMUM_PLACEMENT_WINDOW",
     "DEFAULT_SCENE_GAP_SECONDS",
     "DEFAULT_SCENE_MAX_SECONDS",
     "DEFAULT_SYLLABLES_PER_SECOND",
@@ -732,6 +801,7 @@ __all__ = [
     "InvalidCharacterError",
     "InvalidSceneError",
     "PacingPlan",
+    "placement_windows",
     "plan_pacing",
     "Scene",
     "SyllableBudget",

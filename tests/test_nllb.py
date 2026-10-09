@@ -436,3 +436,39 @@ def test_the_cache_can_be_reset(monkeypatch) -> None:
     second = load_translator(settings=settings)
 
     assert first is not second
+
+
+def test_the_length_penalty_reaches_the_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The only lever NLLB offers over how long a translation comes out."""
+
+    _patch(monkeypatch)
+    translator = NllbTranslator(model="facebook/nllb-200-distilled-1.3B")
+
+    translator.translate("hello", length_penalty=0.6)
+
+    assert FakeNetwork.instances[0].generates[-1]["length_penalty"] == 0.6
+
+
+def test_the_configured_penalty_is_used_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch)
+    translator = NllbTranslator(
+        model="facebook/nllb-200-distilled-1.3B", length_penalty=0.75
+    )
+
+    translator.translate("hello")
+
+    assert FakeNetwork.instances[0].generates[-1]["length_penalty"] == 0.75
+
+
+def test_the_model_default_is_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch)
+
+    NllbTranslator(model="facebook/nllb-200-distilled-1.3B").translate("hello")
+
+    assert FakeNetwork.instances[0].generates[-1]["length_penalty"] == 1.0
+
+
+@pytest.mark.parametrize("penalty", [0.0, -1.0, float("nan"), float("inf")])
+def test_an_unusable_length_penalty_is_rejected(penalty: float) -> None:
+    with pytest.raises(ModelInitializationError, match="length penalty"):
+        NllbTranslator(model="facebook/nllb-200-distilled-1.3B", length_penalty=penalty)

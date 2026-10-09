@@ -579,3 +579,118 @@ def test_real_ffmpeg_stretches_a_line_to_its_window(tmp_path: Path) -> None:
     info = sf.info(str(aligned.audio_path))
     assert info.samplerate == PIPELINE_SAMPLE_RATE
     assert info.frames / info.samplerate == pytest.approx(LEAD + 0.8 + TRAIL, abs=0.03)
+
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# The room a line has before the next one starts
+# ---------------------------------------------------------------------------
+
+
+def _pair(
+    root: Path,
+    *,
+    first_speech: float = SPEECH,
+    first_window: float = 0.8,
+    gap: float = 0.4,
+) -> list[TtsClip]:
+    """Two clips, with real audio files, spaced ``gap`` apart on the timeline."""
+
+    first = _clip(
+        root,
+        index=0,
+        start=5.0,
+        end=5.0 + first_window,
+        audio=_clip_file(root, speech=first_speech, name="first"),
+        speech=first_speech,
+    )
+    second = _clip(
+        root,
+        index=1,
+        start=5.0 + first_window + gap,
+        end=5.0 + first_window + gap + 0.8,
+        audio=_clip_file(root, speech=SPEECH, name="second"),
+    )
+    return [first, second]
+
+
+def test_a_line_may_use_the_silence_after_it(tmp_path: Path) -> None:
+    """Amharic needs longer than the English it replaces, and a gap is spare room.
+
+    Fitting strictly to the original window is what forces a longer language to be
+    squashed; the silence before the next line is already empty, and using it is what
+    lets the line keep its natural pace.
+    """
+
+    # 1.0s of speech in a 0.8s window, with 2.0s of silence before the next line.
+    clips = _pair(tmp_path, first_speech=1.0, first_window=0.8, gap=2.0)
+
+    aligned = align_dialogue(
+        clips, output_dir=tmp_path / "w", settings=_settings(tmp_path)
+    )
+
+    first = aligned[0]
+    assert first.available is not None and first.available > 2.0
+    assert first.tempo == pytest.approx(1.0, abs=0.01)
+    assert first.trimmed == 0.0
+
+
+def test_a_line_still_too_long_is_cut_rather_than_spoken_over(
+    tmp_path: Path,
+) -> None:
+    """Two voices at once is unintelligible, so a cut is the lesser evil - and reported."""
+
+    # 4.0s of speech in a 0.8s window with the next line only 0.4s away: even the tempo
+    # limit cannot fit it, so the tail is faded out short of the next line.
+    clips = _pair(tmp_path, first_speech=4.0, first_window=0.8, gap=0.4)
+
+    aligned = align_dialogue(
+        clips, output_dir=tmp_path / "w", settings=_settings(tmp_path)
+    )
+
+    first = aligned[0]
+    assert first.trimmed > 0
+    assert any("not spoken over" in note for note in first.notes)
+    # The guarantee this whole change exists for.
+    assert first.end <= aligned[1].start + 1e-6
+
+
+def test_nothing_is_cut_when_there_is_no_next_line(tmp_path: Path) -> None:
+    """A lone line harms nobody by running long, so cutting it would be gratuitous."""
+
+    clip = _clip(
+        tmp_path,
+        start=5.0,
+        end=5.8,
+        audio=_clip_file(tmp_path, speech=4.0, name="lone"),
+        speech=4.0,
+    )
+
+    aligned = align_clip(clip, tmp_path / "a.wav", settings=_settings(tmp_path))
+
+    assert aligned.trimmed == 0.0
+    assert aligned.available == pytest.approx(0.8)
+
+
+def test_lines_never_overlap_across_a_whole_dialogue(tmp_path: Path) -> None:
+    """The property the change exists for: no two dubbed lines sound at once."""
+
+    clips = [
+        _clip(
+            tmp_path,
+            index=i,
+            start=5.0 + i * 1.1,
+            end=5.8 + i * 1.1,
+            audio=_clip_file(tmp_path, speech=1.4, name=f"c{i}"),
+            speech=1.4,
+        )
+        for i in range(6)
+    ]
+
+    aligned = align_dialogue(
+        clips, output_dir=tmp_path / "w", settings=_settings(tmp_path)
+    )
+
+    for earlier, later in zip(aligned, aligned[1:]):
+        assert earlier.end <= later.start + 1e-6

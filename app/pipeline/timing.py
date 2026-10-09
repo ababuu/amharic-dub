@@ -39,6 +39,7 @@ import numpy as np
 import soundfile as sf
 
 from app.config import Settings, get_settings
+from app.pipeline.dialogue_context import MINIMUM_PLACEMENT_WINDOW
 from app.pipeline.tts import TtsClip
 from app.pipeline.voice_profiles import portable_path
 
@@ -61,6 +62,10 @@ EXACT_FIT_TOLERANCE_SECONDS = 0.03
 #: it is rejected instead of producing an unusable filter argument.
 ATEMPO_MIN = 0.5
 ATEMPO_MAX = 2.0
+
+#: Length of the fade applied to the tail of a line that has to be cut short, in
+#: seconds. Long enough that the cut is inaudible, short enough not to lose a syllable.
+TRIM_FADE_SECONDS = 0.025
 
 
 class TimingError(RuntimeError):
@@ -114,6 +119,12 @@ class AlignedClip:
     rendered_pause_before: float
     rendered_pause_after: float
     notes: tuple[str, ...] = ()
+    #: Seconds of speech this line was allowed before it would run into the next one.
+    #: Equal to ``original_window`` when the line was considered alone.
+    available: float | None = None
+    #: Seconds cut off the end, with a fade, because the line could not fit even at the
+    #: tempo limit. Non-zero means the translation was longer than the time available.
+    trimmed: float = 0.0
 
     def __post_init__(self) -> None:
         if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
@@ -374,13 +385,41 @@ def _stretched_speech(
     return samples, rate
 
 
+def _fade_out(
+    samples: np.ndarray,
+    sample_rate: int,
+    seconds: float = TRIM_FADE_SECONDS,
+) -> np.ndarray:
+    """Return ``samples`` with its tail faded to silence.
+
+    Used only when a line has to be cut short. Cutting mid-waveform is a click; a fade
+    over a few tens of milliseconds is inaudible, and the speech that is kept is not
+    altered at all.
+    """
+
+    count = min(int(round(seconds * sample_rate)), samples.shape[0])
+    if count <= 1:
+        return samples
+    faded = np.array(samples, dtype=np.float32, copy=True)
+    faded[-count:] *= np.linspace(1.0, 0.0, count, dtype=np.float32)
+    return faded
+
+
+def _audio_start(clip: TtsClip) -> float:
+    """Return where a clip's file begins on the source timeline."""
+
+    lead = min(clip.rendered_pause_before, clip.dialogue.start)
+    return clip.dialogue.start - lead
+
+
 def align_clip(
     clip: TtsClip,
     destination: str | Path,
     *,
     settings: Settings | None = None,
+    room: float | None = None,
 ) -> AlignedClip:
-    """Fit one clip to its original window and describe where to place it.
+    """Fit one clip to its window, and describe where to place it.
 
     Parameters
     ----------
@@ -390,10 +429,24 @@ def align_clip(
         File to write the aligned line to. Created, with its parents, when missing.
     settings:
         Project settings override; the tempo band comes from here.
+    room:
+        How many seconds of speech this line may occupy before it would run into the
+        next one, including any silence between them. ``None`` means "no more than its
+        own window", which is what a single clip considered alone can know.
 
     Returns
     -------
     AlignedClip
+
+    Notes
+    -----
+    A line that fits its own window is fitted to that window, exactly: matching the
+    original timing is what keeps the dub in step with the picture. A line that *cannot*
+    fit is allowed to use the silence after it up to ``room`` before it is squashed at
+    all, because Amharic does not express the same idea in the same number of syllables
+    the English did and compressing hard to hit a window is what makes a dub sound
+    rushed. Only a line that still does not fit at the tempo limit is cut short, and that
+    is reported rather than done quietly.
     """
 
     resolved = settings if settings is not None else get_settings()
@@ -409,7 +462,10 @@ def align_clip(
 
     window = clip.dialogue.duration
     speech = clip.speech_duration
-    required = speech / window
+
+    limit = window if room is None else max(float(room), MINIMUM_PLACEMENT_WINDOW)
+    target = window if speech <= window else max(window, min(limit, speech))
+    required = speech / target
     within_tolerance = abs(speech - window) <= EXACT_FIT_TOLERANCE_SECONDS
     tempo = 1.0 if within_tolerance else _clamp(required, minimum, maximum)
 
@@ -420,17 +476,39 @@ def align_clip(
         tempo,
         Path(destination).with_name(f"{Path(destination).stem}.speech.wav"),
     )
-
     speech_duration = stretched.shape[0] / rate
-    residual = speech_duration - window
 
     notes: list[str] = []
+    trimmed = 0.0
+    # Only a line with a neighbour is cut. A line considered alone - the last line of a
+    # film, or a clip aligned on its own - harms nobody by running past its own window,
+    # so it is stretched as far as the band allows and the overrun is reported instead.
+    # Cutting audio there would be mangling for no benefit, which this stage does not do.
+    if room is not None and speech_duration > limit + EXACT_FIT_TOLERANCE_SECONDS:
+        # Even at the tempo limit this line is too long for the room it has, so it is cut
+        # before the next line begins. Overlapping the next line is the one outcome worth
+        # cutting audio to avoid: two voices at once is unintelligible, while a clipped
+        # ending is merely abrupt and is reported here.
+        keep = int(round(limit * rate))
+        if keep > 0:
+            trimmed = speech_duration - keep / rate
+            stretched = _fade_out(stretched[:keep], rate)
+            speech_duration = keep / rate
+            notes.append(
+                f"the line needed {required:.3f}x its own window but even the "
+                f"{limit:.3f}s available to it (up to the next line) only allows "
+                f"{maximum:g}x; the last {trimmed:.3f}s were cut with a fade so the "
+                "next line is not spoken over - the Amharic is longer than its window"
+            )
+
+    residual = speech_duration - window
+
     if within_tolerance:
         # Close enough that a filter would only add its own rounding.
         notes.append("already within the fit tolerance; no stretching applied")
-    elif abs(residual) > EXACT_FIT_TOLERANCE_SECONDS:
-        # Judged on the audio that was actually produced, not on the arithmetic
-        # that asked for it, so a clamp is only reported when it really shows.
+    elif abs(residual) > EXACT_FIT_TOLERANCE_SECONDS and trimmed == 0.0:
+        # Judged on the audio that was actually produced, not on the arithmetic that
+        # asked for it, so a clamp is only reported when it really shows.
         notes.append(
             f"an exact fit needed a tempo of {required:.3f}, outside "
             f"[{minimum:g}, {maximum:g}]; clamped to {tempo:.3f}, so the line "
@@ -476,6 +554,8 @@ def align_clip(
         rendered_pause_before=lead,
         rendered_pause_after=trail,
         notes=tuple(notes),
+        available=limit,
+        trimmed=trimmed,
     )
 
 
@@ -561,14 +641,30 @@ def align_dialogue(
     directory = resolve_timing_directory(output_dir, settings=resolved)
     directory.mkdir(parents=True, exist_ok=True)
 
+    # Each line is told the room it has before the next one begins. The next line's own
+    # leading pause is included, because that pause is part of where its audio starts and
+    # so is the earliest moment two lines could collide. Without this every line is fitted
+    # to its own window alone, and a line that cannot fit - which is most of them in a
+    # language longer than English - simply overruns into its neighbour and two voices
+    # speak at once.
+    guard = resolved.timing_min_line_gap
+    rooms: list[float | None] = []
+    for position, clip in enumerate(ordered):
+        if position + 1 >= len(ordered):
+            rooms.append(None)
+            continue
+        following = ordered[position + 1]
+        deadline = _audio_start(following) - guard
+        rooms.append(deadline - clip.dialogue.start - clip.rendered_pause_after)
+
     aligned: list[AlignedClip] = []
-    for clip in ordered:
+    for clip, room in zip(ordered, rooms):
         if not isinstance(clip, TtsClip):
             raise InvalidClipError(
                 f"expected a TtsClip, got {type(clip).__name__}"
             )
         destination = directory / f"{Path(clip.audio_path).stem}.wav"
-        aligned.append(align_clip(clip, destination, settings=resolved))
+        aligned.append(align_clip(clip, destination, settings=resolved, room=room))
 
     return aligned
 
@@ -587,6 +683,7 @@ __all__ = [
     "MissingFfmpegError",
     "MissingInputError",
     "StretchError",
+    "TRIM_FADE_SECONDS",
     "TimingError",
     "align_clip",
     "align_dialogue",

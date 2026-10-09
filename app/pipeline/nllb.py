@@ -141,6 +141,7 @@ class NllbTranslator:
         cache_dir: str | None = None,
         num_beams: int = 1,
         max_new_tokens: int = 512,
+        length_penalty: float = 1.0,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ModelInitializationError("TRANSLATION_MODEL must name an NLLB checkpoint")
@@ -156,12 +157,17 @@ class NllbTranslator:
             raise ModelInitializationError(
                 f"the output limit must be a positive integer, got {max_new_tokens!r}"
             )
+        if not math.isfinite(length_penalty) or length_penalty <= 0:
+            raise ModelInitializationError(
+                f"the length penalty must be a positive number, got {length_penalty!r}"
+            )
 
         self._model = model.strip()
         self._device = device.strip() or "cuda"
         self._cache_dir = cache_dir
         self._num_beams = num_beams
         self._max_new_tokens = max_new_tokens
+        self._length_penalty = float(length_penalty)
         self._tokenizer: Any | None = None
         self._network: Any | None = None
         self._torch: Any | None = None
@@ -232,18 +238,29 @@ class NllbTranslator:
 
         return self._tokenizer, self._network, self._torch
 
-    def translate(self, text: str) -> NllbTranslation:
-        """Translate one source line into Amharic."""
+    def translate(
+        self, text: str, *, length_penalty: float | None = None
+    ) -> NllbTranslation:
+        """Translate one source line into Amharic.
+
+        ``length_penalty`` overrides the decoding preference for one call. It is how a
+        line that will not fit the time it has is asked for a more economical rendering:
+        values below 1.0 bias the search towards shorter output, values above towards
+        longer. ``None`` uses the configured default.
+        """
 
         if not isinstance(text, str) or not text.strip():
             raise TranslationFailure("there is nothing to translate")
 
+        penalty = self._length_penalty if length_penalty is None else length_penalty
         chunks = _split_long_text(text.strip())
-        produced = [self._translate_chunk(chunk) for chunk in chunks]
+        produced = [
+            self._translate_chunk(chunk, length_penalty=penalty) for chunk in chunks
+        ]
         joined = " ".join(piece for piece in produced if piece)
         return NllbTranslation(text=joined, source_text=text, chunks=len(chunks))
 
-    def _translate_chunk(self, chunk: str) -> str:
+    def _translate_chunk(self, chunk: str, *, length_penalty: float) -> str:
         """Translate one chunk that is known to be short enough for the model."""
 
         tokenizer, network, torch = self._load()
@@ -269,6 +286,11 @@ class NllbTranslator:
                     forced_bos_token_id=self._target_token_id,
                     max_new_tokens=self._max_new_tokens,
                     num_beams=self._num_beams,
+                    # Biases the search towards shorter or longer renderings. At the
+                    # default 1.0 this is the model's own preference; a line that cannot
+                    # fit its time is re-asked lower, which is the only lever NLLB offers
+                    # over the *length* of a translation - it cannot be instructed.
+                    length_penalty=length_penalty,
                     # Greedy by default, so the same line always translates the same
                     # way and two runs can be compared.
                     do_sample=False,
@@ -291,7 +313,7 @@ class NllbTranslator:
         return decoded[0].strip()
 
 
-_TRANSLATORS: dict[tuple[str, str, str | None, int, int], NllbTranslator] = {}
+_TRANSLATORS: dict[tuple[str, str, str | None, int, int, float], NllbTranslator] = {}
 
 
 def load_translator(*, settings: Settings) -> NllbTranslator:
@@ -308,6 +330,7 @@ def load_translator(*, settings: Settings) -> NllbTranslator:
         str(settings.model_cache_dir),
         settings.translation_num_beams,
         settings.translation_max_new_tokens,
+        settings.translation_length_penalty,
     )
     translator = _TRANSLATORS.get(key)
     if translator is None:
@@ -317,6 +340,7 @@ def load_translator(*, settings: Settings) -> NllbTranslator:
             cache_dir=str(settings.model_cache_dir),
             num_beams=settings.translation_num_beams,
             max_new_tokens=settings.translation_max_new_tokens,
+            length_penalty=settings.translation_length_penalty,
         )
         _TRANSLATORS[key] = translator
     return translator
