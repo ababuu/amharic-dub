@@ -351,6 +351,8 @@ HF_HOME=/workspace/models_cache      # required on a Pod - see below
 MODEL_CACHE_DIR=/workspace/models_cache    # optional; defaults under the repo
 DEEPSEEK_API_KEY=...                 # optional - only for TRANSLATION_BACKEND=openai
 SEED_VC_REPO_PATH=/workspace/seed-vc       # optional - only for TTS_ENGINE=chatterbox
+OMNIVOICE_MODEL=k2-fsa/OmniVoice     # optional - which speech checkpoint to clone with
+TTS_ENGINE=omnivoice                 # optional - omnivoice | chatterbox | mms
 ```
 
 The default configuration (NLLB + MMS-TTS) is entirely local and needs no API key,
@@ -400,6 +402,21 @@ finally imports every runtime module to prove the result is usable:
 ```bash
 bash scripts/install_dependencies.sh
 ```
+
+**What the first run downloads** (measured from the repositories themselves, and why a
+network volume matters). Weights land in `HF_HOME`, not in the repository:
+
+| Model | Download | Note |
+| --- | --- | --- |
+| NLLB-200 `3.3B` (translation) | **16.4 GiB** | the largest single item; `facebook/nllb-200-distilled-1.3B` is 5.1 GiB and scores 49.3 against 52.2 d-chrF on Amharic |
+| OmniVoice (default speech) | 3.0 GiB | plus the Amharic fine-tune, 2.4 GiB, only if you A/B it |
+| faster-whisper `large-v3` | ~3 GiB | transcription |
+| BandIt v2 Multi | ~1 GiB | separation |
+| pyannote Community-1 | ~1 GiB | gated; needs the token |
+| MMS-TTS Amharic | 0.3 GiB | only for `TTS_ENGINE=mms` |
+
+Skip what you are not using: `scripts/validate_models.py` follows the configuration, so
+it loads only the engine and backend a run will actually use.
 
 Everything Chatterbox's code actually imports is declared in `requirements.txt`
 instead, which is why the manifest lists `s3tokenizer`, `conformer`, `diffusers`
