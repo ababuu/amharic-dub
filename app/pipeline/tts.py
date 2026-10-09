@@ -125,7 +125,6 @@ from app.config import (
 )
 from app.pipeline.amharic_text import count_syllables, has_pronounceable_text
 from app.pipeline.dialogue_context import (
-    DEFAULT_SYLLABLES_PER_SECOND,
     PacingPlan,
     plan_pacing,
 )
@@ -213,18 +212,14 @@ SEED_VC_CONFIG_PARTS = ("configs", "v2", "vc_wrapper.yaml")
 MINIMUM_SPEAKABLE_LINE_SECONDS = DEFAULT_TTS_MIN_LINE_SECONDS
 
 #: Shortest Amharic line worth synthesizing, in syllables. One Fidel character is one
-#: syllable, so this counts the script's own unit. Latin text counts as pronounceable
-#: too - an English-derived word is a word - so a borrowed word is never dropped for
-#: being written in Roman script; see :func:`app.pipeline.amharic_text.has_latin`.
+#: syllable, so this counts the script's own unit.
+#:
+#: The check that enforces this is :func:`app.pipeline.amharic_text.has_pronounceable_text`,
+#: not a bare syllable count, and deliberately so: Roman-script text counts as
+#: pronounceable too - an English-derived word is a word - so a borrowed word is never
+#: dropped for being written in Roman letters while it waits to be rewritten in Fidel.
+#: Counting syllables here would reject exactly those lines.
 MINIMUM_SPEAKABLE_SYLLABLES = 1
-
-#: Syllables per second an Amharic performer delivers, used to estimate how long a line
-#: would naturally take before a rate is requested of the engine. Measured at ~4.6
-#: syllables/second on real synthesized output; the value here is a little slower on
-#: purpose, because asking for a line that comes out too fast is worse than one that
-#: comes out slightly short and is then fitted. The film-wide part of the pacing policy
-#: lives in :mod:`app.pipeline.dialogue_context`, which owns how long a line should be.
-RATE_ESTIMATE_SYLLABLES_PER_SECOND = DEFAULT_SYLLABLES_PER_SECOND
 
 #: Seed-VC V2 runs in timbre-only mode by default: it replaces the character's
 #: voice and leaves the take's delivery alone. The flag means "also convert the
