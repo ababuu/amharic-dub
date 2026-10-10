@@ -388,11 +388,17 @@ create, configure, install, validate, run, collect. **Only the first three steps
 are setup** - after that a run is a single command, and the last step gets you the
 file.
 
+On a Pod whose network volume survived, **step 1 is already done and step 3 is a
+`git pull`** - the volume keeps the clone and the weights, so a returning session is
+two commands rather than a full setup.
+
 **1. Create the Pod.** From the official RunPod PyTorch image
 (`runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, which provides Python 3.12,
 PyTorch 2.8, CUDA 12.8 and FFmpeg) on an A40, with a **network volume mounted at
 `/workspace`**. The volume is what you actually want: without one, every session
-re-downloads many gigabytes of weights before doing any work.
+re-downloads about 8 GiB of weights before doing any work. Keeping the repository on
+the volume is also what makes a returning session cheap - clone and install once,
+then only `git pull`.
 
 **2. Configure it through Pod environment variables, and clone the project.** Set
 these in the Pod's **Environment Variables** section (one `KEY=VALUE` per line, or
@@ -402,18 +408,19 @@ and it survives reconnects:
 
 ```
 HUGGINGFACE_TOKEN=hf_...             # required - gated pyannote Community-1 weights
+DEEPSEEK_API_KEY=sk-...              # required - the default backend is an LLM
 HF_HOME=/workspace/models_cache      # required on a Pod - see below
 MODEL_CACHE_DIR=/workspace/models_cache    # optional; defaults under the repo
-DEEPSEEK_API_KEY=...                 # optional - only for TRANSLATION_BACKEND=openai
 SEED_VC_REPO_PATH=/workspace/seed-vc       # optional - only for TTS_ENGINE=chatterbox
 OMNIVOICE_MODEL=k2-fsa/OmniVoice     # optional - which speech checkpoint to clone with
 TTS_ENGINE=omnivoice                 # optional - omnivoice | chatterbox | mms
 ```
 
-The default configuration (NLLB + MMS-TTS) is entirely local and needs no API key,
-so `HUGGINGFACE_TOKEN` is the only credential to set. Add `DEEPSEEK_API_KEY` only
-if you switch to `TRANSLATION_BACKEND=openai`, which is also the only setting that
-makes the run call out to a third party at all.
+Under the defaults **both** credentials are required: the token for the gated
+diarization pipeline, and the key because dialogue adaptation is an LLM call. Setting
+`TRANSLATION_BACKEND=nllb` removes the key requirement and translates locally instead -
+`scripts/check_environment.py --full` reports which credentials the configured run
+actually needs, and never blocks on one it will not read.
 
 Create the Hugging Face token with the **Read** role, or as a fine-grained token
 with read access to the gated repository. The pipeline only ever downloads from the
@@ -459,16 +466,21 @@ bash scripts/install_dependencies.sh
 ```
 
 **What the first run downloads** (measured from the repositories themselves, and why a
-network volume matters). Weights land in `HF_HOME`, not in the repository:
+network volume matters). Weights land in `HF_HOME`, not in the repository. With the
+defaults — an LLM backend and OmniVoice — there is **no translation download at all**,
+because the translation is an API call:
 
 | Model | Download | Note |
 | --- | --- | --- |
-| NLLB-200 `3.3B` (translation) | **16.4 GiB** | the largest single item; `facebook/nllb-200-distilled-1.3B` is 5.1 GiB and scores 49.3 against 52.2 d-chrF on Amharic |
 | OmniVoice (default speech) | 3.0 GiB | plus the Amharic fine-tune, 2.4 GiB, only if you A/B it |
 | faster-whisper `large-v3` | ~3 GiB | transcription |
 | BandIt v2 Multi | ~1 GiB | separation |
 | pyannote Community-1 | ~1 GiB | gated; needs the token |
 | MMS-TTS Amharic | 0.3 GiB | only for `TTS_ENGINE=mms` |
+| NLLB-200 `3.3B` | 16.4 GiB | **only** for `TRANSLATION_BACKEND=nllb`; this is why the LLM backend is also the smaller setup |
+
+That is roughly **8 GiB** by default rather than 24 GiB, and the gated pyannote checkpoint
+plus the Hugging Face token are the only things standing between a fresh pod and a run.
 
 Skip what you are not using: `scripts/validate_models.py` follows the configuration, so
 it loads only the engine and backend a run will actually use.
