@@ -592,6 +592,26 @@ def test_an_unknown_thinking_level_is_rejected(monkeypatch):
         adapt_dialogue([_segment()], settings=_settings(translation_thinking="maximum"))
 
 
+def test_the_default_thinking_level_sends_nothing_at_all(monkeypatch):
+    """A compatibility endpoint may reject the field, and the run must still be pointed at it."""
+
+    _patch(monkeypatch)
+
+    settings = _settings(
+        translation_provider="gemini",
+        translation_model=DEFAULT_TRANSLATION_GEMINI_MODEL,
+        translation_thinking="default",
+    )
+    adapt_dialogue([_segment()], settings=settings)
+
+    request = FakeOpenAI.requests[0]
+    assert "reasoning_effort" not in request
+    assert "extra_body" not in request
+    # The run says the operator asked for the provider's own behaviour, rather than
+    # reporting a control the provider never had.
+    assert translation.describe_thinking(settings) == "gemini default (no thinking field sent)"
+
+
 # ---------------------------------------------------------------------------
 # Provider boundary
 #

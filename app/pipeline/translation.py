@@ -615,10 +615,11 @@ def _request_kwargs(
     return kwargs
 
 
-#: The reasoning levels a caller may ask for, weakest first. Providers differ in the
-#: *shape* of the control, not only in its name: Gemini takes a level, DeepSeek's hybrid
-#: models take an on/off switch, and a server named through ``other`` may take neither.
-_LEVELS_FOR_EFFORT = ("off", "low", "medium", "high")
+#: The reasoning levels a caller may ask for. Providers differ in the *shape* of the
+#: control, not only in its name: Gemini takes a level, DeepSeek's hybrid models take an
+#: on/off switch, and a server named through ``other`` may take neither. ``default``
+#: means "send nothing and let the provider decide" - see :func:`_thinking_request`.
+_THINKING_LEVELS = ("off", "low", "medium", "high", "default")
 
 
 def _thinking_request(settings: Settings) -> dict[str, Any]:
@@ -632,11 +633,19 @@ def _thinking_request(settings: Settings) -> dict[str, Any]:
 
     provider = settings.translation_provider_defaults
     level = (settings.translation_thinking or "").strip().lower()
-    if level not in _LEVELS_FOR_EFFORT:
+    if level not in _THINKING_LEVELS:
         raise ConfigurationError(
-            f"TRANSLATION_THINKING must be one of {', '.join(_LEVELS_FOR_EFFORT)}, "
+            f"TRANSLATION_THINKING must be one of {', '.join(_THINKING_LEVELS)}, "
             f"got {settings.translation_thinking!r}"
         )
+
+    if level == "default":
+        # Escape hatch, and the reason it exists: a compatibility endpoint is free to
+        # reject a field it does not know, and losing a whole film's run to that would
+        # be absurd when the model's own default is a reasonable answer. Sending nothing
+        # is a different request from sending the provider's default *value*, so both
+        # have to be expressible.
+        return {}
 
     if provider.supports_reasoning_effort:
         # Gemini 3 models cannot stop reasoning; the request can only lower it. So "off"
@@ -665,6 +674,9 @@ def describe_thinking(settings: Settings) -> str:
     provider = settings.translation_provider_defaults
     field = _thinking_request(settings)
 
+    if requested == "default":
+        # Not an absent control: the operator asked for the provider's own behaviour.
+        return f"{provider.name} default (no thinking field sent)"
     if not field:
         if provider.supports_thinking_switch:
             return (

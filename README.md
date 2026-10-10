@@ -150,6 +150,12 @@ pipeline never sends them. Gemini's OpenAI-compatible endpoint is documented as
 wrapped in a markdown fence or a sentence of preamble is unwrapped rather than failing a
 whole film's run, while a reply that is not a JSON object at all still fails.
 
+**If a first batch is rejected.** A beta endpoint is free to refuse a field it does not
+know, and a 400 on batch one would otherwise cost a whole pod run. `TRANSLATION_THINKING=default`
+sends no thinking field at all and lets the model use its own behaviour, which is the one
+thing that cannot be rejected. The run's `adaptation` line always states which of the two
+happened, so a manifest never claims a reasoning level the request did not carry.
+
 **What is not known.** No Google-published English-to-Amharic benchmark exists, and
 neither Gemini 3.8's nor DeepSeek's Amharic *dialogue* quality can be established from
 the literature - only from a native-speaker read of your own output. Free-tier
@@ -362,7 +368,7 @@ environment, so values configured on the RunPod pod always win.
 | `CHATTERBOX_MODEL`  | The Amharic adapter used when `TTS_ENGINE=chatterbox` | `gabar-tech/chatterbox-amharic` |
 | `TRANSLATION_BASE_URL` | OpenAI-compatible endpoint (only for `TRANSLATION_BACKEND=openai`). Unset, it follows `TRANSLATION_PROVIDER`; required for `other` | per provider |
 | `TRANSLATION_BATCH_SIZE` | Dialogue lines adapted per request           | `10`               |
-| `TRANSLATION_THINKING` | How much the model may reason before answering: `off`, `low`, `medium` or `high`. Mapped onto whatever the provider understands; the run reports what it actually sent | `medium` |
+| `TRANSLATION_THINKING` | How much the model may reason before answering: `off`, `low`, `medium`, `high`, or `default` to send no thinking field at all. Mapped onto whatever the provider understands; the run reports what it actually sent | `medium` |
 | `TRANSLATION_ENFORCE_BUDGET` | Send a line that is over its syllable budget back once to be shortened | `true` |
 | `TRANSLATION_ENFORCE_FIDEL_LOANWORDS` | Send a line that still carries Roman-script text back once to be written in Fidel | `true` |
 | `VOICE_PROFILE_DIR` | Per-speaker voice profiles directory                | `$WORK_DIR/voices` |
