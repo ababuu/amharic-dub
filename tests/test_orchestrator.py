@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from app.config import Settings
+from app.config import DEFAULT_TRANSLATION_GEMINI_MODEL, Settings
 from app.pipeline import orchestrator
 from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
 from app.pipeline.mixing import MixResult
@@ -492,6 +492,13 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert payload["provenance"]["seed_vc_convert_style"] is False
     assert payload["provenance"]["seed_vc_revision"] is None
     assert payload["provenance"]["seed_vc_diffusion_steps"] == 30
+    # Which model adapted the dialogue travels with the dub, because the terminal that
+    # printed it does not survive the Pod.
+    assert payload["provenance"]["translation_backend"] == "openai"
+    assert payload["provenance"]["translation_provider"] == "gemini"
+    assert payload["provenance"]["translation_model"] == DEFAULT_TRANSLATION_GEMINI_MODEL
+    # What was *sent*, not what was configured.
+    assert payload["provenance"]["translation_thinking"] == "reasoning_effort=medium"
 
 
 def test_crosstalk_is_reported_in_the_manifest(tmp_path: Path, monkeypatch) -> None:

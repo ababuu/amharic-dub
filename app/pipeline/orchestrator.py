@@ -775,14 +775,33 @@ def _provenance(settings: Settings) -> dict[str, Any]:
     Seed-VC is the one engine that is a *checkout* rather than a pinned dependency,
     so the commit it is sitting on is recorded here. A re-clone that silently moved
     the engine is otherwise invisible in a delivered dub.
+
+    The adaptation model is recorded for the same reason. Which provider and model
+    produced the Amharic, and how hard it was asked to think, are the first things two
+    runs are compared on - and the terminal that printed them is gone as soon as the
+    Pod stops, while the manifest travels home with the dub.
     """
 
-    return {
+    provenance: dict[str, Any] = {
         "seed_vc_revision": tts.seed_vc_revision(settings.seed_vc_repo_path),
         "seed_vc_repo_path": portable_path(Path(settings.seed_vc_repo_path)),
         "seed_vc_convert_style": settings.seed_vc_convert_style,
         "seed_vc_diffusion_steps": settings.seed_vc_diffusion_steps,
+        "translation_backend": settings.translation_backend,
     }
+
+    if settings.translation_backend == "openai":
+        provenance["translation_provider"] = settings.translation_provider
+        provenance["translation_model"] = settings.translation_model
+        # What was *sent*, not what was configured: the provider decides whether the
+        # requested level was available, and a manifest must not claim reasoning the
+        # request never carried.
+        provenance["translation_thinking"] = translation.describe_thinking(settings)
+    else:
+        # NLLB is a local checkpoint, so it is the path that identifies it.
+        provenance["translation_model"] = settings.translation_model
+
+    return provenance
 
 
 def _engine_note(settings: Settings) -> str:
