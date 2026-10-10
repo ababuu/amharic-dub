@@ -52,7 +52,17 @@ and keeps the best one:
 * **Dynamics and loudness.** Speech has a wide dynamic range between its loud and
   quiet frames; a window that is flat, mostly silence, or heavily clipped scores
   lower.
-* **Overlap.** Windows overlapping another speaker's turns score lower.
+* **Overlap.** Windows overlapping another speaker's turns score lower, and a
+  window that contains **simultaneous speech** is rejected outright. Diarization
+  reports those regions separately, and a reference cut from one is a recording of
+  two people: cloning from it teaches the model both voices, which is heard as a
+  fragment of the wrong character at the start of a line.
+* **The text has to match the audio.** A reference is only usable when the words
+  that will be sent with it describe exactly the audio that will be sent. The
+  reference is therefore cut on the speaker's own line boundaries rather than on a
+  fixed grid: a window that begins or ends mid-line contains speech no transcript
+  accounts for, and a model given an audio prompt longer than its own transcript
+  can speak the difference.
 * **Phonetic variety.** When a transcript covers the window it contributes a
   modest orthographic proxy for how much of the speaker's symbol and word
   inventory the window exercises. Without a transcript the term is dropped and
@@ -128,7 +138,7 @@ import numpy as np
 import soundfile as sf
 
 from app.config import PROJECT_ROOT, Settings, get_settings
-from app.pipeline.diarization import SpeakerSegment
+from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
 from app.pipeline.transcription import TranscriptSegment
 
 #: A voice-clone encoder: ``(reference_audio, destination) -> prompt path``.
@@ -676,6 +686,9 @@ class _ReferenceCandidate:
     overlap_seconds: float
     text: str | None = None
     variety: float | None = None
+    #: ``True`` when the window shares time with simultaneous speech, so the
+    #: recording contains more than one voice.
+    contaminated: bool = False
 
     @property
     def duration(self) -> float:
@@ -744,6 +757,13 @@ class _ReferenceCandidate:
         )
         if self.variety is not None:
             reason += f", phonetic variety {self.variety:.2f}"
+        if self.text is None:
+            reason += ", no transcript describes this window (the engine will transcribe it)"
+        if self.contaminated:
+            reason += (
+                ", WARNING: no clean window was available, so this reference contains "
+                "simultaneous speech and the cloned voice may carry the other speaker"
+            )
         return reason
 
 
@@ -928,7 +948,13 @@ def _windows(
     target: float,
     maximum: float,
 ) -> list[tuple[float, float]]:
-    """Return the candidate windows to measure inside one continuous run."""
+    """Return the candidate windows to measure inside one continuous run.
+
+    Only used when no transcript is available to align to - see
+    :func:`_aligned_windows` for the case that matters. A window cut on a fixed
+    grid cannot be described exactly by the lines inside it, and the TTS stage
+    requires the transcript it sends to describe the audio it sends.
+    """
 
     run_start, run_end = run
     duration = run_end - run_start
@@ -951,6 +977,55 @@ def _windows(
         windows.append(tail)
 
     return windows
+
+
+def _aligned_windows(
+    lines: list[TranscriptSegment],
+    *,
+    minimum: float,
+    target: float,
+    maximum: float,
+) -> list[tuple[float, float]]:
+    """Return candidate windows that begin and end on the speaker's own lines.
+
+    A voice-cloning reference travels with its transcript, and the model is asked to
+    speak the two together. That only works when they agree. Cutting the window on a
+    fixed grid breaks that agreement at both edges: on the run that prompted this,
+    the 10.0s window 20.0-30.0s contained 2.6s of the speaker's previous line and
+    1.9s of their next one, neither of which the recorded text mentioned - so the
+    prompt audio carried about 4.5s of speech with no transcript. A window taken from
+    line boundaries cannot have that problem.
+
+    ``lines`` must already belong to one speaker and be chronological. Windows are
+    grown from each line in turn, so every candidate is a whole number of complete
+    lines, and gaps between lines are included because that silence is part of the
+    recording either way.
+    """
+
+    windows: list[tuple[float, float]] = []
+    for first in range(len(lines)):
+        start = lines[first].start
+        for last in range(first, len(lines)):
+            end = lines[last].end
+            duration = end - start
+            if duration > maximum:
+                break
+            if duration >= minimum:
+                windows.append((start, end))
+            if duration >= target:
+                # Past the target the score only falls, so there is nothing to gain
+                # by growing this window further; the next line starts a fresh one.
+                break
+    return windows
+
+
+def _contaminated(start: float, end: float, regions: Iterable[tuple[float, float]]) -> bool:
+    """Return whether ``start``..``end`` shares time with any of ``regions``."""
+
+    for region_start, region_end in regions:
+        if min(end, region_end) - max(start, region_start) > TIMESTAMP_TOLERANCE:
+            return True
+    return False
 
 
 def _overlap_seconds(start: float, end: float, others: list[SpeakerSegment]) -> float:
@@ -1015,30 +1090,65 @@ def _candidates_for(
     others: list[SpeakerSegment],
     *,
     reader: _StemReader,
+    minimum: float,
     target: float,
     maximum: float,
     transcript: list[TranscriptSegment],
+    contaminated: Iterable[tuple[float, float]] = (),
 ) -> list[_ReferenceCandidate]:
-    """Build and measure every candidate window for one speaker."""
+    """Build and measure every candidate window for one speaker.
+
+    Two families of window are offered: ones cut on the speaker's own line
+    boundaries, which a transcript can describe exactly, and the older sliding
+    windows for a speaker whose lines are too short to reach the minimum on their
+    own. Every candidate records whether it contains simultaneous speech; the choice
+    between a clean and a contaminated window is made by the caller, so a film with
+    no clean stretch still gets a voice instead of failing.
+    """
+
+    contaminated = list(contaminated)
+    own_lines = sorted(
+        (line for line in transcript if line.speaker_id == speaker_id),
+        key=lambda line: (line.start, line.end),
+    )
+
+    spans: list[tuple[float, float]] = []
+    if own_lines:
+        spans.extend(
+            _aligned_windows(own_lines, minimum=minimum, target=target, maximum=maximum)
+        )
+        # A run-based window is still worth offering for a speaker whose lines are
+        # too short to reach the minimum on their own.
+        for run in _continuous_runs(own):
+            spans.extend(_windows(run, target=target, maximum=maximum))
+    else:
+        for run in _continuous_runs(own):
+            spans.extend(_windows(run, target=target, maximum=maximum))
 
     candidates: list[_ReferenceCandidate] = []
-    for run in _continuous_runs(own):
-        for start, end in _windows(run, target=target, maximum=maximum):
-            samples = reader.read(start, end)
-            if samples.size == 0:
-                continue
-            text = _window_text(speaker_id, start, end, transcript)
-            candidates.append(
-                _ReferenceCandidate(
-                    speaker_id=speaker_id,
-                    start=start,
-                    end=end,
-                    stats=_measure_window(samples, reader.sample_rate),
-                    overlap_seconds=_overlap_seconds(start, end, others),
-                    text=text,
-                    variety=_phonetic_variety(text),
-                )
+    seen: set[tuple[float, float]] = set()
+    for start, end in spans:
+        key = (round(start, 4), round(end, 4))
+        if key in seen:
+            continue
+        seen.add(key)
+        samples = reader.read(start, end)
+        if samples.size == 0:
+            continue
+        text = _window_text(speaker_id, start, end, transcript)
+        covered = _covered_text(speaker_id, start, end, transcript)
+        candidates.append(
+            _ReferenceCandidate(
+                speaker_id=speaker_id,
+                start=start,
+                end=end,
+                stats=_measure_window(samples, reader.sample_rate),
+                overlap_seconds=_overlap_seconds(start, end, others),
+                text=text,
+                variety=_phonetic_variety(covered or text),
+                contaminated=_contaminated(start, end, contaminated),
             )
+        )
     return candidates
 
 
@@ -1080,16 +1190,18 @@ def _no_usable_reference(
 _WORD_PATTERN = re.compile(r"[^\W\d_]+", re.UNICODE)
 
 
-def _window_text(
+def _covered_text(
     speaker_id: str,
     start: float,
     end: float,
     transcript: list[TranscriptSegment],
 ) -> str | None:
-    """Return the transcript covering ``start``..``end``, or ``None``.
+    """Return the lines lying wholly inside ``start``..``end``, or ``None``.
 
-    Only lines that lie fully inside the window and belong to the same speaker
-    are used. Text is never invented, and never borrowed from another speaker.
+    Used only for *scoring* a window: which lines a window happens to contain is a
+    fair hint about how much of a speaker's range it exercises, even when the window
+    cannot be described to the model exactly. What is *sent* is decided by
+    :func:`_window_text`, which is stricter.
     """
 
     lines = [
@@ -1099,8 +1211,47 @@ def _window_text(
         and line.start >= start - TIMESTAMP_TOLERANCE
         and line.end <= end + TIMESTAMP_TOLERANCE
     ]
-
     joined = " ".join(line for line in lines if line)
+    return joined or None
+
+
+def _window_text(
+    speaker_id: str,
+    start: float,
+    end: float,
+    transcript: list[TranscriptSegment],
+) -> str | None:
+    """Return the transcript describing ``start``..``end`` exactly, or ``None``.
+
+    ``None`` means "no transcript describes this window", and it is the safe answer:
+    the TTS stage sends a reference transcript only when it has one, and OmniVoice
+    transcribes the reference itself when it does not. What must never happen is
+    sending a transcript that describes *part* of the audio, because the model is
+    asked to speak the reference and the line together and can make up the
+    difference.
+
+    So a window is described only when the lines it covers begin exactly where it
+    begins and end exactly where it ends. A window cut on a fixed grid does not, and
+    gets ``None``.
+    """
+
+    lines = [
+        line
+        for line in transcript
+        if line.speaker_id == speaker_id
+        and line.end > start + TIMESTAMP_TOLERANCE
+        and line.start < end - TIMESTAMP_TOLERANCE
+    ]
+    lines.sort(key=lambda line: (line.start, line.end))
+    if not lines:
+        return None
+
+    if abs(lines[0].start - start) > TIMESTAMP_TOLERANCE:
+        return None
+    if abs(lines[-1].end - end) > TIMESTAMP_TOLERANCE:
+        return None
+
+    joined = " ".join(line.text.strip() for line in lines if line.text.strip())
     return joined or None
 
 
@@ -1311,6 +1462,7 @@ def build_voice_profiles(
     audio_path: str | Path,
     *,
     transcript: Iterable[TranscriptSegment] | None = None,
+    crosstalk: Iterable[CrosstalkRegion] | None = None,
     settings: Settings | None = None,
     clone_encoder: ClonePromptEncoder | None = None,
 ) -> dict[str, VoiceProfile]:
@@ -1326,11 +1478,17 @@ def build_voice_profiles(
         :func:`app.pipeline.separation.separate_stems`, not the original movie
         mix, so the reference is free of music and effects.
     transcript:
-        Optional lines from :mod:`app.pipeline.transcription`. When a line lies
-        fully inside the selected window it becomes the profile's
-        ``reference_text``, so the TTS stage can skip reference transcription,
-        and it also feeds the phonetic-variety term of the reference score.
-        Windows no line covers are scored without that term.
+        Optional lines from :mod:`app.pipeline.transcription`. They do two jobs:
+        they let a window be cut on line boundaries, so the transcript sent with the
+        reference describes exactly the audio sent with it, and they feed the
+        phonetic-variety term of the reference score. A window no line describes
+        exactly is scored without that term and is sent without a transcript.
+    crosstalk:
+        Optional simultaneous-speech regions from
+        :func:`app.pipeline.diarization.diarize_detailed`. A window sharing time
+        with one of them contains more than one voice and is avoided. It is only
+        used when the film offers nothing clean, and the profile records the
+        compromise.
     settings:
         Project settings override; defaults to
         :func:`app.config.get_settings`. The profile directory, the reference
@@ -1378,6 +1536,17 @@ def build_voice_profiles(
     minimum, target, maximum = _resolve_duration_bounds(resolved)
     directory = Path(resolved.voice_profile_dir)
 
+    # Simultaneous speech is where a reference goes wrong: a window cut across it is a
+    # recording of two people, and cloning from it teaches the model both voices. The
+    # diarization already reports these regions, but the per-line overlap check cannot
+    # see them, because the turns it compares are exclusive by construction - so a
+    # window full of crosstalk still scores "0.0s overlapped by other speakers".
+    regions = [
+        (region.start, region.end)
+        for region in (crosstalk if crosstalk is not None else ())
+        if isinstance(region, CrosstalkRegion)
+    ]
+
     profiles: dict[str, VoiceProfile] = {}
     with _StemReader(source) as reader:
         for speaker_id, own in _group_by_speaker(segments).items():
@@ -1387,18 +1556,44 @@ def build_voice_profiles(
                 own,
                 others,
                 reader=reader,
+                minimum=minimum,
                 target=target,
                 maximum=maximum,
                 transcript=lines,
+                contaminated=regions,
             )
             usable = [item for item in candidates if item.is_usable(minimum)]
             if not usable:
                 raise _no_usable_reference(speaker_id, candidates, minimum=minimum)
 
+            # Reference quality is a matter of what the window *is*, not of a weighted
+            # score that can trade one defect for another. Four kinds of window exist,
+            # in descending order of trust:
+            #
+            #   1. clean, and described exactly by a transcript - what we want;
+            #   2. clean, but undescribed - safe, because the engine transcribes the
+            #      audio itself rather than being handed a transcript that only covers
+            #      part of it;
+            #   3. containing simultaneous speech, described - safe to send, but the
+            #      recording holds two voices;
+            #   4. containing simultaneous speech, undescribed.
+            #
+            # The best window of the highest non-empty tier wins. A film that offers
+            # nothing clean still gets a voice, and the profile says which compromise
+            # was made.
+            def tier(item: "_ReferenceCandidate") -> int:
+                described = item.text is not None
+                if not item.contaminated:
+                    return 0 if described else 1
+                return 2 if described else 3
+
+            chosen_tier = min(tier(item) for item in usable)
+            pool = [item for item in usable if tier(item) == chosen_tier]
+
             # Earliest window wins an exact tie, so the same input always selects
             # the same reference.
             best = max(
-                usable,
+                pool,
                 key=lambda item: (item.quality_score(target), -item.start, -item.end),
             )
             profiles[speaker_id] = _build_profile(

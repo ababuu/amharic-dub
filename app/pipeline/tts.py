@@ -2256,8 +2256,16 @@ class OmniVoiceEngine(VoiceCloningEngine):
 
         The prompt is what carries a character's identity, so it is created once per
         speaker and reused for every line. ``reference_text`` is passed through when it
-        is known: without it the model transcribes the reference with an ASR model of
-        its own, which is both slower and one more download.
+        describes the reference exactly: without it the model transcribes the reference
+        with an ASR model of its own, which is both slower and one more download.
+
+        ``preprocess_prompt`` is turned off whenever a transcript is supplied. Its
+        purpose is to strip silence from a reference nobody transcribed, and it does
+        that by *editing the audio* - which is fine when the model then transcribes
+        the edited audio itself, and wrong when we have already said what the audio
+        contains. The library guards its long-reference trim for exactly this reason,
+        but not its silence removal. Sending audio that no longer matches the
+        transcript we sent is what lets a model speak the difference.
         """
 
         key = (str(reference), (reference_text or "").strip())
@@ -2269,7 +2277,9 @@ class OmniVoiceEngine(VoiceCloningEngine):
         text = key[1] or None
         try:
             prompt = network.create_voice_clone_prompt(
-                ref_audio=str(reference), ref_text=text
+                ref_audio=str(reference),
+                ref_text=text,
+                preprocess_prompt=text is None,
             )
         except Exception as exc:
             raise SynthesisError(

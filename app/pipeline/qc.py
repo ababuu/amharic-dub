@@ -306,6 +306,12 @@ class QcReport:
     crosstalk_regions: int
     crosstalk_seconds: float
     pronunciation: PronunciationReport | None = None
+    #: Line indexes whose time is shared with simultaneous speech, where the speaker
+    #: attribution cannot be checked from timing alone. The claim "this character said
+    #: this" rests on the diarized turn, and a turn that overlaps another turn is one the
+    #: exclusive view had to arbitrate. Reported rather than acted on: a dub must still
+    #: say the line, and dropping it would leave a hole in the dialogue.
+    attribution_uncertain: tuple[int, ...] = ()
 
     @property
     def worst_lines(self) -> tuple[LineMetrics, ...]:
@@ -332,6 +338,7 @@ class QcReport:
             "crosstalk": {
                 "regions": self.crosstalk_regions,
                 "seconds": round(self.crosstalk_seconds, 3),
+                "attribution_uncertain": list(self.attribution_uncertain),
             },
             "lines": [line.as_dict() for line in self.lines],
         }
@@ -354,6 +361,17 @@ class QcReport:
             parts.append(
                 f"{self.crosstalk_regions} crosstalk region(s) "
                 f"({self.crosstalk_seconds:.2f}s)"
+            )
+        if self.attribution_uncertain:
+            # Named, not merely counted: these are the lines where the dub's claim about
+            # who is speaking comes from a turn the diarizer had to arbitrate, so they
+            # are the first place to listen when a character sounds wrong.
+            shown = ", ".join(str(index) for index in self.attribution_uncertain[:8])
+            if len(self.attribution_uncertain) > 8:
+                shown += f", and {len(self.attribution_uncertain) - 8} more"
+            parts.append(
+                f"{len(self.attribution_uncertain)} line(s) inside simultaneous speech "
+                f"whose speaker cannot be verified from timing alone ({shown})"
             )
         if self.pronunciation is None:
             parts.append("pronunciation not measured")
@@ -525,7 +543,35 @@ def build_qc_report(
         crosstalk_regions=len(regions),
         crosstalk_seconds=sum(region.duration for region in regions),
         pronunciation=pronunciation,
+        attribution_uncertain=_attribution_uncertain(alignment, regions),
     )
+
+
+def _attribution_uncertain(
+    alignment: Iterable[AlignedClip],
+    regions: tuple[CrosstalkRegion, ...],
+) -> tuple[int, ...]:
+    """Return the indexes of lines that share time with simultaneous speech.
+
+    Attribution is temporal: each diarized turn is transcribed on its own and everything
+    it contains is credited to that turn's speaker. Where two turns overlap, the exclusive
+    view has already picked a winner, and nothing in the pipeline checks that pick against
+    the actual voice. That is a real limit rather than a bug to paper over, so the lines
+    it affects are named.
+    """
+
+    if not regions:
+        return ()
+
+    uncertain: list[int] = []
+    for line in alignment:
+        start = line.clip.dialogue.start
+        end = line.clip.dialogue.end
+        for region in regions:
+            if min(end, region.end) - max(start, region.start) > 1e-6:
+                uncertain.append(line.index)
+                break
+    return tuple(uncertain)
 
 
 __all__ = [

@@ -52,7 +52,8 @@ Deliberate non-goals
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+import threading
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -402,6 +403,53 @@ def _transcribe_region(
     return _convert(raw_segments, region)
 
 
+def build_amharic_transcriber(
+    settings: Settings | None = None,
+    *,
+    language: str = "am",
+) -> Callable[[Path], str]:
+    """Return a callable that transcribes one audio file as Amharic.
+
+    This is the model half of :func:`app.pipeline.qc.measure_pronunciation`, which
+    stays free of any model dependency by taking a callable. Handing it this one turns
+    the quality report's pronunciation term from "not measured" into a measurement of
+    whether the delivered audio says what the text says.
+
+    It is the only automated check that can see content the *speech model* invented -
+    an extra word at the start of a line, a fragment of the English prompt the voice was
+    cloned from, or a mispronunciation. Comparing the audio with the film's original, as
+    the bleed measurements do, cannot find any of those: they are not the original.
+
+    The language is fixed rather than detected. Detection on a single short line is
+    unreliable, and the answer is known - the text handed to the engine was Amharic.
+
+    Notes
+    -----
+    The model is loaded once, on the first call, and reused. Failures return an empty
+    string so that one unreadable line is counted as unmeasured rather than ending a run.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    model: Any | None = None
+    lock = threading.Lock()
+
+    def transcribe(path: Path) -> str:
+        nonlocal model
+        with lock:
+            if model is None:
+                model = _load_model(resolved)
+            current = model
+        try:
+            segments, _info = current.transcribe(
+                str(path), language=language, beam_size=1, vad_filter=False
+            )
+            return " ".join(segment.text.strip() for segment in segments).strip()
+        except Exception:
+            return ""
+
+    return transcribe
+
+
 def transcribe(
     audio_path: str | Path,
     speaker_segments: Iterable[SpeakerSegment],
@@ -489,5 +537,6 @@ __all__ = [
     "TranscriptionError",
     "TranscriptionInferenceError",
     "UnsupportedOutputError",
+    "build_amharic_transcriber",
     "transcribe",
 ]

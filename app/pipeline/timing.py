@@ -724,30 +724,65 @@ def _cascade(
     conversation already sounds like, before the next line is moved at all. A third of a
     second of hand-over is heard as a natural interruption; three seconds of it is two
     people talking at once, which is the thing a dub must never do.
+
+    The allowance is for a change of speaker. The same character never hands over to
+    themselves - their turns do not overlap in the source, and the same voice laid over
+    itself is not heard as an interruption but as a stutter, because the ear has nothing
+    to separate the two copies with. So one speaker's speech is never left sounding under
+    their own next line.
+
+    Everything here is measured between *speech* boundaries rather than file boundaries.
+    A clip carries its rendered pauses with it, and silence over silence is inaudible, so
+    a line is not moved to avoid an overlap nobody can hear.
     """
 
     placed: list[AlignedClip] = []
-    cursor = 0.0
+    previous: AlignedClip | None = None
+    previous_speech_end = 0.0
     for clip in aligned:
         # A line keeps its original position unless the line in front of it is still
         # speaking. When the two performances overlapped in the source, the overlap is the
         # scene - two people talking over each other - and it is preserved rather than
         # tidied away.
-        simultaneous = bool(placed) and clip.clip.start < placed[-1].clip.end - 1e-9
-        start = clip.start if simultaneous else max(clip.start, cursor - overlap)
+        simultaneous = (
+            previous is not None and clip.clip.start < previous.clip.end - 1e-9
+        )
+        if simultaneous:
+            start = clip.start
+        else:
+            same_speaker = previous is not None and previous.speaker_id == clip.speaker_id
+            allowed = 0.0 if same_speaker else overlap
+            # The constraint is on *speech*, not on the files. A clip carries its
+            # rendered pauses, and silence laid over silence is inaudible, so bounding
+            # the files would move a line for no audible reason. What may never happen
+            # is one line's speech sounding under the next line's - and least of all
+            # under the same character's, where the ear has nothing to separate the two
+            # copies with and hears a stutter.
+            floor = previous_speech_end + guard - clip.rendered_pause_before - allowed
+            start = max(clip.start, floor)
         drift = start - clip.start
         if drift > 1e-6:
+            same_speaker = previous is not None and previous.speaker_id == clip.speaker_id
+            why = (
+                "the same character had not finished, and one voice cannot hand over to "
+                "itself"
+                if same_speaker
+                else "the line before it ran past its own time"
+            )
             clip = replace(
                 clip,
                 start=start,
                 drift=drift,
                 notes=clip.notes
                 + (
-                    f"the line before it ran {drift:.3f}s past its own time, so this line "
-                    "starts later rather than being spoken over",
+                    f"{why}, so this line starts {drift:.3f}s later rather than being "
+                    "spoken over",
                 ),
             )
-        cursor = clip.end + guard
+        previous_speech_end = (
+            clip.start + clip.rendered_pause_before + clip.speech_duration
+        )
+        previous = clip
         placed.append(clip)
     return placed
 

@@ -179,6 +179,7 @@ class Stages:
         self.failures = failures or {}
         self.received: dict[str, tuple[object, ...]] = {}
         self.order: list[str] = []
+        self.seen_crosstalk: object = ()
         self.track = root / "stages" / "movie_mix.wav"
 
     def _record(self, name: str, *args: object) -> None:
@@ -233,9 +234,11 @@ class Stages:
         speech: Path,
         *,
         transcript: object,
+        crosstalk: object = (),
         settings: Settings,
     ) -> dict[str, VoiceProfile]:
         self._record("voice_profiles", turns, speech, transcript, settings)
+        self.seen_crosstalk = crosstalk
         return dict(self.profiles)
 
     def synthesize_dialogue_detailed(
@@ -430,6 +433,25 @@ def test_max_lines_larger_than_the_dialogue_changes_nothing(
     assert not result.partial
 
 
+def test_the_diarizations_crosstalk_reaches_the_voice_profiles(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The reference builder must see simultaneous speech, not just exclusive turns.
+
+    The overlap term it used could never fire on real overlap, because the turns it
+    compares are exclusive by construction - so a window containing both characters
+    still scored "0.0s overlapped by other speakers".
+    """
+
+    region = CrosstalkRegion((SPEAKER, "SPEAKER_01"), 11.0, 12.0)
+    fake = Stages(tmp_path, crosstalk=[region])
+    _wire(monkeypatch, fake)
+
+    run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    assert list(fake.seen_crosstalk) == [region]
+
+
 def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     result = run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
 
@@ -456,7 +478,11 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert payload["qc"]["duration"]["lines"] == len(result.alignment)
     assert payload["qc"]["duration"]["close_fits"] == len(result.alignment)
     assert payload["qc"]["pronunciation"] is None
-    assert payload["qc"]["crosstalk"] == {"regions": 0, "seconds": 0.0}
+    assert payload["qc"]["crosstalk"] == {
+        "regions": 0,
+        "seconds": 0.0,
+        "attribution_uncertain": [],
+    }
     # Coverage says what the run did *not* exercise, so a good score cannot be
     # mistaken for good material.
     assert payload["coverage"]["lines"] == len(result.dialogue)

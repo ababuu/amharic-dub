@@ -331,6 +331,7 @@ environment, so values configured on the RunPod pod always win.
 | `TIMING_MAX_OVERLAP_SECONDS` | How far a line may still be sounding when the next one begins before the next one is moved instead | `0.45` |
 | `TIMING_MIN_LINE_GAP` | Silence kept between one dubbed line and the next, so two voices never sound at once | `0.12` |
 | `TIMING_TRIM_TO_FIT` | Cut a line that will not fit, with a fade, instead of letting it briefly overlap the next | `false` |
+| `QC_PRONUNCIATION` | Round-trip every delivered clip through an Amharic ASR model and report its character error rate against the text that was synthesized | `false` |
 | `MIX_DIALOGUE_GAIN_DB` | Dialogue level in the final mix (signed dB)     | `0.0`              |
 | `MIX_DUCK_DB`       | How far music/effects are ducked under dialogue    | `6.0`              |
 | `DEVICE`            | `cuda` on a GPU worker, `cpu` for CPU-only checks   | `cuda`             |
@@ -620,28 +621,69 @@ under `<VOICE_PROFILE_DIR>/<SPEAKER_ID>/reference.wav`. FFmpeg must therefore be
 on `PATH`. Emotion, intensity and delivery are **not** stored in a profile: they
 change per line and belong to `AdaptedDialogue`.
 
-**The bed is checked for the original dialogue, every run.** The music and effects
-stems are summed back in untouched, so anything the separator failed to take out of
-them is played under the Amharic - the one way the source language can reach a
-finished dub. `separation.measure_bed_bleed` reads each dialogue window straight out
-of the three stems (never whole files: two 2-hour 48 kHz stems are ~8 GB of float32)
-and reports any window where the bed is both within `-15 dB` of the isolated speech
-and correlated with it. Two conditions, because loud music under a line is not a
-leak. The result appears in the run summary as `bleed`, in the manifest as
-`run.bleed`, and a leak is called out as a warning rather than left for a viewer to
-notice. On the GPU run that prompted this, 0 of 42 windows leaked.
+**A reference is one voice, and its transcript describes it exactly.** Both rules
+come from a cloning failure on a real run, and neither was visible in the
+measurements the selection used:
+
+* *One voice.* The window chosen there was `20.0-30.0s`, and the diarization's own
+  crosstalk list put simultaneous speech at `26.27-26.85s` and `27.82-28.57s` -
+  inside it. The profile nevertheless reported `0.0s overlapped by other speakers`,
+  because the overlap term compares the speaker's turns against other speakers'
+  turns and those are *exclusive* by construction, so the term can never fire on a
+  region where two people are genuinely talking at once. `build_voice_profiles`
+  now takes the crosstalk regions and prefers windows free of them; a film that
+  offers nothing clean still gets a voice, and the profile says which compromise it
+  made rather than failing the run.
+* *An exact transcript.* The same window began 2.6s before the first line it
+  recorded and ended 1.9s after the last, so about 4.5s of the prompt audio had no
+  transcript. Cloning engines are handed the reference transcript and the line to
+  speak as **one text stream** - OmniVoice concatenates them under a single language
+  tag - so a transcript covering part of its own audio is an invitation to speak the
+  difference. Windows are therefore cut on the speaker's own line boundaries, and a
+  transcript is sent only when it describes the window exactly; otherwise none is
+  sent and the engine transcribes the reference itself. `preprocess_prompt` is
+  switched off whenever a transcript is supplied, because its silence-stripping edits
+  the audio after the transcript was taken from it.
 
 Candidate windows are ranked on duration, speech presence, dynamic range,
-loudness, overlap with other speakers and clipping. Speech presence is an energy
-VAD: a frame counts as speech only when it rises above the *local* noise floor, so
-a loud music bed or steady bleed - which stays close to its own floor whatever its
-level - is rejected rather than outranking quieter dialogue. When a transcript is
-available it also contributes a modest orthographic phonetic-variety term; without
-one the term is dropped instead of being guessed.
+loudness, overlap with other speakers and clipping, and the best window of the
+highest non-empty trust tier wins - clean and exactly described, clean and
+undescribed, containing crosstalk and described, containing crosstalk and
+undescribed - rather than a weighted score that could trade one defect for another.
+Speech presence is an energy VAD: a frame counts as speech only when it rises above
+the *local* noise floor, so a loud music bed or steady bleed - which stays close to
+its own floor whatever its level - is rejected rather than outranking quieter
+dialogue. When a transcript is available it also contributes a modest orthographic
+phonetic-variety term; without one the term is dropped instead of being guessed.
 
 Speaker ids are kept exactly as diarization reported them, but only ever used as a
 single sanitised directory component (`speaker_directory_name`), so an unusual or
 hostile label cannot write outside `VOICE_PROFILE_DIR`.
+
+**The original is measured against twice, every run, and both are reported.** The
+music and effects stems are summed back in untouched, so anything the separator
+failed to take out of them plays under the Amharic:
+
+* `separation.measure_bed_bleed` compares the **bed** with the isolated speech,
+  window by window, and reports any window where the bed is both within `-15 dB` of
+  the speech and correlated with it - two conditions, because loud music under a
+  line is not a leak. On the run that prompted this, 0 of 42 windows leaked.
+* `separation.measure_dub_bleed` compares the **dubbed dialogue** with the film's
+  original audio. The bed check cannot see the finished dub, because the dubbed
+  dialogue is not part of what it inspects, so a dub carrying the original would
+  have been reported clean. This one searches a small lag window either side of each
+  line, so a placement or resampling fault is caught as well as a straightforward
+  mix. On the same run the dub measured 18.8 dB *below* the original and
+  uncorrelated with it (`-0.019`), against a positive control - the original used as
+  its own dub - that is flagged on all 42 windows at `+0.000 dB` and correlation
+  `+1.000`.
+
+Neither check can see English that the *speech model itself* produced, because that
+is not the original audio and no amount of comparison with the original will find
+it. That is what the pronunciation round trip is for: `qc.measure_pronunciation`
+takes an injected ASR model and reports a character error rate against the text that
+was synthesized, which is the only automated way to see that the audio says
+something the text does not.
 
 Voice-clone prompts are cached next to each reference as `voice_clone.pt`. Encoding
 is the expensive step, so an existing prompt is always reused and never
@@ -802,13 +844,26 @@ Three things happen in order, and only ever as far as needed:
    pitch-preserving `atempo`. Only the speech is stretched; the rendered pauses keep their
    length, and a line's leading pause shifts the file rather than the line, so the speech
    still lands on its original start.
-3. **A line that still cannot fit is not cut and is not laid over its neighbour.** A line
-   already faintly speaking when the next one begins is *not* a defect: up to
-   `TIMING_MAX_OVERLAP_SECONDS` (default `0.45s`) of the previous line may still be
-   sounding, which is what a hand-over in a conversation sounds like - and because the
-   window includes the next line's leading pause, the audio that actually overlaps is
-   shorter than that. Past it, the next line **moves later** instead, recorded per line as
-   `drift`, and reported in the run summary as `placement`.
+3. **A line that still cannot fit is not cut and is not laid over its neighbour.** Two
+   voices in the same instant is the one outcome a dub cannot have, so the next line
+   **moves later** instead, recorded per line as `drift` and reported in the run summary
+   as `placement`. Two things decide when moving is needed, and both are measured between
+   *speech* boundaries rather than file boundaries:
+
+   * **Silence over silence is free.** A clip carries its rendered pauses with it
+     (0.13s on average, up to 0.5s), so bounding the *files* would move a line to avoid
+     an overlap nobody can hear. Only speech is bounded.
+   * **A character never hands over to themselves.** Their turns do not overlap in the
+     source, and the same voice laid over itself is not heard as an interruption but as
+     a stutter - the ear has nothing to separate the two copies with. So one speaker's
+     speech is never left sounding under their own next line. Between *different*
+     speakers up to `TIMING_MAX_OVERLAP_SECONDS` (default `0.45s`) is allowed, because a
+     small hand-over is what an interruption sounds like.
+
+   On the run that prompted this, all 14 remaining speech overlaps were one character
+   over themselves, and *no* pair of different characters overlapped at all - so the
+   allowance was buying nothing legitimate while producing every artifact that was
+   audible.
 
 Cutting remains available and remains off by default: `TIMING_TRIM_TO_FIT` (default
 `false`) fades a line short instead. It is the one outcome that damages the performance
@@ -821,10 +876,14 @@ mangling for no benefit. `atempo` accepts 0.5-2.0, so a wider band is rejected r
 passed through.
 
 The placement policy that makes lines stop talking over each other is the combination of
-the hand-over allowance and the cascade, and it is independent of all of this: measured
-with the real timing stage against the failed run's own timings, **40 overlapping line
-pairs - 34 of them a character speaking over themselves, worst 2.7s - became 31 pairs
-whose worst overlap is 0.18s, i.e. a natural hand-over rather than two voices at once.**
+the speech-boundary bound, the same-speaker rule and the cascade, and it is independent
+of all of this. Measured on the shipped GPU run's own manifest: of its 22 file overlaps,
+**14 overlapped in actual speech and every one of those 14 was a character over
+themselves** - up to 0.33s, which is heard at the start of a line as an extra fragment of
+the same voice. Replaying the corrected rule on the run's own line lengths leaves **0 of
+those**, while costing *less* drift than the file-boundary rule it replaces (9.8s against
+58.8s in the same replay), because a line may now begin during the previous line's
+trailing silence.
 
 Mixing places every aligned line at its own timestamp into a continuous dialogue
 stem, then sums that with the **music and effects only**. The original English
@@ -979,15 +1038,29 @@ What it reports, and why each figure is there:
   which is what the script encodes, so this needs no grapheme-to-phoneme model
   (none exists for Amharic). A rate outside the plausible band marks a line no
   performer could deliver, however well it "fits".
-* **Crosstalk.** Simultaneous speech is what the exclusive diarization cannot
-  describe, so it is reported as a known uncertainty.
+* **Crosstalk, and the attribution it casts doubt on.** Simultaneous speech is what
+  the exclusive diarization cannot describe, so it is reported as a known
+  uncertainty - and now the *lines* it affects are named too
+  (`qc.attribution_uncertain`). Attribution is temporal: each diarized turn is
+  transcribed on its own and everything it contains is credited to that turn's
+  speaker, so where two turns overlap the exclusive view has already arbitrated and
+  nothing compares that decision with the actual voice. The lines are reported
+  rather than acted on - a hole in the dialogue is worse than a doubtful voice - and
+  they are the first place to listen when a character sounds like the wrong one. The
+  pipeline never infers a speaker from a character's *name*, so a character saying
+  another character's name cannot affect who is credited.
 * **Pronunciation, when a transcriber is supplied.** A round trip through an
   Amharic ASR model gives a character error rate against the text that was
-  synthesized - the only automated check that the dub is *intelligible*. It needs
-  a model, so `build_qc_report(..., transcribe=...)` takes it as an argument and a
-  run leaves it unmeasured rather than pretending. Homophone families (ሀ/ሐ/ኀ, ሰ/ሠ,
-  አ/ዐ, ጸ/ፀ) are folded before comparison, because a difference between them is a
-  spelling choice rather than a pronunciation error.
+  synthesized - the only automated check that the dub is *intelligible*, and the
+  only one that can see content the speech model *invented*: a stray word, a
+  fragment of the English prompt the voice was cloned from, a mispronunciation. None
+  of that is the film's original audio, so no comparison with the original can find
+  it. It needs a model, so `build_qc_report(..., transcribe=...)` takes it as an
+  argument; set `QC_PRONUNCIATION=true` and the run supplies
+  `transcription.build_amharic_transcriber()`, otherwise it stays unmeasured rather
+  than pretending. Homophone families (ሀ/ሐ/ኀ, ሰ/ሠ, አ/ዐ, ጸ/ፀ) are folded before
+  comparison, because a difference between them is a spelling choice rather than a
+  pronunciation error.
 
 Nothing in the report fails a run: it states what was measured, and deciding what
 is good enough stays a project decision.

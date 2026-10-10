@@ -136,6 +136,8 @@ class PipelineResult:
     synthesized_lines: int
     #: How much of the film's original dialogue survived separation into the bed.
     bleed: separation.BleedReport | None = None
+    #: How much of the film's original audio survived into the dubbed dialogue track.
+    dub_bleed: separation.BleedReport | None = None
     #: Anything the TTS stage wanted the run to know without treating it as a failure.
     notes: tuple[str, ...] = ()
 
@@ -233,6 +235,7 @@ class PipelineResult:
             "mixing": self.mix.to_dict(),
             "mux": self.dub.to_dict(),
             "bleed": None if self.bleed is None else self.bleed.as_dict(),
+            "dub_bleed": None if self.dub_bleed is None else self.dub_bleed.as_dict(),
         }
 
     def report(self) -> str:
@@ -257,6 +260,8 @@ class PipelineResult:
             f"{max((line.drift for line in drifted), default=0.0):.2f} s",
             f"bleed           "
             f"{'not measured' if self.bleed is None else self.bleed.summary()}",
+            f"dub bleed       "
+            f"{'not measured' if self.dub_bleed is None else self.dub_bleed.summary()}",
             f"mixing          {self.mix.duration:.1f} s track, "
             f"{len(self.mix.overlaps)} overlapping line(s), "
             f"peak {self.mix.peak:.3f}",
@@ -563,6 +568,10 @@ def run_pipeline(
             voice_profiles.build_voice_profiles,
             turns,
             stems.speech,
+            # Simultaneous speech is passed in because it is the one thing the
+            # per-line overlap check cannot see: the turns it compares are exclusive,
+            # so a window full of crosstalk still reports no overlap.
+            crosstalk=crosstalk,
             transcript=lines,
             settings=resolved,
         )
@@ -654,6 +663,27 @@ def run_pipeline(
         settings=resolved,
     )
 
+    # The bed check above cannot see the finished dub: it inspects the music and
+    # effects, and the dubbed dialogue is not part of them. This is the other half -
+    # the original audio surviving into the track a listener actually hears - and it
+    # is what catches a mixing, placement or caching fault that reintroduces English.
+    try:
+        dub_bleed = separation.measure_dub_bleed(
+            track,
+            mixed.dialogue_path,
+            [(line.start, line.end) for line in alignment],
+        )
+    except separation.SeparationError as exc:
+        dub_bleed = None
+        report(f"  dub bleed: not measured ({exc})")
+    else:
+        report(f"  dub bleed: {dub_bleed.summary()}")
+        if not dub_bleed.clean:
+            report(
+                "  dub bleed: WARNING the original audio is audible inside the dubbed "
+                f"dialogue on {dub_bleed.leaked} line(s)"
+            )
+
     dub = _stage(
         "mux",
         seconds,
@@ -679,6 +709,7 @@ def run_pipeline(
         skipped=skipped,
         notes=tuple(synthesized.notes),
         bleed=bleed,
+        dub_bleed=dub_bleed,
         alignment=alignment,
         mix=mixed,
         dub=dub,
@@ -689,19 +720,37 @@ def run_pipeline(
     )
 
     # Measured, not assumed: the model-free quality report is part of every run.
-    # Pronunciation is deliberately left unmeasured here - it needs an Amharic ASR
-    # model, and injecting one is the caller's decision (see the qc module).
+    # Pronunciation needs an Amharic ASR model and is off unless asked for: it loads a
+    # second model and transcribes every clip, which is real time on a feature film.
+    # When it *is* asked for, it is the only check that can see content the speech model
+    # invented - a stray word, a fragment of the English prompt it was cloned from, a
+    # mispronunciation. None of that is the original audio, so comparing the output with
+    # the original, as the bleed measurements do, can never find it.
+    transcriber: Callable[[Path], str] | None = None
+    if resolved.qc_pronunciation:
+        try:
+            transcriber = transcription.build_amharic_transcriber(resolved)
+        except Exception as exc:
+            report(f"  qc: pronunciation unavailable ({type(exc).__name__}: {exc})")
+
     quality = qc.build_qc_report(
         result.alignment,
         dialogue=result.dialogue,
         clips=result.clips,
         crosstalk=result.crosstalk,
+        transcribe=transcriber,
+        transcription_model=resolved.transcription_model,
     )
     # Which hard cases the material actually contains. A run can score well simply
     # because it was easy, so this says what was *not* exercised.
     coverage = evaluation.measure_coverage(result.dialogue, crosstalk=result.crosstalk)
 
-    _write_manifest(result, settings=resolved, quality=quality, coverage=coverage)
+    _write_manifest(
+        result,
+        settings=resolved,
+        quality=quality,
+        coverage=coverage,
+    )
     report(result.report())
     report(f"qc              {quality.summary()}")
     report(f"coverage        {coverage.summary()}")

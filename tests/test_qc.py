@@ -412,6 +412,47 @@ def test_crosstalk_is_carried_into_the_report(tmp_path: Path) -> None:
     assert report.crosstalk_seconds == pytest.approx(2.0)
 
 
+def test_a_line_inside_simultaneous_speech_is_named(tmp_path: Path) -> None:
+    """Attribution is temporal, so an overlapped line is a claim nobody checked.
+
+    Each diarized turn is transcribed on its own and everything it contains is credited
+    to that turn's speaker. Where two turns overlap, the exclusive view has already
+    arbitrated, and nothing compares that decision with the actual voice. The run should
+    say which lines are affected rather than presenting them as certain.
+    """
+
+    line = _aligned(tmp_path, index=3, dialogue=_dialogue(start=5.0, end=6.0))
+    region = CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 5.2, 5.8)
+
+    report = qc.build_qc_report([line], crosstalk=[region])
+
+    assert report.attribution_uncertain == (3,)
+    assert "cannot be verified" in report.summary()
+    assert report.as_dict()["crosstalk"]["attribution_uncertain"] == [3]
+
+
+def test_a_line_outside_simultaneous_speech_is_not_named(tmp_path: Path) -> None:
+    line = _aligned(tmp_path, dialogue=_dialogue(start=5.0, end=6.0))
+    region = CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 9.0, 9.5)
+
+    report = qc.build_qc_report([line], crosstalk=[region])
+
+    assert report.attribution_uncertain == ()
+    assert "cannot be verified" not in report.summary()
+
+
+def test_uncertain_attribution_is_reported_not_acted_on(tmp_path: Path) -> None:
+    """The line is still voiced: a hole in the dialogue is worse than a doubtful voice."""
+
+    line = _aligned(tmp_path, index=7, dialogue=_dialogue(start=5.0, end=6.0))
+    region = CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 5.0, 6.0)
+
+    report = qc.build_qc_report([line], crosstalk=[region])
+
+    assert report.duration.lines == 1
+    assert report.lines[0].index == 7
+
+
 def test_the_report_is_json_safe(tmp_path: Path) -> None:
     import json
 
@@ -420,7 +461,11 @@ def test_the_report_is_json_safe(tmp_path: Path) -> None:
 
     assert json.loads(json.dumps(payload)) == payload
     assert payload["duration"]["lines"] == 1
-    assert payload["crosstalk"] == {"regions": 0, "seconds": 0.0}
+    assert payload["crosstalk"] == {
+        "regions": 0,
+        "seconds": 0.0,
+        "attribution_uncertain": [],
+    }
     assert payload["lines"][0]["index"] == 0
     assert payload["pronunciation"] is None
     assert payload["duration"]["close_fit_tolerance"] == CLOSE_FIT_RATIO

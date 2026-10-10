@@ -16,7 +16,7 @@ import pytest
 import soundfile as sf
 
 from app.pipeline import separation
-from app.pipeline.separation import StemPaths, measure_bed_bleed
+from app.pipeline.separation import StemPaths, measure_bed_bleed, measure_dub_bleed
 
 RATE = 8_000
 
@@ -194,3 +194,111 @@ def test_the_report_is_json_safe(tmp_path: Path) -> None:
     payload = measure_bed_bleed(stems, [(0.2, 1.0)]).as_dict()
 
     assert json.loads(json.dumps(payload)) == payload
+
+
+# ---------------------------------------------------------------------------
+# The finished dub, which the bed check cannot see
+# ---------------------------------------------------------------------------
+
+
+def test_the_bed_check_cannot_see_the_dubbed_dialogue(
+    tmp_path: Path,
+) -> None:
+    """Why a second measurement exists.
+
+    ``measure_bed_bleed`` inspects the music and effects stems. The dubbed dialogue is
+    not part of them, so a dub that carried the original would be reported clean. This
+    is that scenario, measured both ways.
+    """
+
+    original = _noise(3.0, 20)
+    source = _write(tmp_path / "original.wav", original)
+    # A dialogue track that is simply the original: the worst possible leak.
+    dialogue = _write(tmp_path / "dialogue.wav", original)
+    unrelated = _write(tmp_path / "unrelated.wav", _noise(3.0, 21))
+
+    windows = [(0.5, 2.5)]
+
+    dub = measure_dub_bleed(source, dialogue, windows)
+    assert not dub.clean
+    assert dub.worst_correlation > 0.9
+    assert "dubbed dialogue" in dub.summary()
+
+    # The bed is a different file here, and it is silent: nothing to find.
+    stems = StemPaths(
+        speech=unrelated,
+        music=_write(tmp_path / "music.wav", _noise(3.0, 22)),
+        effects=_write(tmp_path / "effects.wav", _noise(3.0, 23)),
+    )
+    assert measure_bed_bleed(stems, windows).clean
+
+
+def test_a_dub_in_another_language_is_not_a_leak(tmp_path: Path) -> None:
+    """A dub says the same thing in a different language, so it must not correlate."""
+
+    original = _noise(3.0, 24)
+    source = _write(tmp_path / "original.wav", original)
+    # Speech-like material of the same level but different content - what a dub is.
+    dialogue = _write(tmp_path / "dialogue.wav", _noise(3.0, 25) * 0.9)
+
+    report = measure_dub_bleed(source, dialogue, [(0.5, 2.5)])
+
+    assert report.clean
+
+
+def test_a_leak_at_a_shifted_position_is_still_found(tmp_path: Path) -> None:
+    """A placement or resampling fault moves the original; a lag search catches it."""
+
+    original = _noise(4.0, 26)
+    source = _write(tmp_path / "original.wav", original)
+    # The original, delayed by 0.2s inside the window.
+    shifted = np.concatenate([np.zeros(int(0.2 * RATE), dtype=np.float32), original])
+    dialogue = _write(tmp_path / "dialogue.wav", shifted[: original.size])
+
+    report = measure_dub_bleed(source, dialogue, [(1.0, 3.0)])
+
+    assert not report.clean
+    assert report.worst_correlation > 0.5
+
+
+def test_quiet_leakage_is_not_reported(tmp_path: Path) -> None:
+    """A trace amount is not audible, and crying wolf would make the check useless."""
+
+    original = _noise(3.0, 27)
+    source = _write(tmp_path / "original.wav", original)
+    dialogue = _write(tmp_path / "dialogue.wav", original * 0.01)  # -40 dB
+
+    assert measure_dub_bleed(source, dialogue, [(0.5, 2.5)]).clean
+
+
+def test_a_dub_at_a_different_rate_is_refused(tmp_path: Path) -> None:
+    """Comparing two time bases would silently measure nothing."""
+
+    source = _write(tmp_path / "original.wav", _noise(2.0, 28))
+    other = tmp_path / "dialogue.wav"
+    other.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(other), _noise(2.0, 29), RATE * 2, format="WAV", subtype="PCM_16")
+
+    with pytest.raises(separation.UnsupportedSampleRateError):
+        measure_dub_bleed(source, other, [(0.0, 1.0)])
+
+
+def test_a_missing_dialogue_track_raises(tmp_path: Path) -> None:
+    source = _write(tmp_path / "original.wav", _noise(2.0, 30))
+
+    with pytest.raises(separation.MissingInputError):
+        measure_dub_bleed(source, tmp_path / "absent.wav", [(0.0, 1.0)])
+
+
+def test_the_dub_report_is_json_safe(tmp_path: Path) -> None:
+    import json
+
+    original = _noise(2.0, 31)
+    source = _write(tmp_path / "original.wav", original)
+    dialogue = _write(tmp_path / "dialogue.wav", original)
+
+    first = measure_dub_bleed(source, dialogue, [(0.2, 1.0)]).as_dict()
+    second = measure_dub_bleed(source, dialogue, [(0.2, 1.0)]).as_dict()
+
+    assert first == second
+    assert json.loads(json.dumps(first)) == first

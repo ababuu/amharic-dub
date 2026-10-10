@@ -287,6 +287,10 @@ class BleedReport:
     worst_index: int | None
     worst_relative_db: float
     worst_correlation: float
+    #: What was measured, for the summary line: the bed, or the dubbed dialogue.
+    subject: str = "the bed"
+    #: What it was measured against, for the summary line.
+    baseline: str = "the speech"
 
     @property
     def clean(self) -> bool:
@@ -298,6 +302,8 @@ class BleedReport:
         """Return a JSON-safe view of the measurement."""
 
         return {
+            "subject": self.subject,
+            "baseline": self.baseline,
             "windows": self.windows,
             "leaked": self.leaked,
             "worst_seconds": round(self.worst_seconds, 3),
@@ -310,16 +316,18 @@ class BleedReport:
         """Return the one-line summary a run prints."""
 
         if not self.windows:
-            return "original-dialogue bleed not measured"
+            return f"original-dialogue bleed in {self.subject} not measured"
         if self.clean:
             return (
-                f"no original dialogue left in the bed over {self.windows} line "
-                f"window(s); worst {self.worst_relative_db:.1f} dB below the speech"
+                f"no original dialogue in {self.subject} over {self.windows} line "
+                f"window(s); worst {self.worst_relative_db:.1f} dB below "
+                f"{self.baseline}"
             )
         return (
-            f"WARNING: the bed still carries the original dialogue in {self.leaked} "
-            f"of {self.windows} window(s); worst {self.worst_relative_db:.1f} dB "
-            "below the speech at {:.2f}s".format(self.worst_seconds)
+            f"WARNING: {self.subject} still carries the original dialogue in "
+            f"{self.leaked} of {self.windows} window(s); worst "
+            f"{self.worst_relative_db:.1f} dB below {self.baseline} at "
+            f"{self.worst_seconds:.2f}s"
         )
 
 
@@ -437,6 +445,180 @@ def measure_bed_bleed(
         worst_index=worst_index,
         worst_relative_db=worst_relative,
         worst_correlation=worst_correlation,
+        subject="the bed",
+    )
+
+
+#: How close a window of the dubbed dialogue may come to the film's original audio
+#: before the original is judged audible in the dub. A dub is *not* expected to
+#: resemble the original: it says the same thing in another language, in a cloned
+#: voice, so anything above this is the original surviving rather than a coincidence.
+DUB_BLEED_DB = -18.0
+
+#: How far either side of a line's own position to look for the original, in seconds.
+#: A mixing or placement fault puts the original *at* its own timestamp; a resampling
+#: or offset fault can shift it, and this catches both without a full search.
+DUB_BLEED_LAG_SECONDS = 0.25
+
+#: How finely that search is stepped, in seconds. A verbatim copy correlates strongly
+#: across a window of lags many milliseconds wide, so stepping at sample resolution
+#: tests the same thing thousands of times over - and at 48 kHz the full resolution
+#: search is 24,000 offsets per line, which costs minutes for no extra detection.
+DUB_BLEED_LAG_STEP_SECONDS = 0.005
+
+#: Waveform correlation above which two windows are judged to be the same audio.
+DUB_BLEED_CORRELATION = 0.5
+
+
+def _open_audio(path: Path, *, what: str) -> sf.SoundFile:
+    """Open an audio file for windowed reading, or raise the module's own error."""
+
+    try:
+        return sf.SoundFile(str(path))
+    except (OSError, RuntimeError) as exc:  # soundfile errors subclass RuntimeError
+        if not Path(path).is_file():
+            raise MissingInputError(f"{what} not found: {path}") from exc
+        raise InvalidAudioError(f"could not open {what} {path}: {exc}") from exc
+
+
+def measure_dub_bleed(
+    original: str | Path,
+    dialogue: str | Path,
+    windows: Iterable[tuple[float, float]],
+    *,
+    threshold_db: float = DUB_BLEED_DB,
+    correlation_threshold: float = DUB_BLEED_CORRELATION,
+) -> BleedReport:
+    """Measure how much of the **original audio** survives in the dubbed dialogue.
+
+    :func:`measure_bed_bleed` answers "did separation leave the original in the music
+    and effects". It cannot answer "is the original audible in the finished dub",
+    because the dubbed dialogue track is not part of what it inspects - and the
+    finished dub is what a listener hears. This measures the other half.
+
+    ``dialogue`` is the mix's own dialogue stem, before the bed is added, so anything
+    the original shares with it came from the original rather than from the music.
+    The two are compared both in level and in waveform, over a small lag search,
+    because a copy is only a copy if it is *the same audio*: an Amharic line spoken by
+    a cloned voice of the same character resembles the original not at all.
+
+    Parameters
+    ----------
+    original:
+        The film's own soundtrack - the extracted track, not a stem.
+    dialogue:
+        The dubbed dialogue stem written by :mod:`app.pipeline.mixing`.
+    windows:
+        ``(start, end)`` of every line the dub contains - the moments a line should be
+        the *only* thing in the dialogue stem.
+    threshold_db, correlation_threshold:
+        How close, and how alike, the two have to be before the original is judged
+        audible. Both are required, so loud unrelated material is not a leak.
+
+    Returns
+    -------
+    BleedReport
+        With ``subject`` set to ``"the dubbed dialogue"``.
+    """
+
+    windows = list(windows)
+    counted = 0
+    leaked = 0
+    leak: tuple[float, float, float, int] | None = None
+    loudest: tuple[float, float, float, int] | None = None
+
+    with _open_audio(Path(original), what="the original soundtrack") as source, (
+        _open_audio(Path(dialogue), what="the dubbed dialogue")
+    ) as dub:
+        rate = int(source.samplerate)
+        if int(dub.samplerate) != rate:
+            raise UnsupportedSampleRateError(
+                f"the dubbed dialogue is {dub.samplerate} Hz but the original is "
+                f"{rate} Hz; the two cannot be compared"
+            )
+        frames = min(len(source), len(dub))
+        floor = max(1, int(round(0.02 * rate)))
+        # The lag search is in samples of *this* file, so a rate other than the
+        # pipeline's would otherwise search a different distance than it says.
+        span = int(round(DUB_BLEED_LAG_SECONDS * rate))
+        step = max(1, int(round(DUB_BLEED_LAG_STEP_SECONDS * rate)))
+        offsets = list(range(-span, span + 1, step))
+
+        for index, (start, end) in enumerate(windows):
+            first = max(0, int(round(start * rate)))
+            last = min(frames, int(round(end * rate)))
+            if last - first < floor:
+                continue
+            counted += 1
+
+            try:
+                produced = _read_window(dub, first, last - first)
+                # Read the original once, padded by the lag search, rather than
+                # re-seeking for every offset: a window is compared against a whole
+                # neighbourhood of the original, and a seek per offset is thousands of
+                # reads for one line.
+                padded_first = max(0, first - span)
+                padded_last = min(frames, last + span)
+                neighbourhood = _read_window(
+                    source, padded_first, padded_last - padded_first
+                )
+            except (OSError, RuntimeError) as exc:
+                raise InvalidAudioError(
+                    f"could not read the audio at {start:.3f}s-{end:.3f}s: {exc}"
+                ) from exc
+
+            if produced.size == 0 or produced.std() <= 0.0:
+                continue
+
+            best_correlation = 0.0
+            best_ratio = 0.0
+            produced_rms = float(np.sqrt(np.mean(produced**2)))
+            for offset in offsets:
+                begin = (first + offset) - padded_first
+                if begin < 0 or begin + produced.size > neighbourhood.size:
+                    continue
+                candidate = neighbourhood[begin : begin + produced.size]
+                if candidate.std() <= 0.0:
+                    continue
+                correlation = float(np.corrcoef(candidate, produced)[0, 1])
+                if abs(correlation) > abs(best_correlation):
+                    best_correlation = correlation
+                    candidate_rms = float(np.sqrt(np.mean(candidate**2)))
+                    best_ratio = (
+                        20.0 * math.log10(produced_rms / candidate_rms)
+                        if candidate_rms > 0.0
+                        else -math.inf
+                    )
+
+            flagged = (
+                best_ratio >= threshold_db
+                and abs(best_correlation) >= correlation_threshold
+            )
+            if flagged:
+                leaked += 1
+                if leak is None or best_ratio > leak[0]:
+                    leak = (best_ratio, best_correlation, start, index)
+            if loudest is None or best_ratio > loudest[0]:
+                loudest = (best_ratio, best_correlation, start, index)
+
+    # Report the worst *leak*, not the loudest window: a window can be loud and
+    # unrelated, and naming that one would send a reader to inspect audio that is
+    # fine. When nothing was flagged, the loudest window is the most useful bound.
+    chosen = leak if leak is not None else loudest
+    worst_relative = chosen[0] if chosen is not None else -math.inf
+    worst_correlation = chosen[1] if chosen is not None else 0.0
+    worst_seconds = chosen[2] if chosen is not None else 0.0
+    worst_index = chosen[3] if chosen is not None else None
+
+    return BleedReport(
+        windows=counted,
+        leaked=leaked,
+        worst_seconds=worst_seconds,
+        worst_index=worst_index,
+        worst_relative_db=worst_relative,
+        worst_correlation=worst_correlation,
+        subject="the dubbed dialogue",
+        baseline="the original audio",
     )
 
 
@@ -454,6 +636,10 @@ def _read_window(handle: sf.SoundFile, first: int, frames: int) -> np.ndarray:
 
 __all__ = [
     "AUDIBLE_BLEED_DB",
+    "DUB_BLEED_CORRELATION",
+    "DUB_BLEED_DB",
+    "DUB_BLEED_LAG_SECONDS",
+    "DUB_BLEED_LAG_STEP_SECONDS",
     "MODEL_NAME",
     "REQUIRED_SAMPLE_RATE",
     "STEM_NAMES",
@@ -467,6 +653,7 @@ __all__ = [
     "MissingStemError",
     "StemPaths",
     "measure_bed_bleed",
+    "measure_dub_bleed",
     "read_audio",
     "resolve_weights_dir",
     "separate_stems",

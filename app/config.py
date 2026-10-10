@@ -115,6 +115,14 @@ DEFAULT_TRANSCRIPTION_MODEL = "large-v3"
 #: ``int8`` or ``float32``, because CTranslate2 does not support fp16 on CPU.
 DEFAULT_TRANSCRIPTION_COMPUTE_TYPE = "float16"
 
+#: Whether a run round-trips its own dialogue through an Amharic ASR model to measure
+#: pronunciation. Off by default: it loads a second model and transcribes every clip.
+#: It is the only automated check that can see content the speech model invented - a
+#: stray word at the start of a line, a fragment of the English prompt the voice was
+#: cloned from, a mispronunciation - because none of that is the film's original audio,
+#: so no comparison with the original can find it.
+DEFAULT_QC_PRONUNCIATION = False
+
 #: Which translation backend :mod:`app.pipeline.translation` uses.
 #:
 #: ``"openai"`` (the default) talks to any OpenAI-compatible endpoint - DeepSeek by
@@ -633,6 +641,10 @@ class Settings:
     #: faster-whisper model and CTranslate2 compute type for transcription.
     transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL
     transcription_compute_type: str = DEFAULT_TRANSCRIPTION_COMPUTE_TYPE
+    #: Round-trip every delivered clip through an Amharic ASR model and report the
+    #: character error rate against the text that was synthesized. Off by default
+    #: because it loads a second model and transcribes every clip.
+    qc_pronunciation: bool = DEFAULT_QC_PRONUNCIATION
     #: Source language code for transcription; ``None`` detects it automatically.
     transcription_language: Optional[str] = None
     #: DeepSeek dialogue adaptation settings for :mod:`app.pipeline.translation`.
@@ -739,6 +751,9 @@ class Settings:
             transcription_compute_type=(
                 _read_env("TRANSCRIPTION_COMPUTE_TYPE", DEFAULT_TRANSCRIPTION_COMPUTE_TYPE)
                 or DEFAULT_TRANSCRIPTION_COMPUTE_TYPE
+            ),
+            qc_pronunciation=_read_bool(
+                "QC_PRONUNCIATION", DEFAULT_QC_PRONUNCIATION
             ),
             transcription_language=(
                 (_read_env("TRANSCRIPTION_LANGUAGE") or "").lower() or None
@@ -927,6 +942,7 @@ class Settings:
             "diarization_max_speakers": self.diarization_max_speakers,
             "transcription_model": self.transcription_model,
             "transcription_compute_type": self.transcription_compute_type,
+            "qc_pronunciation": self.qc_pronunciation,
             "transcription_language": self.transcription_language,
             "translation_backend": self.translation_backend,
             "translation_model": self.translation_model,
@@ -1010,6 +1026,7 @@ __all__ = [
     "DEFAULT_SEED_VC_DIFFUSION_STEPS",
     "DEFAULT_SEED_VC_REPO_NAME",
     "DEFAULT_TRANSCRIPTION_COMPUTE_TYPE",
+    "DEFAULT_QC_PRONUNCIATION",
     "DEFAULT_TRANSCRIPTION_MODEL",
     "DEFAULT_TRANSLATION_BACKEND",
     "DEFAULT_TRANSLATION_MAX_NEW_TOKENS",

@@ -23,7 +23,7 @@ import soundfile as sf
 
 from app.config import Settings
 from app.pipeline import diarization, transcription, voice_profiles
-from app.pipeline.diarization import SpeakerSegment
+from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
 from app.pipeline.transcription import TranscriptSegment
 from app.pipeline.translation import AdaptedDialogue
 from app.pipeline.voice_profiles import (
@@ -877,15 +877,27 @@ def test_the_same_input_produces_the_same_profiles(tmp_path: Path, ffmpeg: FakeF
 # ---------------------------------------------------------------------------
 
 
-def test_reference_text_uses_only_lines_inside_the_window(
+def test_the_reference_text_describes_the_reference_audio_exactly(
     tmp_path: Path, ffmpeg: FakeFfmpeg
 ) -> None:
+    """A transcript is sent only for a window it describes completely.
+
+    The TTS stage gives the reference transcript and the line to speak to the model
+    together, as one text stream, and the model is conditioned on the reference audio
+    for the first part of it. On the run that prompted this, the chosen window
+    20.0-30.0s contained 2.6s of the speaker's previous line and 1.9s of the next one,
+    while the transcript recorded only the 5.4s in the middle - so the prompt audio
+    held about 4.5s of speech that nothing described. A mismatch that large is an
+    invitation to speak the difference.
+
+    A window the transcript does not cover exactly is therefore used without a
+    transcript, and the engine transcribes the reference itself.
+    """
+
     stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD)])
     transcript = [
-        TranscriptSegment("SPEAKER_00", 8.0, 9.0, "before"),
-        TranscriptSegment("SPEAKER_00", 10.5, 12.0, "hello"),
+        TranscriptSegment("SPEAKER_00", 10.0, 12.0, "hello"),
         TranscriptSegment("SPEAKER_00", 12.0, 13.0, "there"),
-        TranscriptSegment("SPEAKER_00", 19.0, 21.0, "outside"),
     ]
 
     profile = build_voice_profiles(
@@ -895,10 +907,43 @@ def test_reference_text_uses_only_lines_inside_the_window(
         settings=_settings(tmp_path),
     )["SPEAKER_00"]
 
+    # The window is cut on the line boundaries, so the text is theirs exactly.
+    assert profile.reference_start == 10.0
+    assert profile.reference_end == 13.0
     assert profile.reference_text == "hello there"
 
 
+def test_a_window_the_transcript_cannot_describe_is_never_sent_with_one(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """The invariant that matters: text sent must describe the audio sent.
+
+    Anything else - a longer window, a shorter one, a window with no text at all -
+    is acceptable. Sending a transcript covering part of the reference is not.
+    """
+
+    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD)])
+    # One line, deliberately covering only the middle of the turn.
+    transcript = [TranscriptSegment("SPEAKER_00", 13.0, 14.0, "mine")]
+
+    profile = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", 10.0, 20.0)],
+        stem,
+        transcript=transcript,
+        settings=_settings(tmp_path),
+    )["SPEAKER_00"]
+
+    if profile.reference_text is not None:
+        assert profile.reference_start == 13.0
+        assert profile.reference_end == 14.0
+        assert profile.reference_text == "mine"
+    else:
+        assert "no transcript describes this window" in profile.selection_reason
+
+
 def test_reference_text_ignores_other_speakers(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
+    """A reference transcript never contains another character's words."""
+
     stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD)])
     transcript = [
         TranscriptSegment("SPEAKER_01", 11.0, 12.0, "not mine"),
@@ -912,7 +957,9 @@ def test_reference_text_ignores_other_speakers(tmp_path: Path, ffmpeg: FakeFfmpe
         settings=_settings(tmp_path),
     )["SPEAKER_00"]
 
-    assert profile.reference_text == "mine"
+    assert "not mine" not in (profile.reference_text or "")
+    if profile.reference_text is not None:
+        assert profile.reference_text == "mine"
 
 
 def test_reference_text_is_none_without_a_transcript(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
@@ -1508,7 +1555,10 @@ def test_a_richer_window_wins_when_both_are_transcribed(
         segments, stem, transcript=transcript, settings=_settings(tmp_path)
     )["SPEAKER_00"]
 
-    assert profile.reference_start == 30.0
+    # Both candidates are cut on their own line boundaries, so both carry a
+    # transcript and the variety term is what separates them.
+    assert profile.reference_start == 30.5
+    assert profile.reference_text == RICH_TEXT
     assert "phonetic variety" in profile.selection_reason
 
 
@@ -1525,30 +1575,51 @@ def test_identical_windows_tie_without_a_transcript(tmp_path: Path, ffmpeg: Fake
     assert "phonetic variety" not in profile.selection_reason
 
 
-def test_variety_is_dropped_for_a_window_no_line_covers(
+def test_a_described_window_beats_a_longer_undescribed_one(
     tmp_path: Path, ffmpeg: FakeFfmpeg
 ) -> None:
-    """The documented cost of never inventing a variety value.
+    """Trust in the transcript outranks a longer recording.
 
-    A window the transcript does not cover is scored without the term, so here it
-    beats an identical window whose text is repetitive. The term is deliberately
-    modest so that it cannot outweigh a real quality difference.
+    A window a transcript describes exactly can be sent with that transcript, so the
+    engine needs no ASR pass and cannot be handed text that only covers part of its
+    audio. That is worth more than the extra seconds of the turn-based window, which
+    the engine would have to transcribe itself.
     """
 
-    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD), (30.0, 40.0, LOUD)])
-    segments = [
-        SpeakerSegment("SPEAKER_00", 10.0, 20.0),
-        SpeakerSegment("SPEAKER_00", 30.0, 40.0),
-    ]
+    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD)])
     transcript = [TranscriptSegment("SPEAKER_00", 10.5, 14.0, REPETITIVE_TEXT)]
 
     profile = build_voice_profiles(
-        segments, stem, transcript=transcript, settings=_settings(tmp_path)
+        [SpeakerSegment("SPEAKER_00", 10.0, 20.0)],
+        stem,
+        transcript=transcript,
+        settings=_settings(tmp_path),
     )["SPEAKER_00"]
 
-    assert profile.reference_start == 30.0
+    assert profile.reference_start == 10.5
+    assert profile.reference_end == 14.0
+    assert profile.reference_text == REPETITIVE_TEXT
+
+
+def test_a_window_no_line_covers_carries_no_transcript(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """With nothing described, the engine transcribes the reference itself."""
+
+    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD)])
+
+    profile = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", 10.0, 20.0)],
+        stem,
+        # A transcript for a different speaker cannot describe this window.
+        transcript=[TranscriptSegment("SPEAKER_01", 10.5, 14.0, "not mine")],
+        settings=_settings(tmp_path),
+    )["SPEAKER_00"]
+
+    assert profile.reference_start == 10.0
     assert profile.reference_text is None
-    assert "phonetic variety" not in profile.selection_reason
+    assert profile.clone_prompt_path is None
+    assert "no transcript describes this window" in profile.selection_reason
 
 
 def test_variety_cannot_outweigh_a_clear_audio_difference(
@@ -1569,4 +1640,7 @@ def test_variety_cannot_outweigh_a_clear_audio_difference(
     )["SPEAKER_00"]
 
     # Much better recorded speech wins even though its transcript is repetitive.
-    assert profile.reference_start == 30.0
+    # Both windows here are described by their own line, so the comparison is made
+    # on the audio - which is the point of the test - rather than on the text.
+    assert profile.reference_start == 30.5
+    assert profile.reference_text == REPETITIVE_TEXT

@@ -53,9 +53,10 @@ def _clip(
     speech: float,
     lead: float = 0.0,
     trail: float = 0.0,
+    speaker_id: str = "SPEAKER_00",
 ) -> TtsClip:
     dialogue = AdaptedDialogue(
-        speaker_id="SPEAKER_00",
+        speaker_id=speaker_id,
         start=start,
         end=end,
         source_text="line",
@@ -103,6 +104,46 @@ def test_an_over_long_line_moves_the_next_one_instead_of_overlapping(
     assert second.drift > 0.0
     # What is left of the first line when the second begins is at most the hand-over
     # the configuration allows, never the seconds of doubled speech that were audible.
+    assert first.end - second.start <= DEFAULT_TIMING_MAX_OVERLAP_SECONDS + 1e-6
+
+
+def test_a_character_never_hands_over_to_themselves(tmp_path: Path) -> None:
+    """The hand-over allowance is for a change of speaker, not for one voice.
+
+    Measured on the run that prompted this: 18 of its 22 remaining overlaps were a
+    character over themselves, every one of them exactly the allowance minus the
+    guard (0.33s). The ear cannot separate two copies of the same voice, so it hears a
+    stutter - which is how "an extra word at the start of her lines" was reported.
+    Two speakers may still overlap; one may not.
+    """
+
+    clips = [
+        _clip(tmp_path, index=0, start=5.0, end=5.4, speech=1.6),
+        # Same speaker, starting while the first line is still going.
+        _clip(tmp_path, index=1, start=5.6, end=6.4, speech=0.6),
+    ]
+
+    aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
+
+    first, second = aligned
+    assert first.speaker_id == second.speaker_id
+    assert second.start >= first.end
+    assert second.drift > 0.0
+    assert any("cannot hand over to itself" in note for note in second.notes)
+
+
+def test_the_allowance_still_applies_between_two_speakers(tmp_path: Path) -> None:
+    """Changing speaker is where a small overlap is natural, and it is kept."""
+
+    clips = [
+        _clip(tmp_path, index=0, start=5.0, end=5.4, speech=1.6, speaker_id="SPEAKER_00"),
+        _clip(tmp_path, index=1, start=5.6, end=6.4, speech=0.6, speaker_id="SPEAKER_01"),
+    ]
+
+    aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
+
+    first, second = aligned
+    assert second.start < first.end
     assert first.end - second.start <= DEFAULT_TIMING_MAX_OVERLAP_SECONDS + 1e-6
 
 
@@ -180,7 +221,7 @@ def test_a_moved_line_says_so_on_the_clip(tmp_path: Path) -> None:
 
     aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
 
-    assert any("starts later" in note for note in aligned[1].notes)
+    assert any("starts" in note and "later" in note for note in aligned[1].notes)
     assert aligned[1].to_dict()["drift"] == pytest.approx(aligned[1].drift)
     assert aligned[0].to_dict()["drift"] == 0.0
 
