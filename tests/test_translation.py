@@ -407,7 +407,7 @@ def test_the_default_backend_is_the_instructable_one():
     from app.config import DEFAULT_TRANSLATION_BACKEND, DEFAULT_TRANSLATION_OPENAI_MODEL
 
     assert DEFAULT_TRANSLATION_BACKEND == "openai"
-    assert DEFAULT_TRANSLATION_OPENAI_MODEL == "deepseek-flash"
+    assert DEFAULT_TRANSLATION_OPENAI_MODEL == "deepseek-v4-pro"
     assert "nllb" in DEFAULT_TRANSLATION_MODEL
 
 
@@ -730,6 +730,92 @@ def test_an_overshooting_line_is_sent_back_once(monkeypatch):
         "dialogue_000001"
     ]
     assert adapted[0].amharic == "ሰላም"
+
+
+def test_a_rewrite_that_is_not_shorter_is_refused(monkeypatch):
+    """A model asked for something shorter sometimes returns something longer.
+
+    The rewrite used to overwrite the line unconditionally, so three attempts could
+    leave a line *worse* than one attempt did. Whatever comes back has to earn its
+    place by being closer to speakable than what it would replace.
+    """
+
+    _patch(monkeypatch)
+    calls: list[int] = []
+    longer = "ሰላም እንደምን ነህ ውድ ጓደኛዬ ሰላም ሰላም"  # 17 syllables
+
+    def transform(body):
+        calls.append(1)
+        for line in body["lines"]:
+            line["amharic"] = "ሰላም እንደምን ነህ" if len(calls) == 1 else longer
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapted = adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
+
+    assert adapted[0].amharic == "ሰላም እንደምን ነህ"
+
+
+def test_a_rewrite_with_nothing_to_pronounce_is_refused(monkeypatch):
+    """An empty line has no syllables, which must not read as "perfectly short"."""
+
+    _patch(monkeypatch)
+    calls: list[int] = []
+
+    def transform(body):
+        calls.append(1)
+        for line in body["lines"]:
+            line["amharic"] = "ሰላም እንደምን ነህ" if len(calls) == 1 else "።"
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapted = adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
+
+    assert adapted[0].amharic == "ሰላም እንደምን ነህ"
+
+
+def test_each_rewrite_asks_for_a_different_kind_of_cut(monkeypatch):
+    """Repeating the same request returns the same line; escalating does not.
+
+    Measured on the real transcript, three passes that all said "cut filler" left the
+    Amharic at 1.5x its budget. The passes have to give the model something new to
+    give up each time.
+    """
+
+    _patch(monkeypatch)
+    calls: list[int] = []
+    # Always over budget, so every attempt is taken and every instruction is recorded.
+    amharic = "ሰላም እንደምን ነህ ውድ ጓደኛዬ"
+    shorter = "ሰላም እንደምን ነህ ውድ"
+
+    def transform(body):
+        calls.append(1)
+        for line in body["lines"]:
+            line["amharic"] = amharic if len(calls) == 1 else shorter[: max(2, 12 - calls[-1])]
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapt_dialogue(
+        [_segment(start=0.0, end=1.0)],
+        settings=_settings(translation_max_reduction_attempts=3),
+    )
+
+    assert len(FakeOpenAI.requests) >= 3
+    rewrites = [_payload(request)["rewrite"] for request in FakeOpenAI.requests[1:]]
+    assert len({rewrite[rewrite.index("Cut"):] if "Cut" in rewrite else rewrite
+                for rewrite in rewrites}) > 1
+
+
+def test_the_reduction_tactics_escalate_and_then_hold():
+    assert "filler" in translation.reduction_tactic(1)
+    assert "Cut deeper" in translation.reduction_tactic(2)
+    assert "Rebuild" in translation.reduction_tactic(3)
+    # Past the end of the list the strongest tactic is repeated rather than raising.
+    assert translation.reduction_tactic(4) == translation.reduction_tactic(3)
+    assert translation.reduction_tactic(0) == translation.reduction_tactic(1)
 
 
 def test_only_the_overshooting_lines_are_resent(monkeypatch):

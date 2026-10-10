@@ -29,7 +29,7 @@ from app.pipeline.orchestrator import (
 from app.pipeline.timing import AlignedClip
 from app.pipeline.transcription import TranscriptSegment
 from app.pipeline.translation import AdaptedDialogue
-from app.pipeline.tts import PerformanceControls, TtsClip
+from app.pipeline.tts import PerformanceControls, SkippedLine, TtsClip
 from app.pipeline.video import MuxResult
 from app.pipeline.voice_profiles import VoiceProfile
 
@@ -607,6 +607,56 @@ def test_a_line_that_cannot_be_voiced_is_recorded_in_the_manifest(
     assert skipped[0]["duration"] == 0.22
     assert "cannot be dubbed" in skipped[0]["reason"]
     assert result.skipped == tuple(fake.skipped)
+
+
+def test_an_incomplete_dub_says_so_in_the_manifest_and_the_exit_code(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A missing line must not be discoverable only by listening to the film.
+
+    The exit code is the part that matters: a caller that only checks it would
+    otherwise be able to ship a dub with dialogue missing from it.
+    """
+
+    fake = Stages(
+        tmp_path,
+        skipped=[
+            SkippedLine(
+                index=0,
+                speaker_id=SPEAKER,
+                start=5.836,
+                end=6.056,
+                amharic="።፣?!",
+                reason="cannot be dubbed: the Amharic line has nothing to pronounce",
+            )
+        ],
+    )
+    _wire(monkeypatch, fake)
+
+    result = run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert payload["notes"][0].startswith("INCOMPLETE DUB")
+    assert "PARTIAL DUB" in result.report()
+
+    monkeypatch.setattr(
+        orchestrator, "run_pipeline", lambda *a, **k: result, raising=False
+    )
+    assert orchestrator.main([str(_source(tmp_path))]) == 2
+
+
+def test_a_complete_dub_exits_zero(monkeypatch, tmp_path: Path, stages: Stages) -> None:
+    _wire(monkeypatch, stages)
+
+    result = run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert not any(note.startswith("INCOMPLETE DUB") for note in payload["notes"])
+
+    monkeypatch.setattr(
+        orchestrator, "run_pipeline", lambda *a, **k: result, raising=False
+    )
+    assert orchestrator.main([str(_source(tmp_path))]) == 0
 
 
 def test_manifest_truncation_is_recorded(

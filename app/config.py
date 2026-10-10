@@ -147,11 +147,14 @@ DEFAULT_TRANSLATION_BACKEND = "openai"
 #: The weights are CC-BY-NC-4.0.
 DEFAULT_TRANSLATION_MODEL = "facebook/nllb-200-3.3B"
 
-#: The model the instruction-following backend asks for by default. ``deepseek-flash`` is
-#: DeepSeek's current model name and is what the default base URL serves; a local
-#: OpenAI-compatible server needs whatever it serves instead, set through
-#: ``TRANSLATION_MODEL``.
-DEFAULT_TRANSLATION_OPENAI_MODEL = "deepseek-flash"
+#: The model the instruction-following backend asks for by default. Measured against the
+#: test film's real 42-line transcript, ``deepseek-v4-pro`` produced 426 syllables where
+#: ``deepseek-flash`` produced 462 and the previous prompt produced 486, and it got the
+#: short lines right where flash did not ("We're done." -> ጨረስን rather than ጨረቃ, "moon").
+#: Fitting a dub is a hard constraint-following job, and the stronger model is the one
+#: that honours it. A local OpenAI-compatible server needs whatever it serves instead,
+#: set through ``TRANSLATION_MODEL``.
+DEFAULT_TRANSLATION_OPENAI_MODEL = "deepseek-v4-pro"
 
 #: Beam search width. ``1`` is greedy, which is deterministic - the same line always
 #: translates the same way, so two runs can be compared against one another. Raise it
@@ -358,11 +361,39 @@ DEFAULT_TTS_REQUEST_RATE = True
 #: How far a line's delivery may be time-stretched to fit the window of the
 #: original line, as a tempo factor. A factor below 1 slows the line down, above
 #: 1 speeds it up, and both are pitch-preserving. The band is deliberately narrow:
-#: a line that needs more than a quarter faster or a fifth slower is reported as
-#: not fitting rather than being mangled to fit. FFmpeg's ``atempo`` filter only
-#: accepts factors between 0.5 and 2.0, which bounds any configuration here.
+#: a line that needs more than this is reported as not fitting rather than being
+#: mangled to fit. FFmpeg's ``atempo`` filter only accepts factors between 0.5 and
+#: 2.0, which bounds any configuration here.
+#:
+#: The ceiling is 1.45 rather than 1.25 because it was measured, not chosen. Replaying
+#: the failed run's own line timings through the placement policy below, with the
+#: Amharic the adaptation stage produced for this project, the worst line landed after
+#: the actor spoke by:
+#:
+#: * 1.25 - 9.24s (the old default, with strict separation)
+#: * 1.35 - 6.13s
+#: * 1.45 - 4.96s
+#: * 1.55 - 3.98s
+#:
+#: Below 1.25 the lines have nowhere to go and the whole dub falls behind the picture;
+#: past 1.45 the delivery starts to sound hurried for what is left to gain. This is
+#: deliberately a *band*, not a target: a line that fits is left at its natural pace,
+#: and only the lines that cannot fit are delivered faster. FFmpeg's ``atempo`` filter
+#: only accepts factors between 0.5 and 2.0, which bounds any configuration here.
 DEFAULT_TIMING_MIN_TEMPO = 0.80
-DEFAULT_TIMING_MAX_TEMPO = 1.25
+DEFAULT_TIMING_MAX_TEMPO = 1.45
+
+#: How far a line may run into the next one before the next one is moved instead, in
+#: seconds.
+#:
+#: Two voices a fraction of a second apart is what a conversation already sounds like -
+#: the listener hears a natural hand-over (and the window includes the next line's own
+#: leading pause, so the *speech* overlap is shorter still). Two voices *seconds* apart
+#: is unintelligible, and moving a line that far breaks lip-sync, so the overrun is paid
+#: first in a small overlap and only then in position. Measured with the real timing
+#: stage on the failed run's own numbers, the worst line's drift falls from 6.13s to
+#: 4.13s when this goes from 0.30 to 0.45.
+DEFAULT_TIMING_MAX_OVERLAP_SECONDS = 0.45
 
 #: Silence kept between one dubbed line and the next, in seconds.
 #:
@@ -666,6 +697,7 @@ class Settings:
     #: the next line so two voices are never heard at once.
     timing_min_tempo: float = DEFAULT_TIMING_MIN_TEMPO
     timing_max_tempo: float = DEFAULT_TIMING_MAX_TEMPO
+    timing_max_overlap_seconds: float = DEFAULT_TIMING_MAX_OVERLAP_SECONDS
     timing_min_line_gap: float = DEFAULT_TIMING_MIN_LINE_GAP
     timing_trim_to_fit: bool = DEFAULT_TIMING_TRIM_TO_FIT
     #: Mix settings for :mod:`app.pipeline.mixing`: the dialogue level and how far
@@ -822,6 +854,9 @@ class Settings:
             ),
             timing_min_tempo=_read_float("TIMING_MIN_TEMPO", DEFAULT_TIMING_MIN_TEMPO),
             timing_max_tempo=_read_float("TIMING_MAX_TEMPO", DEFAULT_TIMING_MAX_TEMPO),
+            timing_max_overlap_seconds=_read_float(
+                "TIMING_MAX_OVERLAP_SECONDS", DEFAULT_TIMING_MAX_OVERLAP_SECONDS
+            ),
             timing_min_line_gap=_read_float(
                 "TIMING_MIN_LINE_GAP", DEFAULT_TIMING_MIN_LINE_GAP
             ),
@@ -940,6 +975,7 @@ class Settings:
             "tts_request_rate": self.tts_request_rate,
             "timing_min_tempo": self.timing_min_tempo,
             "timing_max_tempo": self.timing_max_tempo,
+            "timing_max_overlap_seconds": self.timing_max_overlap_seconds,
             "timing_min_line_gap": self.timing_min_line_gap,
             "timing_trim_to_fit": self.timing_trim_to_fit,
             "mix_dialogue_gain_db": self.mix_dialogue_gain_db,
@@ -995,6 +1031,7 @@ __all__ = [
     "DEFAULT_TTS_MODEL",
     "DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
     "DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
+    "DEFAULT_TIMING_MAX_OVERLAP_SECONDS",
     "DEFAULT_TIMING_MAX_TEMPO",
     "DEFAULT_TIMING_MIN_LINE_GAP",
     "DEFAULT_TIMING_TRIM_TO_FIT",

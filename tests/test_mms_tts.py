@@ -583,7 +583,7 @@ def test_unvoiceable_lines_are_still_skipped(monkeypatch, tmp_path: Path) -> Non
     engine = MmsAmharicEngine(device="cpu")
 
     result = synthesize_dialogue_detailed(
-        [_line(start=5.836, end=6.056), _line(start=8.0, end=10.0)],
+        [_line(start=5.836, end=6.056, amharic="።፣?!"), _line(start=8.0, end=10.0)],
         _speech(tmp_path),
         None,
         settings=_settings(tmp_path),
@@ -592,6 +592,27 @@ def test_unvoiceable_lines_are_still_skipped(monkeypatch, tmp_path: Path) -> Non
 
     assert [clip.index for clip in result.clips] == [1]
     assert [line.index for line in result.skipped] == [0]
+
+
+def test_a_short_window_is_voiced_by_a_single_voice_engine(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A brief original line is spoken rather than left out, on every engine."""
+
+    _patch(monkeypatch)
+    engine = MmsAmharicEngine(device="cpu")
+
+    result = synthesize_dialogue_detailed(
+        [_line(start=5.836, end=6.056), _line(start=8.0, end=10.0)],
+        _speech(tmp_path),
+        None,
+        settings=_settings(tmp_path),
+        tts_engine=engine,
+    )
+
+    assert [clip.index for clip in result.clips] == [0, 1]
+    assert result.skipped == ()
+    assert result.notes
 
 
 def test_an_engine_of_the_wrong_kind_is_rejected(monkeypatch, tmp_path: Path) -> None:

@@ -205,11 +205,11 @@ SEED_VC_ENGINE_NAME = "seed-vc-v2"
 #: Configuration that describes Seed-VC V2, relative to its checkout.
 SEED_VC_CONFIG_PARTS = ("configs", "v2", "vc_wrapper.yaml")
 
-#: Shortest original window that can be dubbed, in seconds. Below this the original
-#: is a fragment rather than a spoken line - there is no room for a word in the time
-#: it occupied - and the engine can fail outright on it: Chatterbox does, with an
-#: empty mel spectrogram that trips a convolution inside its vocoder.
-MINIMUM_SPEAKABLE_LINE_SECONDS = DEFAULT_TTS_MIN_LINE_SECONDS
+#: Shortest original window a line is *reported* for, in seconds. It is not a reason to
+#: leave a line unsaid: a brief English line is normal, and the Amharic that replaces it
+#: needs more time, which :mod:`app.pipeline.timing` finds by moving the lines after it.
+#: Lines below this are voiced and counted in :attr:`SynthesisResult.notes`.
+MINIMUM_REPORTABLE_LINE_SECONDS = DEFAULT_TTS_MIN_LINE_SECONDS
 
 #: Shortest Amharic line worth synthesizing, in syllables. One Fidel character is one
 #: syllable, so this counts the script's own unit.
@@ -2784,6 +2784,9 @@ class SynthesisResult:
     #: The film-wide delivery plan these clips were spoken to. Recorded so a run can say
     #: what rate it asked for rather than leaving it to be inferred from the audio.
     pacing: PacingPlan | None = None
+    #: Anything the stage wants the run to know without treating it as a failure: lines
+    #: voiced despite a window shorter than the engine minimum, for instance.
+    notes: tuple[str, ...] = ()
 
     @property
     def attempted(self) -> int:
@@ -2808,6 +2811,7 @@ class SynthesisResult:
             "attempted": self.attempted,
             "failed": len(self.failed),
             "skipped_lines": [line.as_dict() for line in self.skipped],
+            "notes": list(self.notes),
         }
 
 
@@ -2818,21 +2822,20 @@ FAILURE_REASON_PREFIX = "synthesis failed"
 UNSPEAKABLE_REASON_PREFIX = "cannot be dubbed"
 
 
-def _skip_reason(line: AdaptedDialogue, *, min_line_seconds: float) -> str | None:
-    """Return why ``line`` cannot be dubbed, or ``None`` when it can.
+def _skip_reason(line: AdaptedDialogue) -> str | None:
+    """Return why ``line`` cannot be dubbed at all, or ``None`` when it can.
 
-    Both checks are about the *input*, not about an engine: a window with no room for
-    a word, or text with nothing to pronounce. Skipping these is not tolerating a
-    failure, it is refusing to ask for something that cannot work - and it is what
-    keeps a broken fragment from ending a three-hour run.
+    The only input that rules a line out is having nothing to pronounce. A short
+    original window does *not* rule a line out, and used to: four real lines of the
+    test film - "Walt.", "Thank you.", "We're done." and "No." - were dropped from the
+    dub because the English actor said them in a tenth of a second, leaving a hole in
+    the dialogue where the audience expects an answer.
+
+    A brief English line is normal rather than a defect. Amharic needs more time than
+    English to say the same thing, so the honest response is to say the line and let
+    :mod:`app.pipeline.timing` move the lines that follow, not to leave the line out.
     """
 
-    if line.duration < min_line_seconds:
-        return (
-            f"{UNSPEAKABLE_REASON_PREFIX}: the original window is "
-            f"{line.duration:.3f}s, shorter than the {min_line_seconds:g}s a line "
-            "needs to hold a word"
-        )
     if not has_pronounceable_text(line.amharic):
         return (
             f"{UNSPEAKABLE_REASON_PREFIX}: the Amharic line has nothing to "
@@ -3422,8 +3425,9 @@ def synthesize_dialogue_detailed(
 
     clips: list[TtsClip] = []
     skipped: list[SkippedLine] = []
+    short_windows: list[int] = []
     for index, line in enumerate(lines):
-        reason = _skip_reason(line, min_line_seconds=min_line_seconds)
+        reason = _skip_reason(line)
         if reason is not None:
             skipped.append(
                 SkippedLine(
@@ -3436,6 +3440,9 @@ def synthesize_dialogue_detailed(
                 )
             )
             continue
+
+        if line.duration < min_line_seconds:
+            short_windows.append(index)
 
         digest = _line_digest(line, model=artifact_model)
         try:
@@ -3501,7 +3508,21 @@ def synthesize_dialogue_detailed(
                 )
             )
 
-    return SynthesisResult(clips=tuple(clips), skipped=tuple(skipped), pacing=pacing)
+    notes: list[str] = []
+    if short_windows:
+        shown = ", ".join(str(index) for index in short_windows[:10])
+        if len(short_windows) > 10:
+            shown += f", and {len(short_windows) - 10} more"
+        notes.append(
+            f"{len(short_windows)} line(s) have an original window shorter than the "
+            f"{min_line_seconds:g}s engine minimum (line(s) {shown}); they were "
+            "synthesized and the timing stage moves the lines after them, because "
+            "dropping them would leave real dialogue unsaid"
+        )
+
+    return SynthesisResult(
+        clips=tuple(clips), skipped=tuple(skipped), pacing=pacing, notes=tuple(notes)
+    )
 
 
 def synthesize_dialogue(
@@ -3517,10 +3538,11 @@ def synthesize_dialogue(
     """Synthesize every dubbable line and return the clips.
 
     The clips alone, in the order the lines were given. Lines the stage could not
-    voice - a window too short to hold a word, text with nothing to pronounce, or a
-    line an engine failed on - are absent rather than raising; call
-    :func:`synthesize_dialogue_detailed` when the reason for each one is wanted,
-    which is what the orchestrator does so the manifest can record them.
+    voice - text with nothing to pronounce, or a line an engine failed on - are absent
+    rather than raising; call :func:`synthesize_dialogue_detailed` when the reason for
+    each one is wanted, which is what the orchestrator does so the manifest can record
+    them. A short original window is not a reason to leave a line out, so those lines
+    are voiced.
     """
 
     return list(
@@ -3545,7 +3567,7 @@ __all__ = [
     "CHATTERBOX_SAMPLE_RATE",
     "CLIP_CEILING",
     "EXAGGERATION_BOUNDS",
-    "MINIMUM_SPEAKABLE_LINE_SECONDS",
+    "MINIMUM_REPORTABLE_LINE_SECONDS",
     "MINIMUM_SPEAKABLE_SYLLABLES",
     "PerformanceControls",
     "SEED_VC_CONVERT_STYLE",

@@ -34,6 +34,7 @@ from app.pipeline.timing import (
     align_dialogue,
     resolve_timing_directory,
 )
+from app.config import DEFAULT_TIMING_MAX_OVERLAP_SECONDS, DEFAULT_TIMING_MAX_TEMPO
 from app.pipeline.translation import AdaptedDialogue
 from app.pipeline.tts import PerformanceControls, TtsClip
 
@@ -286,7 +287,7 @@ def test_a_line_that_cannot_fit_is_reported_not_mangled(
 
     aligned = align_dialogue([_clip(tmp_path, start=3.0, end=3.4)], settings=_settings(tmp_path))[0]
 
-    assert aligned.tempo == pytest.approx(1.25)
+    assert aligned.tempo == pytest.approx(DEFAULT_TIMING_MAX_TEMPO)
     assert aligned.required_tempo == pytest.approx(2.5)
     assert not aligned.fits
     assert aligned.residual > 0
@@ -309,8 +310,10 @@ def test_a_clamped_line_that_still_fits_says_nothing(
 def test_the_tempo_band_is_configurable(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
     """A line the default band cannot fit is fitted exactly by a wider one."""
 
-    # A 1.0 s line in a two-thirds-of-a-second window needs 1.5x.
-    clip = _clip(tmp_path, start=3.0, end=3.0 + SPEECH / 1.5)
+    # A line well inside the default ceiling: 1.0s of speech in 0.8s needs 1.25x,
+    # which the default band reaches comfortably, so the *wider* band must show a
+    # difference the default cannot.
+    clip = _clip(tmp_path, start=3.0, end=3.0 + SPEECH / 1.6)
 
     default = align_dialogue([clip], output_dir=tmp_path / "d", settings=_settings(tmp_path))[0]
     wider = align_dialogue(
@@ -319,10 +322,26 @@ def test_the_tempo_band_is_configurable(tmp_path: Path, ffmpeg: FakeFfmpeg) -> N
         settings=_settings(tmp_path, timing_min_tempo=0.5, timing_max_tempo=2.0),
     )[0]
 
-    assert default.tempo == pytest.approx(1.25)
-    assert not default.fits
-    assert wider.tempo == pytest.approx(1.5)
+    assert default.tempo == pytest.approx(DEFAULT_TIMING_MAX_TEMPO)
+    assert wider.tempo == pytest.approx(1.6)
     assert wider.fits
+
+
+def test_a_narrow_band_clamps_where_a_wide_one_fits(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """The band is what decides, not the line."""
+
+    clip = _clip(tmp_path, start=3.0, end=3.0 + SPEECH / 1.5)
+
+    narrow = align_dialogue(
+        [clip],
+        output_dir=tmp_path / "n",
+        settings=_settings(tmp_path, timing_max_tempo=1.25),
+    )[0]
+
+    assert narrow.tempo == pytest.approx(1.25)
+    assert not narrow.fits
 
 
 # ---------------------------------------------------------------------------

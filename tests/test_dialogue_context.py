@@ -16,6 +16,7 @@ from app.pipeline.dialogue_context import (
     DEFAULT_LOCAL_TEMPO_MIN,
     DEFAULT_SYLLABLES_PER_SECOND,
     MAXIMUM_SYLLABLE_BUDGET,
+    MINIMUM_SYLLABLE_BUDGET,
     Character,
     CharacterBible,
     InvalidBudgetError,
@@ -274,13 +275,28 @@ def test_a_bible_entry_without_a_name_falls_back_to_its_label(tmp_path: Path) ->
 
 def test_a_budget_scales_with_the_window() -> None:
     assert syllable_budget(2.0, rate=4.0).syllables == 8
-    assert syllable_budget(0.5, rate=4.0).syllables == 2
+    assert syllable_budget(1.5, rate=4.0).syllables == 6
 
 
 def test_a_budget_is_never_zero() -> None:
-    """Even a very short window has to allow a syllable."""
+    """Even a very short window has to allow something a person would say.
 
-    assert syllable_budget(0.01, rate=4.0).syllables == 1
+    The floor is what stops a model from being asked for the impossible. A one-syllable
+    budget for "We're done." produced ``ጨረቃ``, the word for *moon*, on the test film:
+    a model that cannot reach the target returns a shorter *word*, not a shorter line.
+    """
+
+    assert syllable_budget(0.01, rate=4.0).syllables == MINIMUM_SYLLABLE_BUDGET
+
+
+def test_a_budget_above_the_floor_still_scales_with_the_window() -> None:
+    assert syllable_budget(1.0, rate=4.0).syllables == 4
+    assert syllable_budget(1.25, rate=4.0).syllables == 5
+    assert syllable_budget(1.75, rate=4.0).syllables == 7
+
+
+def test_the_floor_can_be_lowered_for_a_run_that_wants_it() -> None:
+    assert syllable_budget(0.01, rate=4.0, minimum=1).syllables == 1
 
 
 def test_a_budget_is_capped() -> None:

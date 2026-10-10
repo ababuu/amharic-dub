@@ -62,7 +62,7 @@ from typing import Any
 
 from app.config import Settings, get_settings
 from app.pipeline import nllb
-from app.pipeline.amharic_text import count_syllables, latin_spans
+from app.pipeline.amharic_text import count_syllables, has_pronounceable_text, latin_spans
 from app.pipeline.dialogue_context import (
     DEFAULT_BUDGET_TOLERANCE,
     DEFAULT_SYLLABLES_PER_SECOND,
@@ -115,9 +115,16 @@ Non-negotiable rules
 5. Do not make dialogue more formal or more polite than the original. Street talk
    stays street talk, and casual speech stays casual.
 6. Do not add information that is not present, and do not explain a joke.
-7. Do not cut important meaning just to make a line shorter. Trim only harmless
-   filler, and only when timing requires it.
-8. When a literal rendering would sound unnatural in Amharic, restructure the
+7. Fitting the time is part of the translation, not an edit applied after it. When a
+   line does not fit, shorten it by cutting what the scene already carries - drop a
+   clause that repeats what the previous line established, drop a detail the picture
+   shows, drop an aside, a qualification or an example - and keep the one thing the
+   line exists to say. A shorter line that lands the beat is a better adaptation than
+   a complete one that cannot be spoken in the time it has.
+8. Never cut the information the scene turns on. If a line is the reason the next
+   thing happens, or carries a name, a number, a threat, a promise or a reveal, that
+   part stays and something else goes instead.
+9. When a literal rendering would sound unnatural in Amharic, restructure the
    whole sentence. Rewriting freely is encouraged as long as the meaning, tone and
    intent survive.
 
@@ -192,9 +199,24 @@ compact than a word-for-word rendering of English. Use that:
 Say the same thing in fewer words: that is the craft. A faithful rendering that does
 not fit is not a good translation of a *dub* - it is a line that cannot be performed.
 
-Never pad a line to fill its time, and never drop information the scene needs. If the
-budget truly cannot be met, get as close to it as you can rather than exceeding it by
-half. Do not use the borrowed-word licence above as an excuse for length either.
+If the budget is genuinely tight, work down these steps in order, stopping as soon as
+the line fits:
+
+1. Remove filler, particles, false starts and repetition.
+2. Remove anything the previous line already said or the picture already shows.
+3. Merge two short clauses into one verb.
+4. Drop a qualification, an example, an aside or a subordinate clause, keeping the
+   main assertion.
+5. Rebuild the line as the shortest spoken Amharic sentence that still does the same
+   job in the conversation - what it changes, reveals, threatens, asks or refuses.
+
+Steps 4 and 5 change the words considerably. That is expected and allowed: the
+standard is what the character is doing with the line, not how many of the English
+words survived. What must never go is the information the scene needs to move.
+
+Never pad a line to fill its time. If the budget truly cannot be met, get as close to
+it as you can rather than exceeding it by half. Do not use the borrowed-word licence
+above as an excuse for length either.
 
 Punctuation should support spoken delivery - use commas, dashes, ellipses and
 question marks the way a performer would breathe and pause.
@@ -730,6 +752,59 @@ def _adapt_batch(
 #: unbounded loop would eventually fit the window by losing the meaning.
 MAXIMUM_REDUCTION_ATTEMPTS = 3
 
+#: What each successive rewrite is told to cut. Escalating matters more than repeating:
+#: a model asked the same question twice returns nearly the same line, whereas a model
+#: told *what* to give up next actually shortens. Measured on the real transcript, the
+#: Amharic came back at 1.5x its budget when the retry only said "cut filler".
+REDUCTION_TACTICS: tuple[str, ...] = (
+    "Cut filler, particles, false starts and repetition. Drop pronouns the verb already "
+    "marks, and vocatives the scene makes obvious. Keep every piece of information.",
+    "Cut deeper. Drop anything the line before it already said, anything the picture "
+    "already shows, and any aside, example or qualification. Keep the main assertion "
+    "and everything the scene turns on.",
+    "Rebuild the line as the shortest spoken Amharic sentence that does the same job in "
+    "the conversation - what it changes, reveals, threatens, asks or refuses. The words "
+    "may change completely; the effect must not. Keep any name, number, threat, promise "
+    "or reveal.",
+)
+
+
+def reduction_tactic(attempt: int) -> str:
+    """Return the instruction for rewrite ``attempt`` (1-based), clamped to the list."""
+
+    index = min(max(attempt, 1), len(REDUCTION_TACTICS)) - 1
+    return REDUCTION_TACTICS[index]
+
+
+def _rank(line: AdaptedDialogue, *, enforce_fidel_loanwords: bool) -> tuple[int, int] | None:
+    """Score a rewrite, lower being better, or ``None`` when it is unusable.
+
+    Ranking rather than accepting is what stops the loop going backwards: a model that
+    is asked for something shorter sometimes returns something *longer*, and the old
+    code took it unconditionally, so a line could end up worse after three attempts
+    than after one. A line with no Amharic at all scores ``None`` and is never taken.
+    """
+
+    if not has_pronounceable_text(line.amharic):
+        return None
+    roman = len(latin_spans(line.amharic)) if enforce_fidel_loanwords else 0
+    return (roman, count_syllables(line.amharic))
+
+
+def _is_improvement(
+    candidate: AdaptedDialogue,
+    current: AdaptedDialogue,
+    *,
+    enforce_fidel_loanwords: bool,
+) -> bool:
+    """Return ``True`` when ``candidate`` is closer to being speakable than ``current``."""
+
+    better = _rank(candidate, enforce_fidel_loanwords=enforce_fidel_loanwords)
+    if better is None:
+        return False
+    worse = _rank(current, enforce_fidel_loanwords=enforce_fidel_loanwords)
+    return worse is None or better < worse
+
 
 def _reduce_overshooting_lines(
     client: Any,
@@ -785,7 +860,8 @@ def _reduce_overshooting_lines(
         if index in over_budget:
             instructions.append(
                 f"- {_dialogue_id(first_position + index)}: "
-                f"{verdicts[index].describe()}"
+                f"{verdicts[index].describe()} It is over the time it has, so it has to "
+                f"get shorter or it will be heard over the next line. {reduction_tactic(1)}"
             )
         if index in with_roman:
             instructions.append(
@@ -808,7 +884,13 @@ def _reduce_overshooting_lines(
         ),
     )
     for slot, line in zip(offenders, retried):
-        adapted[slot] = line
+        # Only keep the rewrite when it is actually better. A model asked to shorten a
+        # line sometimes returns a longer one, and taking that would leave the line
+        # worse off than before this attempt.
+        if _is_improvement(
+            line, adapted[slot], enforce_fidel_loanwords=enforce_fidel_loanwords
+        ):
+            adapted[slot] = line
 
     return _reduce_again(
         client,
@@ -889,9 +971,8 @@ def _reduce_again(
             instructions.append(
                 f"- {_dialogue_id(first_position + index)}: "
                 f"{verdicts[index].describe()} This is attempt "
-                f"{total_attempts - attempts + 1} for this line. Cut words, not meaning: "
-                "drop the vocative, drop a pronoun the verb already marks, drop any word "
-                "the scene makes obvious."
+                f"{total_attempts - attempts + 1} for this line. "
+                f"{reduction_tactic(total_attempts - attempts + 1)}"
             )
         if index in with_roman:
             instructions.append(
@@ -914,7 +995,10 @@ def _reduce_again(
         ),
     )
     for slot, line in zip(offenders, retried):
-        adapted[slot] = line
+        if _is_improvement(
+            line, adapted[slot], enforce_fidel_loanwords=enforce_fidel_loanwords
+        ):
+            adapted[slot] = line
 
     return _reduce_again(
         client,

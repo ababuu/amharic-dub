@@ -183,12 +183,23 @@ lines that need nothing, which is heard as a rushed line rather than a consisten
 Lines that run *short* are likewise left alone, since fitting one down into a longer
 window is the timing stage's job.
 
-**Why nothing is widened to make it fit.** Raising the request band is tempting - asking
-for 1.5x would trim less - but it was measured on a real failing run and rejected:
-against 144.8s of Amharic needing to fit 87.3s of available time, requesting 1.25x leaves
-38.6s cut across 29 lines, and requesting 1.5x still leaves 22.6s cut across 27 lines
-while rushing the entire film by half again. The band stays at 1.25 and the remaining
-time comes out of the *text*, which is what the shortening pass below is for.
+**Why the ceiling is 1.45 and not 1.25.** The ceiling is a measured trade, not a taste.
+Replaying the failed run's own line timings through the placement policy below, with the
+Amharic the adaptation stage produced for this project, the worst line lands this far
+after the actor spoke:
+
+| stretch ceiling | hand-over allowance | worst line moved later |
+| --- | --- | --- |
+| 1.25 (the old default) | none | 9.24s |
+| 1.35 | 0.45s | 5.00s |
+| **1.45** (the default) | **0.45s** | **4.13s** |
+| 1.55 | 0.45s | 3.38s |
+
+Below 1.25 the lines have nowhere to go and the whole dub falls behind the picture; past
+1.45 the delivery starts to sound hurried for what is left to gain. The band is not a
+target: a line that already fits is left at its natural pace, and only the lines that
+cannot fit are delivered faster. The remaining time comes out of the *text*, which is what
+the shortening pass below is for.
 | Delivery (later)     | Bunny Stream                            |
 
 Target GPU: **NVIDIA RTX A40 (48 GB VRAM)**.
@@ -281,7 +292,7 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
 | `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |
 | `TRANSLATION_BACKEND` | `nllb` (local translation) or `openai` (instruction-following adaptation) | `nllb` |
-| `TRANSLATION_MODEL`  | Model for the selected backend. Defaults per backend: `deepseek-flash` for `openai`, `facebook/nllb-200-3.3B` for `nllb` | per backend |
+| `TRANSLATION_MODEL`  | Model for the selected backend. Defaults per backend: `deepseek-v4-pro` for `openai`, `facebook/nllb-200-3.3B` for `nllb` | per backend |
 | `TRANSLATION_NUM_BEAMS` | NLLB beam width; `1` is greedy and deterministic | `1` |
 | `TRANSLATION_MAX_NEW_TOKENS` | Longest NLLB output per chunk, in tokens | `512` |
 | `TRANSLATION_LENGTH_PENALTY` | NLLB's preference over output length; `<1` favours brevity | `1.0` |
@@ -316,7 +327,8 @@ environment, so values configured on the RunPod pod always win.
 | `TTS_CONTINUE_ON_FAILURE` | Skip and report a line an engine fails on instead of ending the run | `false` |
 | `TTS_REQUEST_RATE` | Ask a cloning engine for a per-line length before falling back to stretching | `true` |
 | `TIMING_MIN_TEMPO` | Slowest a line may be stretched to fit its window | `0.80` |
-| `TIMING_MAX_TEMPO` | Fastest a line may be stretched to fit its window | `1.25` |
+| `TIMING_MAX_TEMPO` | Fastest a line may be stretched to fit its window | `1.45` |
+| `TIMING_MAX_OVERLAP_SECONDS` | How far a line may still be sounding when the next one begins before the next one is moved instead | `0.45` |
 | `TIMING_MIN_LINE_GAP` | Silence kept between one dubbed line and the next, so two voices never sound at once | `0.12` |
 | `TIMING_TRIM_TO_FIT` | Cut a line that will not fit, with a fade, instead of letting it briefly overlap the next | `false` |
 | `MIX_DIALOGUE_GAIN_DB` | Dialogue level in the final mix (signed dB)     | `0.0`              |
@@ -608,6 +620,17 @@ under `<VOICE_PROFILE_DIR>/<SPEAKER_ID>/reference.wav`. FFmpeg must therefore be
 on `PATH`. Emotion, intensity and delivery are **not** stored in a profile: they
 change per line and belong to `AdaptedDialogue`.
 
+**The bed is checked for the original dialogue, every run.** The music and effects
+stems are summed back in untouched, so anything the separator failed to take out of
+them is played under the Amharic - the one way the source language can reach a
+finished dub. `separation.measure_bed_bleed` reads each dialogue window straight out
+of the three stems (never whole files: two 2-hour 48 kHz stems are ~8 GB of float32)
+and reports any window where the bed is both within `-15 dB` of the isolated speech
+and correlated with it. Two conditions, because loud music under a line is not a
+leak. The result appears in the run summary as `bleed`, in the manifest as
+`run.bleed`, and a leak is called out as a warning rather than left for a viewer to
+notice. On the GPU run that prompted this, 0 of 42 windows leaked.
+
 Candidate windows are ranked on duration, speech presence, dynamic range,
 loudness, overlap with other speakers and clipping. Speech presence is an energy
 VAD: a frame counts as speech only when it rises above the *local* noise floor, so
@@ -779,32 +802,41 @@ Three things happen in order, and only ever as far as needed:
    pitch-preserving `atempo`. Only the speech is stretched; the rendered pauses keep their
    length, and a line's leading pause shifts the file rather than the line, so the speech
    still lands on its original start.
-3. **A line that still cannot fit is reported, not cut.** `TIMING_TRIM_TO_FIT` (default
-   `false`) decides whether it is faded short instead. Cutting is off by default because it
-   is the one outcome that damages the performance itself: on a real run where the text was
-   too long it fired on 31 of 38 lines, and the result was described as "not a single good
-   sentence without cuts and stutters". A brief overlap is the lesser evil, and the run
-   states the overrun in the manifest and in its summary either way.
+3. **A line that still cannot fit is not cut and is not laid over its neighbour.** A line
+   already faintly speaking when the next one begins is *not* a defect: up to
+   `TIMING_MAX_OVERLAP_SECONDS` (default `0.45s`) of the previous line may still be
+   sounding, which is what a hand-over in a conversation sounds like - and because the
+   window includes the next line's leading pause, the audio that actually overlaps is
+   shorter than that. Past it, the next line **moves later** instead, recorded per line as
+   `drift`, and reported in the run summary as `placement`.
+
+Cutting remains available and remains off by default: `TIMING_TRIM_TO_FIT` (default
+`false`) fades a line short instead. It is the one outcome that damages the performance
+itself, and on a real run where the text was too long it fired on 31 of 38 lines - "not a
+single good sentence without cuts and stutters".
 
 A line with no successor - the last in the film, or a clip aligned on its own - is
 **never** cut: it harms nobody by running past its own window, and cutting would be
 mangling for no benefit. `atempo` accepts 0.5-2.0, so a wider band is rejected rather than
 passed through.
 
-The fix that made lines stop talking over each other is the *deadline*, and it is
-independent of all of this: measured on a real failing run, **28 overlapping lines became
-0.**
+The placement policy that makes lines stop talking over each other is the combination of
+the hand-over allowance and the cascade, and it is independent of all of this: measured
+with the real timing stage against the failed run's own timings, **40 overlapping line
+pairs - 34 of them a character speaking over themselves, worst 2.7s - became 31 pairs
+whose worst overlap is 0.18s, i.e. a natural hand-over rather than two voices at once.**
 
 Mixing places every aligned line at its own timestamp into a continuous dialogue
 stem, then sums that with the **music and effects only**. The original English
 dialogue is never used: separation already removed it, and mixing the full
 original mix back in would reintroduce the language the pipeline exists to
-replace. Overlaps are kept - the original performances overlapped too, and moving
-a line would break its sync - and every overlap is reported with its speaker pair
-and duration. The bed is ducked under the dialogue by `MIX_DUCK_DB` with a ramped
-reduction, so it never gates or clicks, and only the bed is reduced. The mix is
-then held under a -1 dBFS ceiling; if that needs a global scale-down, the
-reduction and the peak that caused it are reported.
+replace. Genuine overlaps - the ones the original performance had, and the small
+hand-over the timing stage allows - are summed and reported with their speaker
+pair and duration; the timing stage has already removed the accidental ones. The
+bed is ducked under the dialogue by `MIX_DUCK_DB` with a ramped reduction, so it
+never gates or clicks, and only the bed is reduced. The mix is then held under a
+-1 dBFS ceiling; if that needs a global scale-down, the reduction and the peak
+that caused it are reported.
 
 Loudness normalization (EBU R128) is deliberately **not** applied: the mix is
 placed at a defined peak with defined dialogue and bed levels so it stays

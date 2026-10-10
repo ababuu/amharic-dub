@@ -91,6 +91,11 @@ DEFAULT_BUDGET_TOLERANCE = 0.10
 #: an unusually long original window turning into an invitation to pad a line.
 MAXIMUM_SYLLABLE_BUDGET = 240
 
+#: Fewest syllables a line is ever asked to fit into. A budget below this is not a
+#: target a model can hit while still saying something true, and asking for one is how
+#: a dub acquires words that mean the wrong thing.
+MINIMUM_SYLLABLE_BUDGET = 4
+
 
 class DialogueContextError(RuntimeError):
     """Base class for every error raised by this module."""
@@ -487,8 +492,19 @@ def syllable_budget(
     *,
     rate: float = DEFAULT_SYLLABLES_PER_SECOND,
     maximum: int = MAXIMUM_SYLLABLE_BUDGET,
+    minimum: int = MINIMUM_SYLLABLE_BUDGET,
 ) -> SyllableBudget:
-    """Return the syllable budget for a ``window`` of ``window`` seconds."""
+    """Return the syllable budget for a ``window`` of ``window`` seconds.
+
+    ``minimum`` is a floor, and it exists because a budget can be *impossible* rather
+    than merely tight. "Thank you." in a 0.54s room is two syllables, and Amharic has no
+    two-syllable way to say it; "We're done." in a 0.27s room is one. Asked for one
+    syllable, a model does not decline - it returns whatever is short enough, which on
+    the test film was ``ጨረቃ``, the word for *moon*, in place of ``ጨረስን``, "we're done".
+    A wrong word in the dub is far worse than a line that runs long, so the budget stops
+    at the shortest thing a person would actually say and the overrun is handled by
+    :mod:`app.pipeline.timing`.
+    """
 
     if not math.isfinite(rate) or rate <= 0:
         raise InvalidBudgetError(f"rate must be a positive number, got {rate!r}")
@@ -496,8 +512,10 @@ def syllable_budget(
         raise InvalidBudgetError(f"window must be a positive number, got {window!r}")
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
         raise InvalidBudgetError(f"maximum must be a positive integer, got {maximum!r}")
+    if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
+        raise InvalidBudgetError(f"minimum must be a positive integer, got {minimum!r}")
 
-    syllables = max(1, min(maximum, round(window * rate)))
+    syllables = max(minimum, min(maximum, round(window * rate)))
     return SyllableBudget(window=window, syllables=syllables, rate=rate)
 
 
@@ -789,6 +807,7 @@ __all__ = [
     "DEFAULT_MIN_LINE_GAP",
     "DEFAULT_PACING_TOLERANCE",
     "MINIMUM_PLACEMENT_WINDOW",
+    "MINIMUM_SYLLABLE_BUDGET",
     "DEFAULT_SCENE_GAP_SECONDS",
     "DEFAULT_SCENE_MAX_SECONDS",
     "DEFAULT_SYLLABLES_PER_SECOND",

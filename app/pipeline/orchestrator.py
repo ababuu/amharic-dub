@@ -134,6 +134,10 @@ class PipelineResult:
     stage_seconds: Mapping[str, float]
     elapsed_seconds: float
     synthesized_lines: int
+    #: How much of the film's original dialogue survived separation into the bed.
+    bleed: separation.BleedReport | None = None
+    #: Anything the TTS stage wanted the run to know without treating it as a failure.
+    notes: tuple[str, ...] = ()
 
     @property
     def final_video(self) -> Path:
@@ -228,6 +232,7 @@ class PipelineResult:
             },
             "mixing": self.mix.to_dict(),
             "mux": self.dub.to_dict(),
+            "bleed": None if self.bleed is None else self.bleed.as_dict(),
         }
 
     def report(self) -> str:
@@ -235,6 +240,7 @@ class PipelineResult:
 
         speakers = sorted({turn.speaker_id for turn in self.turns})
         stretched = sum(1 for line in self.alignment if line.tempo != 1.0)
+        drifted = [line for line in self.alignment if line.drift > 0.005]
         lines = [
             f"source          {self.source}",
             f"output          {self.output_dir}",
@@ -246,6 +252,11 @@ class PipelineResult:
             f"tts             {len(self.clips)} clip(s)",
             f"timing          {len(self.alignment)} aligned, {stretched} stretched, "
             f"{len(self.unfitted_lines)} not fitted",
+            f"placement       {len(drifted)} line(s) moved later to avoid speaking over "
+            f"the line before them, worst "
+            f"{max((line.drift for line in drifted), default=0.0):.2f} s",
+            f"bleed           "
+            f"{'not measured' if self.bleed is None else self.bleed.summary()}",
             f"mixing          {self.mix.duration:.1f} s track, "
             f"{len(self.mix.overlaps)} overlapping line(s), "
             f"peak {self.mix.peak:.3f}",
@@ -255,7 +266,9 @@ class PipelineResult:
             f"manifest        {self.manifest_path}",
             f"elapsed         {self.elapsed_seconds:.1f} s",
         ]
-        if self.partial:
+        for note in self.notes:
+            lines.append(f"note            {note}")
+        if self.partial or self.skipped:
             reasons: list[str] = []
             if self.skipped:
                 reasons.append(f"{len(self.skipped)} line(s) could not be voiced")
@@ -589,6 +602,8 @@ def run_pipeline(
             f"  skipped: {len(skipped)} line(s) could not be voiced "
             f"({len(synthesized.failed)} engine failure(s))"
         )
+    for note in synthesized.notes:
+        report(f"  note: {note}")
     if not clips:
         raise EmptyStageError(
             "speech synthesis produced no clips; there is nothing to place or mix"
@@ -605,6 +620,27 @@ def run_pipeline(
             settings=resolved,
         )
     )
+
+    # Measured, because the one way the source language can survive into a finished
+    # dub is the separator leaving it in the music or effects, which are re-mixed
+    # untouched. Cheap next to the stages above, and the alternative is finding out
+    # from a listener.
+    try:
+        bleed = separation.measure_bed_bleed(
+            stems, [(line.start, line.end) for line in lines]
+        )
+    except separation.SeparationError as exc:
+        # A diagnostic must never be the reason a finished dub is lost, so an
+        # unreadable stem is reported as unmeasured rather than raised.
+        bleed = None
+        report(f"  bleed: not measured ({exc})")
+    else:
+        report(f"  bleed: {bleed.summary()}")
+        if not bleed.clean:
+            report(
+                "  bleed: WARNING the original dialogue is still in the bed under "
+                f"{bleed.leaked} line(s); it will be heard under the Amharic"
+            )
 
     mixed = _stage(
         "mixing",
@@ -641,6 +677,8 @@ def run_pipeline(
         profiles=dict(profiles),
         clips=clips,
         skipped=skipped,
+        notes=tuple(synthesized.notes),
+        bleed=bleed,
         alignment=alignment,
         mix=mixed,
         dub=dub,
@@ -686,6 +724,25 @@ def _provenance(settings: Settings) -> dict[str, Any]:
     }
 
 
+def _engine_note(settings: Settings) -> str:
+    """Describe the synthesis chain this run actually used.
+
+    The note used to name Seed-VC whatever the engine was, which made a manifest from an
+    OmniVoice run claim a conversion stage that never ran. What produced a dub has to be
+    readable from the manifest alone.
+    """
+
+    if tts.engine_needs_profiles(settings.tts_engine):
+        return (
+            f"{settings.tts_engine} runs voice cloning: each character is spoken in "
+            "their own voice, cloned from their isolated English performance"
+        )
+    return (
+        f"{settings.tts_engine} is a single-voice engine: one voice speaks every part, "
+        "so the source's English performance is used as a prompt rather than converted"
+    )
+
+
 def _write_manifest(
     result: PipelineResult,
     *,
@@ -716,17 +773,32 @@ def _write_manifest(
         "notes": [
             "video streams are copied, never re-encoded; the source's own audio "
             "streams are replaced by the Amharic mix",
-            "Seed-VC V2 runs in timbre-only mode: it replaces the character's voice "
-            "and leaves the take's delivery alone (SEED_VC_CONVERT_STYLE=false)",
+            _engine_note(settings),
             "loudness normalization (EBU R128) is not applied: the mix is placed "
             "at a defined peak with defined dialogue and bed levels",
             "clip paths are content-addressed artifacts of the tts stage, so later "
             "runs of the same lines reuse them instead of re-synthesizing",
+            "a line whose Amharic needs more time than the film gave it is moved "
+            "later rather than being spoken over the next line, because two voices "
+            "at once cannot be understood; the shift is recorded per line as 'drift'",
             "the qc block is measured, not assumed; pronunciation is left "
             "unmeasured because it needs an Amharic ASR model, which is injected "
             "by the caller rather than downloaded by a run",
         ],
     }
+    if result.partial or result.skipped:
+        why = (
+            f"{len(result.skipped)} line(s) could not be voiced"
+            if result.skipped
+            else "the run was limited with --max-lines"
+        )
+        payload["notes"].insert(
+            0,
+            f"INCOMPLETE DUB: only {result.synthesized_lines} of "
+            f"{len(result.dialogue)} line(s) were synthesized ({why}); see run.tts "
+            "for the lines that are missing and why",
+        )
+    payload["notes"].extend(result.notes)
 
     target = result.manifest_path
     temporary = target.with_suffix(target.suffix + ".tmp")
@@ -766,11 +838,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        run_pipeline(args.source, output_dir=args.out, max_lines=args.max_lines)
+        result = run_pipeline(args.source, output_dir=args.out, max_lines=args.max_lines)
     except OrchestrationError as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)
         traceback.print_exc()
         return 1
+
+    if result.skipped:
+        # A dub missing lines is a deliverable that is wrong rather than a run that
+        # failed, so it still exits non-zero: a caller that only checks the exit code
+        # must not be able to ship a film with dialogue missing from it.
+        print(
+            f"\nINCOMPLETE DUB: {len(result.skipped)} of {len(result.dialogue)} "
+            f"line(s) were not voiced. {result.manifest_path} records the reason for "
+            "each one under run.tts.skipped_lines.",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

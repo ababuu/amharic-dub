@@ -25,10 +25,12 @@ Deliberate non-goals
 
 from __future__ import annotations
 
+import math
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import soundfile as sf
@@ -257,11 +259,206 @@ def separate_stems(
     )
 
 
+#: How far below the original performance the bed has to sit for the English to be
+#: inaudible under the dub. Speech stays intelligible about 15 dB under competing
+#: sound, so a bed carrying the original that close to the mix is a leak, not a
+#: level choice.
+AUDIBLE_BLEED_DB = -15.0
+
+
+@dataclass(frozen=True, slots=True)
+class BleedReport:
+    """How much of the film's **original dialogue** survived into the bed.
+
+    The music and effects stems are re-mixed untouched, so anything the separator
+    failed to take out of them is played under the Amharic. That is the one way the
+    source language can still be heard in a finished dub, and it is worth measuring
+    rather than assuming: a separator that works on ten minutes of dialogue can still
+    misclassify a whispered line at minute 95 of a feature.
+
+    ``leaked`` counts the windows where the bed is both *level with* and *correlated
+    with* the isolated speech - two independent conditions, because loud music that
+    happens to sit under a line is not a leak.
+    """
+
+    windows: int
+    leaked: int
+    worst_seconds: float
+    worst_index: int | None
+    worst_relative_db: float
+    worst_correlation: float
+
+    @property
+    def clean(self) -> bool:
+        """``True`` when no window carries the original dialogue audibly."""
+
+        return self.leaked == 0
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe view of the measurement."""
+
+        return {
+            "windows": self.windows,
+            "leaked": self.leaked,
+            "worst_seconds": round(self.worst_seconds, 3),
+            "worst_index": self.worst_index,
+            "worst_relative_db": round(self.worst_relative_db, 2),
+            "worst_correlation": round(self.worst_correlation, 4),
+        }
+
+    def summary(self) -> str:
+        """Return the one-line summary a run prints."""
+
+        if not self.windows:
+            return "original-dialogue bleed not measured"
+        if self.clean:
+            return (
+                f"no original dialogue left in the bed over {self.windows} line "
+                f"window(s); worst {self.worst_relative_db:.1f} dB below the speech"
+            )
+        return (
+            f"WARNING: the bed still carries the original dialogue in {self.leaked} "
+            f"of {self.windows} window(s); worst {self.worst_relative_db:.1f} dB "
+            "below the speech at {:.2f}s".format(self.worst_seconds)
+        )
+
+
+def _open_stem(path: Path, *, what: str) -> sf.SoundFile:
+    """Open a stem for windowed reading, or raise the module's own error."""
+
+    try:
+        return sf.SoundFile(str(path))
+    except (OSError, RuntimeError) as exc:  # soundfile errors subclass RuntimeError
+        if not Path(path).is_file():
+            raise MissingInputError(f"{what} not found: {path}") from exc
+        raise InvalidAudioError(f"could not open {what} {path}: {exc}") from exc
+
+
+def measure_bed_bleed(
+    stems: StemPaths,
+    windows: Iterable[tuple[float, float]],
+    *,
+    threshold_db: float = AUDIBLE_BLEED_DB,
+) -> BleedReport:
+    """Measure how much original dialogue is left in the music and effects stems.
+
+    Parameters
+    ----------
+    stems:
+        The three stems one run produced.
+    windows:
+        ``(start, end)`` of every moment the film has dialogue. The speech stem is
+        what the separator thinks the dialogue is; these windows say when it happened.
+    threshold_db:
+        How close to the isolated speech the bed may come before the bleed is called
+        audible.
+
+    Returns
+    -------
+    BleedReport
+
+    Notes
+    -----
+    Each window is read straight out of the files, so memory stays flat: three
+    two-hour 48 kHz stems are about 8 GB of float32 in total, and an A40 doing the
+    rest of the pipeline does not have that to spare. Nothing is ever loaded whole.
+
+    Both stems are summed to one channel: the question is whether the *performance*
+    is present, and a mono sum answers it without a channel-wise alignment
+    assumption.
+    """
+
+    windows = list(windows)
+    speech_file = _open_stem(Path(stems.speech), what="speech stem")
+    with speech_file, _open_stem(Path(stems.music), what="music stem") as music_file, (
+        _open_stem(Path(stems.effects), what="effects stem")
+    ) as effects_file:
+        rate = int(speech_file.samplerate)
+        for other, name in ((music_file, "music"), (effects_file, "effects")):
+            if int(other.samplerate) != rate:
+                raise UnsupportedSampleRateError(
+                    f"the {name} stem is {other.samplerate} Hz but the speech stem is "
+                    f"{rate} Hz; the stems of one run must share a rate"
+                )
+
+        frames = min(len(speech_file), len(music_file), len(effects_file))
+        floor = max(1, int(round(0.02 * rate)))
+
+        leaked = 0
+        counted = 0
+        worst_index: int | None = None
+        worst_relative = -math.inf
+        worst_correlation = 0.0
+        worst_seconds = 0.0
+
+        for index, (start, end) in enumerate(windows):
+            first = max(0, int(round(start * rate)))
+            last = min(frames, int(round(end * rate)))
+            if last - first < floor:
+                continue
+            counted += 1
+
+            try:
+                reference = _read_window(speech_file, first, last - first)
+                candidate = _read_window(music_file, first, last - first) + _read_window(
+                    effects_file, first, last - first
+                )
+            except (OSError, RuntimeError) as exc:
+                raise InvalidAudioError(
+                    f"could not read the stems at {start:.3f}s-{end:.3f}s: {exc}"
+                ) from exc
+
+            reference_rms = float(np.sqrt(np.mean(reference**2)))
+            bed_rms = float(np.sqrt(np.mean(candidate**2)))
+            if reference_rms <= 0.0 or bed_rms <= 0.0:
+                continue
+            relative_db = 20.0 * math.log10(bed_rms / reference_rms)
+
+            if reference.std() > 0.0 and candidate.std() > 0.0:
+                correlation = float(np.corrcoef(candidate, reference)[0, 1])
+            else:
+                correlation = 0.0
+
+            if relative_db >= threshold_db and correlation >= 0.5:
+                leaked += 1
+            if relative_db > worst_relative:
+                worst_relative = relative_db
+                worst_correlation = correlation
+                worst_seconds = start
+                worst_index = index
+
+    if not math.isfinite(worst_relative):
+        worst_relative = -math.inf
+
+    return BleedReport(
+        windows=counted,
+        leaked=leaked,
+        worst_seconds=worst_seconds,
+        worst_index=worst_index,
+        worst_relative_db=worst_relative,
+        worst_correlation=worst_correlation,
+    )
+
+
+def _read_window(handle: sf.SoundFile, first: int, frames: int) -> np.ndarray:
+    """Read ``frames`` samples starting at ``first`` and return them as one channel.
+
+    ``frames`` is always within every stem - the caller clamps to the shortest - so a
+    short read is not a case that arises.
+    """
+
+    handle.seek(first)
+    block = handle.read(frames, dtype="float32", always_2d=True)
+    return np.asarray(block, dtype=np.float32).mean(axis=1)
+
+
 __all__ = [
+    "AUDIBLE_BLEED_DB",
     "MODEL_NAME",
     "REQUIRED_SAMPLE_RATE",
     "STEM_NAMES",
     "WEIGHTS_DIR_ENV_VAR",
+    "BleedReport",
     "SeparationError",
     "MissingInputError",
     "UnsupportedSampleRateError",
@@ -269,6 +466,7 @@ __all__ = [
     "SeparationInferenceError",
     "MissingStemError",
     "StemPaths",
+    "measure_bed_bleed",
     "read_audio",
     "resolve_weights_dir",
     "separate_stems",

@@ -1210,17 +1210,18 @@ def test_the_failing_line_is_identified_by_its_window(rig: Rig) -> None:
 
 
 def _short_line() -> AdaptedDialogue:
-    """The 0.22s fragment that fed a three-syllable line to Chatterbox.
+    """The 0.22s window in which the actor says "Walt.".
 
-    Chatterbox produced an empty mel spectrogram for it and its vocoder died in a
-    convolution, which ended an otherwise healthy run. There is no room for a word
-    in 0.22s, so the line is not dubbable and must never reach the engine.
+    It used to be dropped as undubbable, which left a hole in the dub exactly where the
+    audience expects a name to be called. A brief English line is normal rather than a
+    defect; the Amharic that replaces it needs more time, and the timing stage finds
+    that time by moving the lines after it.
     """
 
     return _line(start=5.836, end=6.056, amharic="ዋልት።")
 
 
-def test_a_window_too_short_to_hold_a_word_is_skipped(rig: Rig) -> None:
+def test_a_short_window_is_voiced_rather_than_dropped(rig: Rig) -> None:
     result = tts.synthesize_dialogue_detailed(
         [_short_line()],
         rig.stem,
@@ -1230,24 +1231,38 @@ def test_a_window_too_short_to_hold_a_word_is_skipped(rig: Rig) -> None:
         style_engine=rig.seedvc,
     )
 
-    assert result.clips == ()
-    (skipped,) = result.skipped
-    assert skipped.index == 0
-    assert skipped.speaker_id == rig.profile.speaker_id
-    assert skipped.amharic == "ዋልት።"
-    assert skipped.duration == pytest.approx(0.22)
-    assert "cannot be dubbed" in skipped.reason
-    assert "0.220s" in skipped.reason
-    assert result.failed == ()  # refused, not failed
+    assert result.skipped == ()
+    assert [clip.index for clip in result.clips] == [0]
+    assert result.clips[0].dialogue.amharic == "ዋልት።"
+    (note,) = result.notes
+    assert "shorter than the" in note
+    assert "line(s) 0" in note
 
 
-def test_the_engine_is_never_called_for_a_skipped_line(rig: Rig) -> None:
-    """The guard has to run *before* the engine, or the crash it prevents returns."""
+def test_the_short_window_is_reported_even_though_the_line_is_spoken(rig: Rig) -> None:
+    """A run still has to be able to see that a line had almost no room."""
+
+    result = tts.synthesize_dialogue_detailed(
+        [_short_line()],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        performance_engine=rig.chatterbox,
+        style_engine=rig.seedvc,
+    )
+
+    payload = result.as_dict()
+    assert payload["notes"]
+    assert payload["skipped"] == 0
+
+
+def test_the_engine_is_not_called_for_a_line_with_nothing_to_pronounce(rig: Rig) -> None:
+    """The guard has to run *before* the engine, or it costs a wasted synthesis."""
 
     catchbox = rig.chatterbox
 
     tts.synthesize_dialogue_detailed(
-        [_short_line()],
+        [_line(amharic="።፣?!")],
         rig.stem,
         {rig.profile.speaker_id: rig.profile},
         settings=rig.settings(),
@@ -1268,8 +1283,8 @@ def test_a_short_line_does_not_stop_the_lines_around_it(rig: Rig) -> None:
         style_engine=rig.seedvc,
     )
 
-    assert [clip.index for clip in result.clips] == [0, 2]
-    assert [line.index for line in result.skipped] == [1]
+    assert [clip.index for clip in result.clips] == [0, 1, 2]
+    assert result.skipped == ()
     assert result.attempted == 3
 
 
@@ -1328,8 +1343,8 @@ def test_a_mixed_script_line_is_attempted(rig: Rig) -> None:
     assert len(result.clips) == 1
 
 
-def test_the_shortest_dubbable_window_is_configurable(rig: Rig) -> None:
-    """A pod can lower the bar for a film whose turns really are that short."""
+def test_the_reporting_threshold_is_configurable(rig: Rig) -> None:
+    """A pod can silence the note for a film whose turns really are that short."""
 
     result = tts.synthesize_dialogue_detailed(
         [_short_line()],
@@ -1341,6 +1356,7 @@ def test_the_shortest_dubbable_window_is_configurable(rig: Rig) -> None:
     )
 
     assert result.skipped == ()
+    assert result.notes == ()
     assert len(result.clips) == 1
 
 
@@ -1357,7 +1373,7 @@ def test_synthesize_dialogue_still_returns_the_clips(rig: Rig) -> None:
     )
 
     assert isinstance(clips, list)
-    assert [clip.index for clip in clips] == [0]
+    assert [clip.index for clip in clips] == [0, 1]
 
 
 def test_an_engine_failure_is_skipped_when_the_caller_asks(rig: Rig) -> None:
@@ -1386,7 +1402,7 @@ def test_a_skipped_line_is_json_safe(rig: Rig) -> None:
     import json as _json
 
     result = tts.synthesize_dialogue_detailed(
-        [_short_line()],
+        [_line(start=5.836, end=6.056, amharic="።፣?!")],
         rig.stem,
         {rig.profile.speaker_id: rig.profile},
         settings=rig.settings(),

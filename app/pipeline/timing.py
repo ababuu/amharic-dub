@@ -7,7 +7,10 @@ Each synthesized clip is fitted to the window of the line it replaces:
 * the **rendered pauses** are left alone - they are deliberate silence, not slack
   to be absorbed - so a line's leading pause still precedes the line;
 * a line that would need more than the configured tempo band is **reported** as
-  not fitting rather than mangled to fit, and the run records by how much.
+  not fitting rather than mangled to fit, and the run records by how much;
+* a line that is still too long **moves the next line later** instead of being
+  spoken over it, so two voices are never heard at once unless the source put
+  them there.
 
 The result of this stage is one aligned WAV per line at the pipeline sample rate,
 plus where to place it in the timeline, which is exactly what
@@ -31,7 +34,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -104,7 +107,8 @@ class AlignedClip:
     so ``start`` is earlier than the original line's own start by exactly
     ``rendered_pause_before``. ``required_tempo`` is what an exact fit would have
     needed and ``tempo`` is what was applied: the two differ only for a line that
-    did not fit, which is why both are kept.
+    did not fit, which is why both are kept. ``drift`` is how far the line had to
+    move later than the original performance because the line before it ran long.
     """
 
     index: int
@@ -129,6 +133,11 @@ class AlignedClip:
     #: Seconds this line runs past its available time. Non-zero means it will overlap the
     #: next line; it is reported rather than cut away.
     overrun: float = 0.0
+    #: Seconds this line was moved later than the original performance started, because the
+    #: line before it ran long. ``0.0`` means it landed exactly where the actor spoke.
+    #: A drifted line is *late* rather than doubling another voice, which is the smaller
+    #: cost: two voices at once is unintelligible, a late line is merely a little behind.
+    drift: float = 0.0
 
     def __post_init__(self) -> None:
         if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
@@ -152,7 +161,7 @@ class AlignedClip:
             )
 
         for name in ("start", "tempo", "required_tempo", "rendered_pause_before",
-                     "rendered_pause_after"):
+                     "rendered_pause_after", "drift", "overrun", "trimmed"):
             value = getattr(self, name)
             number = _finite(name, value)
             if number < 0:
@@ -224,6 +233,7 @@ class AlignedClip:
             "available": self.available,
             "trimmed": self.trimmed,
             "overrun": self.overrun,
+            "drift": self.drift,
             "rendered_pause_before": self.rendered_pause_before,
             "rendered_pause_after": self.rendered_pause_after,
             "duration": self.duration,
@@ -470,7 +480,15 @@ def align_clip(
     window = clip.dialogue.duration
     speech = clip.speech_duration
 
-    limit = window if room is None else max(float(room), MINIMUM_PLACEMENT_WINDOW)
+    # The room a line may use is never smaller than its own window: the window is where
+    # the actor actually spoke, and no line should be squashed below the performance it
+    # replaces just because the line in front of it ran long. ``room`` can come back
+    # smaller than the window when the two original performances overlapped.
+    limit = (
+        window
+        if room is None
+        else max(window, float(room), MINIMUM_PLACEMENT_WINDOW)
+    )
     target = window if speech <= window else max(window, min(limit, speech))
     required = speech / target
     within_tolerance = abs(speech - window) <= EXACT_FIT_TOLERANCE_SECONDS
@@ -510,8 +528,9 @@ def align_clip(
         else:
             notes.append(
                 f"the line is {overrun:.3f}s longer than the {limit:.3f}s it has before "
-                "the next line and it is left intact, because cutting a performance is "
-                "worse than a brief overlap; the Amharic is longer than its time"
+                "the next line and it is left intact; the next line is moved later "
+                "instead of the two being spoken over each other - the Amharic is "
+                "longer than its time"
             )
 
     residual = speech_duration - window
@@ -630,7 +649,9 @@ def align_dialogue(
     -------
     list[AlignedClip]
         One entry per input clip, in the same order. An empty input returns an
-        empty list without touching FFmpeg.
+        empty list without touching FFmpeg. A line that could not fit its time is
+        moved later rather than spoken over the next one, so the returned lines
+        never overlap unless they overlapped in the source.
 
     Raises
     ------
@@ -680,7 +701,55 @@ def align_dialogue(
         destination = directory / f"{Path(clip.audio_path).stem}.wav"
         aligned.append(align_clip(clip, destination, settings=resolved, room=room))
 
-    return aligned
+    return _cascade(
+        aligned,
+        guard=guard,
+        overlap=resolved.timing_max_overlap_seconds,
+    )
+
+
+def _cascade(
+    aligned: list[AlignedClip], *, guard: float, overlap: float = 0.0
+) -> list[AlignedClip]:
+    """Place lines later so that no two of them are ever *intelligibly* at once.
+
+    A line whose Amharic needs more time than the film left it cannot be fitted without
+    either rushing it past intelligibility or cutting a word off the end. Both were
+    tried; both were audible. So the overrun is paid for in position instead: the next
+    line waits until this one has finished, and only the lines that were genuinely
+    simultaneous in the original are allowed to stay simultaneous here.
+
+    ``overlap`` is the concession that keeps the picture: up to this many seconds of the
+    previous line may still be sounding when the next one starts, which is what a
+    conversation already sounds like, before the next line is moved at all. A third of a
+    second of hand-over is heard as a natural interruption; three seconds of it is two
+    people talking at once, which is the thing a dub must never do.
+    """
+
+    placed: list[AlignedClip] = []
+    cursor = 0.0
+    for clip in aligned:
+        # A line keeps its original position unless the line in front of it is still
+        # speaking. When the two performances overlapped in the source, the overlap is the
+        # scene - two people talking over each other - and it is preserved rather than
+        # tidied away.
+        simultaneous = bool(placed) and clip.clip.start < placed[-1].clip.end - 1e-9
+        start = clip.start if simultaneous else max(clip.start, cursor - overlap)
+        drift = start - clip.start
+        if drift > 1e-6:
+            clip = replace(
+                clip,
+                start=start,
+                drift=drift,
+                notes=clip.notes
+                + (
+                    f"the line before it ran {drift:.3f}s past its own time, so this line "
+                    "starts later rather than being spoken over",
+                ),
+            )
+        cursor = clip.end + guard
+        placed.append(clip)
+    return placed
 
 
 __all__ = [
