@@ -29,13 +29,23 @@ Environment variables
                       CTranslate2 compute type (e.g. ``float16`` on GPU).
 ``TRANSCRIPTION_LANGUAGE``
                       Source language code; unset means detect automatically.
-``TRANSLATION_MODEL`` DeepSeek model used for dialogue adaptation.
+``TRANSLATION_BACKEND``
+                      ``nllb`` for local translation, or ``openai`` (the default) for
+                      an instruction-following model served over an OpenAI-compatible
+                      endpoint.
+``TRANSLATION_PROVIDER``
+                      Which vendor the served backend talks to: ``gemini`` (the
+                      default), ``deepseek``, or ``other`` for a server you name
+                      yourself. Decides the endpoint, the model, the key variable and
+                      how reasoning is requested.
+``TRANSLATION_MODEL`` The model the served endpoint answers to; follows the provider.
 ``TRANSLATION_BASE_URL``
-                      DeepSeek API base URL (OpenAI-compatible endpoint).
+                      Endpoint base URL; follows the provider, required for ``other``.
 ``TRANSLATION_BATCH_SIZE``
                       Consecutive dialogue lines adapted in one request.
-``TRANSLATION_DISABLE_THINKING``
-                      Set ``false`` if the API rejects the thinking toggle.
+``TRANSLATION_THINKING``
+                      ``off``/``low``/``medium``/``high``, mapped onto whatever the
+                      provider understands. Reported as what was actually sent.
 ``TRANSLATION_ENFORCE_BUDGET`` / ``TRANSLATION_ENFORCE_FIDEL_LOANWORDS``
                       Whether a line that comes back over its syllable budget, or
                       with a borrowed word left in Roman script, is sent back once
@@ -125,9 +135,10 @@ DEFAULT_QC_PRONUNCIATION = False
 
 #: Which translation backend :mod:`app.pipeline.translation` uses.
 #:
-#: ``"openai"`` (the default) talks to any OpenAI-compatible endpoint - DeepSeek by
-#: default - and is what provides *adaptation* rather than translation: scene and
-#: character context, a syllable budget that a line can be sent back to meet, the
+#: ``"openai"`` (the default) talks to any OpenAI-compatible endpoint - Gemini by
+#: default, DeepSeek or a server you run yourself if configured - and is what provides
+#: *adaptation* rather than translation: scene and character context, a syllable budget
+#: that a line can be sent back to meet, the
 #: borrowed-word policy, and per-line performance metadata.
 #:
 #: ``"nllb"`` translates locally with Meta's NLLB-200 and needs no key. It is kept
@@ -155,14 +166,60 @@ DEFAULT_TRANSLATION_BACKEND = "openai"
 #: The weights are CC-BY-NC-4.0.
 DEFAULT_TRANSLATION_MODEL = "facebook/nllb-200-3.3B"
 
-#: The model the instruction-following backend asks for by default. Measured against the
-#: test film's real 42-line transcript, ``deepseek-v4-pro`` produced 426 syllables where
-#: ``deepseek-flash`` produced 462 and the previous prompt produced 486, and it got the
-#: short lines right where flash did not ("We're done." -> ጨረስን rather than ጨረቃ, "moon").
-#: Fitting a dub is a hard constraint-following job, and the stronger model is the one
-#: that honours it. A local OpenAI-compatible server needs whatever it serves instead,
-#: set through ``TRANSLATION_MODEL``.
-DEFAULT_TRANSLATION_OPENAI_MODEL = "deepseek-v4-pro"
+#: Which vendor serves the instruction-following translation model. Both speak the
+#: OpenAI chat-completions protocol, so the pipeline code is the same; the provider
+#: decides three things that genuinely differ between them - the environment variable
+#: the API key is read from, the default endpoint and model, and how "think harder"
+#: is requested.
+DEFAULT_TRANSLATION_PROVIDER = "gemini"
+
+#: The model the Gemini provider asks for by default.
+#:
+#: ``gemini-3.8-flash`` is the current Flash model, and is free of charge on the free
+#: tier. It is *not* an arbitrary pick: ``gemini-3.7-flash`` - the id this project
+#: first reached for - is deprecated, and Google now routes requests for it to
+#: ``gemini-3.8-flash`` automatically, so naming 3.8 explicitly is naming what
+#: actually answers. Thinking is on by default at level ``medium``.
+#:
+#: Amharic evidence is thin and is stated as such in the README: there is no
+#: Google-published Amharic MT benchmark. What justifies an instruction-following
+#: model here is not raw translation quality but *instructability* - the adaptation
+#: stage has to hit a syllable budget, keep a borrowed word in Fidel, and hold a
+#: character consistent, none of which a sentence-level MT model can be asked for.
+DEFAULT_TRANSLATION_GEMINI_MODEL = "gemini-3.8-flash"
+
+#: Gemini's OpenAI-compatible endpoint. Documented by Google as beta; switching back
+#: to another provider is a ``TRANSLATION_PROVIDER`` change and nothing else.
+DEFAULT_TRANSLATION_GEMINI_BASE_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/openai/"
+)
+
+#: How hard the served model is asked to think, one of ``off``, ``low``, ``medium``,
+#: ``high``. The adaptation stage is the one place in this pipeline where reasoning
+#: pays: it must read a scene, keep a character consistent, and hit a syllable count
+#: that is often far below a literal rendering. ``medium`` is the models' own default
+#: and is the safe resting point; ``high`` is worth trying on a film whose dialogue is
+#: dense with overlapping speech.
+#:
+#: ``off`` is honest about being a request rather than a guarantee: Gemini 3 models
+#: cannot disable reasoning, so on that provider it selects the lowest level available.
+DEFAULT_TRANSLATION_THINKING = "medium"
+
+#: The model the other instruction-following provider asks for by default. Measured
+#: against the test film's real 42-line transcript, ``deepseek-v4-pro`` produced 426
+#: syllables where ``deepseek-flash`` produced 462 and the older prompt produced 486,
+#: and it got the short lines right where flash did not ("We're done." -> ጨረስን rather
+#: than ጨረቃ, "moon"). Kept so the two providers can be compared on the same film.
+DEFAULT_TRANSLATION_DEEPSEEK_MODEL = "deepseek-v4-pro"
+
+#: DeepSeek's endpoint, for ``TRANSLATION_PROVIDER=deepseek``.
+DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+#: Kept as the name of the *served instruction-following backend's* default model, which
+#: is what older code and documentation call it. New code should read
+#: :data:`DEFAULT_TRANSLATION_GEMINI_MODEL` or :data:`DEFAULT_TRANSLATION_DEEPSEEK_MODEL`
+#: according to the provider.
+DEFAULT_TRANSLATION_OPENAI_MODEL = DEFAULT_TRANSLATION_GEMINI_MODEL
 
 #: Beam search width. ``1`` is greedy, which is deterministic - the same line always
 #: translates the same way, so two runs can be compared against one another. Raise it
@@ -209,8 +266,10 @@ DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND = 4.0
 #: would eventually fit the window by losing the meaning.
 DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS = 3
 
-#: DeepSeek API endpoint. The official endpoint is OpenAI-compatible.
-DEFAULT_TRANSLATION_BASE_URL = "https://api.deepseek.com"
+#: The endpoint the *served* instruction-following backend talks to by default.
+#: Kept under its original name for callers that already read it; the value follows the
+#: default provider.
+DEFAULT_TRANSLATION_BASE_URL = DEFAULT_TRANSLATION_GEMINI_BASE_URL
 
 #: How many consecutive dialogue lines are adapted in a single API request.
 #: Small enough to stay well inside the context window and keep a rejection
@@ -456,9 +515,9 @@ def _translation_model_default() -> str:
     """Return the model to use when ``TRANSLATION_MODEL`` is not set.
 
     The two backends name completely different things: a local NLLB *checkpoint path* or
-    the model a *served* endpoint answers to. A single default would silently ask DeepSeek
+    the model a *served* endpoint answers to. A single default would silently ask Gemini
     for a model called ``facebook/nllb-200-3.3B`` - which fails - so the default follows
-    the configured backend.
+    the configured backend, and within the served backend it follows the provider.
     """
 
     backend = (
@@ -467,7 +526,90 @@ def _translation_model_default() -> str:
     ).strip().lower()
     if backend == "nllb":
         return DEFAULT_TRANSLATION_MODEL
-    return DEFAULT_TRANSLATION_OPENAI_MODEL
+    return translation_provider_defaults(
+        _read_env("TRANSLATION_PROVIDER", DEFAULT_TRANSLATION_PROVIDER)
+        or DEFAULT_TRANSLATION_PROVIDER
+    ).model
+
+
+def _translation_base_url_default() -> str:
+    """Return the endpoint to use when ``TRANSLATION_BASE_URL`` is not set.
+
+    Follows the provider for the same reason the model does: the endpoint *is* the
+    provider on an OpenAI-compatible backend, and a single default would quietly send
+    Gemini's key to DeepSeek's host. Meaningless for the NLLB backend, which is local
+    and talks to no endpoint at all.
+    """
+
+    return translation_provider_defaults(
+        _read_env("TRANSLATION_PROVIDER", DEFAULT_TRANSLATION_PROVIDER)
+        or DEFAULT_TRANSLATION_PROVIDER
+    ).base_url
+
+
+@dataclass(frozen=True)
+class TranslationProvider:
+    """What one served-model vendor decides, and nothing else.
+
+    Keeping this to three fields is deliberate. Everything else about a request - the
+    prompt, the JSON protocol, the batching, the syllable budgets, the rewrite passes -
+    is the pipeline's and is identical for every provider, which is why adding a vendor
+    does not touch the pipeline.
+    """
+
+    name: str
+    base_url: str
+    model: str
+    api_key_env: str
+    #: ``True`` when the vendor understands ``reasoning_effort``.
+    supports_reasoning_effort: bool
+    #: ``True`` when the vendor understands the ``thinking`` request body this project
+    #: used for DeepSeek's hybrid models.
+    supports_thinking_switch: bool
+
+
+#: The vendors this project knows how to talk to. A local or self-hosted
+#: OpenAI-compatible server is not in this table: name it with ``TRANSLATION_PROVIDER=other``
+#: and set ``TRANSLATION_BASE_URL``, ``TRANSLATION_MODEL`` and its key yourself.
+TRANSLATION_PROVIDERS: dict[str, TranslationProvider] = {
+    "gemini": TranslationProvider(
+        name="gemini",
+        base_url=DEFAULT_TRANSLATION_GEMINI_BASE_URL,
+        model=DEFAULT_TRANSLATION_GEMINI_MODEL,
+        api_key_env="GEMINI_API_KEY",
+        supports_reasoning_effort=True,
+        supports_thinking_switch=False,
+    ),
+    "deepseek": TranslationProvider(
+        name="deepseek",
+        base_url=DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL,
+        model=DEFAULT_TRANSLATION_DEEPSEEK_MODEL,
+        api_key_env="DEEPSEEK_API_KEY",
+        supports_reasoning_effort=False,
+        supports_thinking_switch=True,
+    ),
+    "other": TranslationProvider(
+        name="other",
+        # Deliberately blank: there is no sensible guess for a server this project has
+        # never seen, and a *wrong* guess would send a film's requests to somebody
+        # else's host. Empty values are refused at start-up with a named variable.
+        base_url="",
+        model="",
+        api_key_env="TRANSLATION_API_KEY",
+        supports_reasoning_effort=False,
+        supports_thinking_switch=False,
+    ),
+}
+
+#: Accepted values of ``TRANSLATION_THINKING``, weakest first.
+TRANSLATION_THINKING_LEVELS: tuple[str, ...] = ("off", "low", "medium", "high")
+
+
+def translation_provider_defaults(name: str) -> TranslationProvider:
+    """Return the provider named by ``name``, or the default if it is unknown."""
+
+    key = (name or "").strip().lower()
+    return TRANSLATION_PROVIDERS.get(key, TRANSLATION_PROVIDERS[DEFAULT_TRANSLATION_PROVIDER])
 
 
 def _read_env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -629,6 +771,9 @@ class Settings:
     work_dir: Path
     output_dir: Path
     model_cache_dir: Path
+    #: API keys for the served translation providers. Only the configured provider's
+    #: key is ever read; the other stays ``None`` and unused.
+    gemini_api_key: Optional[str] = None
     deepseek_api_key: Optional[str] = None
     huggingface_token: Optional[str] = None
     device: str = "cuda"
@@ -647,14 +792,18 @@ class Settings:
     qc_pronunciation: bool = DEFAULT_QC_PRONUNCIATION
     #: Source language code for transcription; ``None`` detects it automatically.
     transcription_language: Optional[str] = None
-    #: DeepSeek dialogue adaptation settings for :mod:`app.pipeline.translation`.
     #: Dialogue adaptation / translation settings for
     #: :mod:`app.pipeline.translation`.
     translation_backend: str = DEFAULT_TRANSLATION_BACKEND
-    translation_model: str = DEFAULT_TRANSLATION_MODEL
-    translation_base_url: str = DEFAULT_TRANSLATION_BASE_URL
+    #: Which vendor serves the instruction-following model. Decides the default endpoint,
+    #: the default model, the environment variable the key is read from, and how thinking
+    #: is requested - and nothing else.
+    translation_provider: str = DEFAULT_TRANSLATION_PROVIDER
+    translation_model: str = DEFAULT_TRANSLATION_GEMINI_MODEL
+    translation_base_url: str = DEFAULT_TRANSLATION_GEMINI_BASE_URL
     translation_batch_size: int = DEFAULT_TRANSLATION_BATCH_SIZE
-    translation_disable_thinking: bool = True
+    #: ``off``/``low``/``medium``/``high``. See :data:`DEFAULT_TRANSLATION_THINKING`.
+    translation_thinking: str = DEFAULT_TRANSLATION_THINKING
     translation_num_beams: int = DEFAULT_TRANSLATION_NUM_BEAMS
     translation_max_new_tokens: int = DEFAULT_TRANSLATION_MAX_NEW_TOKENS
     translation_length_penalty: float = DEFAULT_TRANSLATION_LENGTH_PENALTY
@@ -730,6 +879,7 @@ class Settings:
             work_dir=work_dir,
             output_dir=_read_path("OUTPUT_DIR", DEFAULT_OUTPUT_DIR),
             model_cache_dir=model_cache_dir,
+            gemini_api_key=_read_env("GEMINI_API_KEY"),
             deepseek_api_key=_read_env("DEEPSEEK_API_KEY"),
             huggingface_token=_read_env("HUGGINGFACE_TOKEN"),
             device=(_read_env("DEVICE", "cuda") or "cuda").lower(),
@@ -762,17 +912,23 @@ class Settings:
                 _read_env("TRANSLATION_BACKEND", DEFAULT_TRANSLATION_BACKEND)
                 or DEFAULT_TRANSLATION_BACKEND
             ).lower(),
+            translation_provider=(
+                _read_env("TRANSLATION_PROVIDER", DEFAULT_TRANSLATION_PROVIDER)
+                or DEFAULT_TRANSLATION_PROVIDER
+            ).lower(),
             translation_model=(
                 _read_env("TRANSLATION_MODEL") or _translation_model_default()
             ),
             translation_base_url=(
-                _read_env("TRANSLATION_BASE_URL", DEFAULT_TRANSLATION_BASE_URL)
-                or DEFAULT_TRANSLATION_BASE_URL
+                _read_env("TRANSLATION_BASE_URL") or _translation_base_url_default()
             ),
             translation_batch_size=_read_int(
                 "TRANSLATION_BATCH_SIZE", DEFAULT_TRANSLATION_BATCH_SIZE
             ),
-            translation_disable_thinking=_read_bool("TRANSLATION_DISABLE_THINKING", True),
+            translation_thinking=(
+                _read_env("TRANSLATION_THINKING", DEFAULT_TRANSLATION_THINKING)
+                or DEFAULT_TRANSLATION_THINKING
+            ).lower(),
             translation_num_beams=_read_int(
                 "TRANSLATION_NUM_BEAMS", DEFAULT_TRANSLATION_NUM_BEAMS
             ),
@@ -886,10 +1042,46 @@ class Settings:
 
     # -- helpers ------------------------------------------------------------
     @property
+    def translation_provider_defaults(self) -> TranslationProvider:
+        """Return the provider record this run is configured to talk to."""
+
+        return translation_provider_defaults(self.translation_provider)
+
+    @property
+    def translation_api_key(self) -> str:
+        """Return the API key for the configured provider, or an empty string.
+
+        One accessor rather than a branch at every call site: the provider is what says
+        which variable holds the key, and the rest of the pipeline should not have to
+        know which vendor it is talking to.
+        """
+
+        env = self.translation_provider_defaults.api_key_env
+        if env == "GEMINI_API_KEY":
+            return (self.gemini_api_key or "").strip()
+        if env == "DEEPSEEK_API_KEY":
+            return (self.deepseek_api_key or "").strip()
+        # ``other`` names its own variable, so that a self-hosted server with its own
+        # key convention needs no code change.
+        return (_read_env(env) or "").strip()
+
+    @property
+    def translation_api_key_env(self) -> str:
+        """Return the environment variable name the provider needs."""
+
+        return self.translation_provider_defaults.api_key_env
+
+    @property
     def has_deepseek_credentials(self) -> bool:
         """``True`` when a DeepSeek API key is configured."""
 
         return bool(self.deepseek_api_key)
+
+    @property
+    def has_gemini_credentials(self) -> bool:
+        """``True`` when a Gemini API key is configured."""
+
+        return bool(self.gemini_api_key)
 
     @property
     def has_huggingface_credentials(self) -> bool:
@@ -901,15 +1093,15 @@ class Settings:
         """Return the names of the credentials the *configured* run still needs.
 
         The Hugging Face token is always needed, because the diarization pipeline it
-        authenticates is gated. The DeepSeek key belongs to the instruction-following
-        translation backend alone: under ``TRANSLATION_BACKEND=nllb`` the run never
-        reads it, so reporting it as missing would hold up a session that is ready to
-        go.
+        authenticates is gated. The translation key belongs to the instruction-following
+        backend alone, and *which* variable holds it follows the provider: under
+        ``TRANSLATION_BACKEND=nllb`` the run never reads either, so reporting a key as
+        missing would hold up a session that is ready to go.
         """
 
         missing: list[str] = []
-        if self.translation_backend == "openai" and not self.deepseek_api_key:
-            missing.append("DEEPSEEK_API_KEY")
+        if self.translation_backend == "openai" and not self.translation_api_key:
+            missing.append(self.translation_api_key_env)
         if not self.huggingface_token:
             missing.append("HUGGINGFACE_TOKEN")
         return missing
@@ -934,6 +1126,7 @@ class Settings:
             "output_dir": str(self.output_dir),
             "model_cache_dir": str(self.model_cache_dir),
             "deepseek_api_key_set": self.has_deepseek_credentials,
+            "gemini_api_key_set": self.has_gemini_credentials,
             "huggingface_token_set": self.has_huggingface_credentials,
             "device": self.device,
             "log_level": self.log_level,
@@ -945,10 +1138,12 @@ class Settings:
             "qc_pronunciation": self.qc_pronunciation,
             "transcription_language": self.transcription_language,
             "translation_backend": self.translation_backend,
+            "translation_provider": self.translation_provider,
+            "translation_api_key_env": self.translation_api_key_env,
             "translation_model": self.translation_model,
             "translation_base_url": self.translation_base_url,
+            "translation_thinking": self.translation_thinking,
             "translation_batch_size": self.translation_batch_size,
-            "translation_disable_thinking": self.translation_disable_thinking,
             "translation_num_beams": self.translation_num_beams,
             "translation_max_new_tokens": self.translation_max_new_tokens,
             "translation_length_penalty": self.translation_length_penalty,
@@ -1037,6 +1232,16 @@ __all__ = [
     "DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS",
     "DEFAULT_TRANSLATION_LENGTH_PENALTY",
     "DEFAULT_TRANSLATION_MODEL",
+    "DEFAULT_TRANSLATION_PROVIDER",
+    "DEFAULT_TRANSLATION_GEMINI_BASE_URL",
+    "DEFAULT_TRANSLATION_GEMINI_MODEL",
+    "DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL",
+    "DEFAULT_TRANSLATION_DEEPSEEK_MODEL",
+    "DEFAULT_TRANSLATION_THINKING",
+    "TRANSLATION_PROVIDERS",
+    "TRANSLATION_THINKING_LEVELS",
+    "TranslationProvider",
+    "translation_provider_defaults",
     "DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS",
     "DEFAULT_TRANSLATION_OPENAI_MODEL",
     "DEFAULT_TRANSLATION_SHORTEN_PENALTY",

@@ -602,6 +602,33 @@ def test_the_bible_is_reported_as_applied_only_when_it_is(
     assert "NLLB translates line by line" not in reported
 
 
+def test_the_adaptation_report_names_the_model_and_what_it_was_asked_for(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """Two runs are compared on these words, so a bare model name is not enough.
+
+    The provider decides whether the requested thinking level was available at all, so
+    the report states what was actually sent rather than what was configured.
+    """
+
+    settings = _settings(
+        tmp_path,
+        translation_backend="openai",
+        translation_provider="gemini",
+        translation_model="gemini-3.8-flash",
+        translation_thinking="off",
+        gemini_api_key="test-key",
+    )
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+
+    reported = " ".join(messages)
+    # ``off`` cannot be honoured by a Gemini 3 model, and the report says so.
+    assert "adaptation: gemini gemini-3.8-flash" in reported
+    assert "cannot disable reasoning" in reported
+
+
 def test_a_line_that_cannot_be_voiced_is_recorded_in_the_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

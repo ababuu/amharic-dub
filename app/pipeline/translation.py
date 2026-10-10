@@ -1,6 +1,6 @@
-"""Dialogue adaptation into dubbing-ready spoken Amharic (**DeepSeek**).
+"""Dialogue adaptation into dubbing-ready spoken Amharic (**an instruction-following LLM**).
 
-This module is the only place in the pipeline that talks to the DeepSeek API. It
+This module is the only place in the pipeline that talks to a served model. It
 turns the transcribed source-language lines produced by
 :mod:`app.pipeline.transcription` into Amharic dialogue that a voice actor or a
 TTS model can actually perform::
@@ -12,6 +12,13 @@ native speaker would say out loud in that scene, and it has to fit roughly the
 time the original performance occupied. Each line also carries the performance
 metadata the later voice-profile and TTS stages need: emotion, intensity,
 delivery, and the pauses around the line.
+
+Which model is served - Gemini, DeepSeek, or an endpoint you run yourself - is
+configuration (:data:`~app.config.TRANSLATION_PROVIDERS`), not code. The provider
+decides four things and nothing else: the endpoint, the model name, the variable
+the key is read from, and how reasoning is requested. Everything below is
+identical for every provider, which is what makes swapping the model a
+configuration change.
 
 Who owns what
 -------------
@@ -33,11 +40,11 @@ silently dropping dialogue.
 
 Contract with the ``openai`` package (checked against 3.22.1)
 ------------------------------------------------------------
-* ``OpenAI(api_key=..., base_url=...)`` builds the client for DeepSeek's
-  OpenAI-compatible endpoint.
+* ``OpenAI(api_key=..., base_url=...)`` builds the client for the configured
+  provider's OpenAI-compatible endpoint.
 * ``client.chat.completions.create(model=..., messages=[...],
-  response_format={"type": "json_object"}, extra_body=...)`` returns an object
-  whose ``choices[0].message.content`` holds the JSON text.
+  response_format={"type": "json_object"}, reasoning_effort=...)`` returns an
+  object whose ``choices[0].message.content`` holds the JSON text.
 * ``openai.AuthenticationError`` (which is an ``openai.APIError``) reports
   rejected credentials.
 
@@ -48,7 +55,7 @@ Deliberate non-goals
 * **No caching.** Re-runs re-bill; caching belongs to the orchestrator, which will
   own the ``*.amharic.json`` manifest.
 * **No network access at import time** (and none in the test suite).
-* **No DeepSeek objects in the public API.** Callers only ever see
+* **No vendor objects in the public API.** Callers only ever see
   :class:`AdaptedDialogue`.
 """
 
@@ -258,7 +265,7 @@ class TranslationError(RuntimeError):
 
 
 class MissingApiKeyError(TranslationError):
-    """No DeepSeek API key is configured."""
+    """The configured provider's API key is not set."""
 
 
 class ConfigurationError(TranslationError, ValueError):
@@ -266,15 +273,15 @@ class ConfigurationError(TranslationError, ValueError):
 
 
 class ApiClientError(TranslationError):
-    """The DeepSeek client could not be constructed."""
+    """The served-model client could not be constructed."""
 
 
 class ApiRequestError(TranslationError):
-    """The DeepSeek request failed (network or API error)."""
+    """The served-model request failed (network or API error)."""
 
 
 class ApiAuthenticationError(ApiRequestError):
-    """DeepSeek rejected the configured credentials."""
+    """The provider rejected the configured credentials."""
 
 
 class MalformedResponseError(TranslationError):
@@ -419,15 +426,46 @@ def _validate_segments(segments: Iterable[TranscriptSegment]) -> list[Transcript
 
 
 def _require_api_key(settings: Settings) -> str:
-    """Return the configured DeepSeek API key, or explain what is missing."""
+    """Return the configured API key for the active provider, or explain what is missing."""
 
-    api_key = (settings.deepseek_api_key or "").strip()
+    api_key = settings.translation_api_key
     if not api_key:
+        env = settings.translation_api_key_env
+        hint = (
+            ""
+            if settings.translation_provider == "other"
+            else " Point TRANSLATION_BASE_URL at a local OpenAI-compatible server to "
+            "run without one."
+        )
         raise MissingApiKeyError(
-            "DEEPSEEK_API_KEY is not set; dialogue adaptation needs a DeepSeek API "
-            "key (see .env.example)"
+            f"{env} is not set; dialogue adaptation needs an API key for the "
+            f"{settings.translation_provider} provider (see .env.example).{hint}"
         )
     return api_key
+
+
+def _require_served_endpoint(settings: Settings) -> None:
+    """Refuse to guess an endpoint or model for a provider that supplies neither.
+
+    ``TRANSLATION_PROVIDER=other`` is the escape hatch for a self-hosted server: the
+    project knows the protocol but not the address, so both must be stated. Failing here
+    names the variable instead of sending a request to a default host or asking for a
+    model the server has never heard of.
+    """
+
+    missing = [
+        name
+        for name, value in (
+            ("TRANSLATION_BASE_URL", settings.translation_base_url),
+            ("TRANSLATION_MODEL", settings.translation_model),
+        )
+        if not (value or "").strip()
+    ]
+    if missing:
+        raise ConfigurationError(
+            f"{settings.translation_provider} points at a server this project has no "
+            f"defaults for; set {' and '.join(missing)}"
+        )
 
 
 def _resolve_batch_size(settings: Settings) -> int:
@@ -442,7 +480,7 @@ def _resolve_batch_size(settings: Settings) -> int:
 
 
 def _build_client(settings: Settings, api_key: str) -> Any:
-    """Create the DeepSeek (OpenAI-compatible) client."""
+    """Create the OpenAI-compatible client for the configured provider."""
 
     if OpenAI is None:  # pragma: no cover - only without the API client installed
         raise ApiClientError(
@@ -452,11 +490,12 @@ def _build_client(settings: Settings, api_key: str) -> Any:
 
     try:
         # The key is passed straight to the client and never logged or embedded in
-        # any message we raise.
+        # any message we raise. Every supported provider speaks this protocol, which is
+        # why the pipeline itself has no idea which vendor it is talking to.
         return OpenAI(api_key=api_key, base_url=settings.translation_base_url)
     except Exception as exc:
         raise ApiClientError(
-            f"could not create the DeepSeek client for "
+            f"could not create the {settings.translation_provider} client for "
             f"{settings.translation_base_url!r}: {type(exc).__name__}: {exc}"
         ) from exc
 
@@ -572,13 +611,79 @@ def _request_kwargs(
         "response_format": {"type": "json_object"},
     }
 
-    if settings.translation_disable_thinking:
-        # DeepSeek's hybrid models expose a thinking toggle through the OpenAI
-        # client's escape hatch. Set TRANSLATION_DISABLE_THINKING=false if the
-        # live API rejects this body.
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-
+    kwargs.update(_thinking_request(settings))
     return kwargs
+
+
+#: The reasoning levels a caller may ask for, weakest first. Providers differ in the
+#: *shape* of the control, not only in its name: Gemini takes a level, DeepSeek's hybrid
+#: models take an on/off switch, and a server named through ``other`` may take neither.
+_LEVELS_FOR_EFFORT = ("off", "low", "medium", "high")
+
+
+def _thinking_request(settings: Settings) -> dict[str, Any]:
+    """Return the request fields that ask the provider to think harder, or fewer.
+
+    Returns an empty mapping when the provider has no such control, rather than sending
+    a field it might reject. The adaptation stage is the one place in this pipeline
+    where reasoning measurably pays, so the control is worth having - and it is worth
+    having *per provider*, because the two supported vendors spell it differently.
+    """
+
+    provider = settings.translation_provider_defaults
+    level = (settings.translation_thinking or "").strip().lower()
+    if level not in _LEVELS_FOR_EFFORT:
+        raise ConfigurationError(
+            f"TRANSLATION_THINKING must be one of {', '.join(_LEVELS_FOR_EFFORT)}, "
+            f"got {settings.translation_thinking!r}"
+        )
+
+    if provider.supports_reasoning_effort:
+        # Gemini 3 models cannot stop reasoning; the request can only lower it. So "off"
+        # asks for the lowest level the model has, and the run says so rather than
+        # implying it was disabled.
+        return {"reasoning_effort": "low" if level == "off" else level}
+
+    if provider.supports_thinking_switch and level == "off":
+        # DeepSeek's hybrid models expose an on/off toggle through the OpenAI client's
+        # escape hatch. Set TRANSLATION_THINKING=low (or higher) if the live API rejects
+        # this body: it only understands off.
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+
+    return {}
+
+
+def describe_thinking(settings: Settings) -> str:
+    """Return what thinking control this run will actually send.
+
+    Reported at the start of a run so a manifest cannot be read as "high reasoning" when
+    the configured provider had no such knob, or when "off" only reached the lowest
+    level because the model cannot stop thinking.
+    """
+
+    requested = (settings.translation_thinking or "").strip().lower()
+    provider = settings.translation_provider_defaults
+    field = _thinking_request(settings)
+
+    if not field:
+        if provider.supports_thinking_switch:
+            return (
+                f"{requested} requested, but {provider.name} only understands off: no "
+                "thinking field is sent, so its own default applies"
+            )
+        return (
+            f"{requested} requested, but {provider.name} has no thinking control: "
+            "nothing is sent"
+        )
+    if "reasoning_effort" in field:
+        sent = field["reasoning_effort"]
+        if requested == "off" and sent != "off":
+            return (
+                f"off requested, sent reasoning_effort={sent}: {provider.name} cannot "
+                "disable reasoning, so the lowest level is used"
+            )
+        return f"reasoning_effort={sent}"
+    return f"{provider.name} thinking disabled"
 
 
 def _as_request_error(exc: Exception, settings: Settings) -> TranslationError:
@@ -591,47 +696,72 @@ def _as_request_error(exc: Exception, settings: Settings) -> TranslationError:
     )
     if rejected:
         return ApiAuthenticationError(
-            "DeepSeek rejected the configured credentials for model "
-            f"{settings.translation_model!r}"
+            f"{settings.translation_provider} rejected the configured credentials for "
+            f"model {settings.translation_model!r}"
             + (f" (HTTP {status})" if status is not None else "")
-            + ": check DEEPSEEK_API_KEY and that it is allowed to use this model"
+            + f": check {settings.translation_api_key_env} and that it is allowed to "
+            "use this model"
         )
 
     return ApiRequestError(
-        f"the DeepSeek request for model {settings.translation_model!r} failed: "
-        f"{type(exc).__name__}: {exc}"
+        f"the {settings.translation_provider} request for model "
+        f"{settings.translation_model!r} failed: {type(exc).__name__}: {exc}"
     )
 
 
 def _response_content(response: Any) -> str:
-    """Return the text content of a DeepSeek chat completion."""
+    """Return the text content of a chat completion."""
 
     choices = getattr(response, "choices", None)
     if not choices:
         raise MalformedResponseError(
-            "the DeepSeek response contains no choices "
+            "the model response contains no choices "
             f"(got {type(response).__name__})"
         )
 
     message = getattr(choices[0], "message", None)
     if message is None:
-        raise MalformedResponseError("the DeepSeek response choice has no message")
+        raise MalformedResponseError("the model response choice has no message")
 
     content = getattr(message, "content", None)
     if not isinstance(content, str) or not content.strip():
         raise MalformedResponseError(
-            "the DeepSeek response contains no text content (is the model running "
-            "in reasoning mode?)"
+            "the model response contains no text content (the whole output may have "
+            "been consumed by reasoning, or the model may not follow instructions)"
         )
 
     return content
+
+
+def _json_object(content: str) -> Any:
+    """Parse the model's reply as a JSON object, tolerating a wrapper around it.
+
+    ``json_object`` response mode is requested on every call, but it is not guaranteed
+    by every OpenAI-compatible endpoint - Gemini's is documented as beta - and a model
+    that ignores it tends to answer with the object inside a markdown fence or a
+    sentence of preamble. Losing a whole film's run to that would be a poor trade, so
+    the outermost ``{...}`` is tried when the reply is not already valid JSON.
+
+    This is deliberately narrow: it accepts a JSON object that is *wrapped*, and nothing
+    else. A reply that is not a JSON object still fails with the original error, so a
+    model that genuinely cannot follow the protocol is not quietly accepted.
+    """
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        return json.loads(content[start : end + 1])
 
 
 def _parse_response(content: str, ids: list[str]) -> dict[str, Any]:
     """Parse and validate the model's JSON, returning ``{dialogue_id: line}``."""
 
     try:
-        payload = json.loads(content)
+        payload = _json_object(content)
     except json.JSONDecodeError as exc:
         raise MalformedResponseError(
             f"the model did not return valid JSON: {exc}"
@@ -1198,14 +1328,15 @@ def adapt_dialogue(
     InvalidTranscriptSegmentsError
         ``segments`` is not an iterable of ``TranscriptSegment``.
     ConfigurationError
-        ``TRANSLATION_BACKEND`` is neither ``nllb`` nor ``openai``, or a setting
-        the chosen backend reads (currently the batch size) is unusable.
+        ``TRANSLATION_BACKEND`` is neither ``nllb`` nor ``openai``, a setting the
+        chosen backend reads (the batch size, or the thinking level) is unusable, or
+        ``TRANSLATION_PROVIDER=other`` was chosen without naming an endpoint and model.
     MissingApiKeyError
-        ``TRANSLATION_BACKEND=openai`` and ``DEEPSEEK_API_KEY`` is not configured.
+        ``TRANSLATION_BACKEND=openai`` and the configured provider's key is not set.
     ApiClientError
-        The DeepSeek client could not be constructed.
+        The served-model client could not be constructed.
     ApiAuthenticationError, ApiRequestError
-        DeepSeek rejected the credentials, or the request failed.
+        The provider rejected the credentials, or the request failed.
     MalformedResponseError
         The model did not return the requested JSON object.
     InvalidModelOutputError, DialogueIdError
@@ -1228,6 +1359,9 @@ def adapt_dialogue(
             f"{settings.translation_backend!r}"
         )
 
+    # The endpoint is checked first: for a self-hosted server, being told which address
+    # to state is more useful than being told about a key for an address never given.
+    _require_served_endpoint(settings)
     api_key = _require_api_key(settings)
     batch_size = _resolve_batch_size(settings)
     client = _build_client(settings, api_key)
@@ -1308,4 +1442,5 @@ __all__ = [
     "MissingApiKeyError",
     "TranslationError",
     "adapt_dialogue",
+    "describe_thinking",
 ]

@@ -126,7 +126,7 @@ def report_settings(settings: Settings) -> None:
         _info("tts model", settings.tts_model)
 
     # The check is configuration-aware, so this names only what this run will
-    # actually read: the token always, the DeepSeek key only under the
+    # actually read: the token always, the translation provider's key only under the
     # instruction-following backend.
     missing = settings.missing_credentials()
     if missing:
@@ -135,7 +135,8 @@ def report_settings(settings: Settings) -> None:
             + ", ".join(missing)
             + " - the gated diarization pipeline needs HUGGINGFACE_TOKEN"
             + (
-                ", and TRANSLATION_BACKEND=openai needs DEEPSEEK_API_KEY"
+                f", and TRANSLATION_BACKEND=openai ({settings.translation_provider}) "
+                f"needs {settings.translation_api_key_env}"
                 if settings.translation_backend == "openai"
                 else ""
             )

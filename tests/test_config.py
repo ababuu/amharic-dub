@@ -17,6 +17,8 @@ from app.config import (
     DEFAULT_SEED_VC_REPO_NAME,
     DEFAULT_TIMING_MAX_TEMPO,
     DEFAULT_TIMING_MIN_LINE_GAP,
+    DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL,
+    DEFAULT_TRANSLATION_DEEPSEEK_MODEL,
     DEFAULT_TRANSLATION_LENGTH_PENALTY,
     DEFAULT_TRANSLATION_SHORTEN_PENALTY,
     DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND,
@@ -25,8 +27,11 @@ from app.config import (
     DEFAULT_TRANSCRIPTION_MODEL,
     DEFAULT_TRANSLATION_BASE_URL,
     DEFAULT_TRANSLATION_BATCH_SIZE,
+    DEFAULT_TRANSLATION_GEMINI_BASE_URL,
+    DEFAULT_TRANSLATION_GEMINI_MODEL,
     DEFAULT_TRANSLATION_MODEL,
     DEFAULT_TRANSLATION_OPENAI_MODEL,
+    DEFAULT_TRANSLATION_THINKING,
     DEFAULT_TTS_MIN_LINE_SECONDS,
     DEFAULT_TTS_MAX_PAUSE_SECONDS,
     DEFAULT_TTS_MODEL,
@@ -35,71 +40,10 @@ from app.config import (
     DEFAULT_VOICE_REFERENCE_MAX_DURATION,
     DEFAULT_VOICE_REFERENCE_MIN_DURATION,
     DEFAULT_VOICE_REFERENCE_TARGET_DURATION,
+    TRANSLATION_PROVIDERS,
     Settings,
     get_settings,
 )
-
-_ENV_VARS = (
-    "INPUT_DIR",
-    "WORK_DIR",
-    "OUTPUT_DIR",
-    "MODEL_CACHE_DIR",
-    "DEEPSEEK_API_KEY",
-    "HUGGINGFACE_TOKEN",
-    "DIARIZATION_MODEL",
-    "DIARIZATION_MIN_SPEAKERS",
-    "DIARIZATION_MAX_SPEAKERS",
-    "TRANSCRIPTION_MODEL",
-    "TRANSCRIPTION_COMPUTE_TYPE",
-    "TRANSCRIPTION_LANGUAGE",
-    "TRANSLATION_BACKEND",
-    "TRANSLATION_MODEL",
-    "TRANSLATION_BASE_URL",
-    "TRANSLATION_BATCH_SIZE",
-    "TRANSLATION_DISABLE_THINKING",
-    "TRANSLATION_NUM_BEAMS",
-    "TRANSLATION_MAX_NEW_TOKENS",
-    "TRANSLATION_ENFORCE_BUDGET",
-    "TRANSLATION_ENFORCE_FIDEL_LOANWORDS",
-    "VOICE_PROFILE_DIR",
-    "VOICE_REFERENCE_MIN_DURATION",
-    "VOICE_REFERENCE_TARGET_DURATION",
-    "VOICE_REFERENCE_MAX_DURATION",
-    "DIALOGUE_BIBLE_PATH",
-    "TTS_MODEL",
-    "TTS_ENGINE",
-    "CHATTERBOX_MODEL",
-    "MMS_SAMPLE_RATE",
-    "MMS_SEED",
-    "MMS_SPEAKING_RATE",
-    "SEED_VC_REPO_PATH",
-    "SEED_VC_DIFFUSION_STEPS",
-    "SEED_VC_CONVERT_STYLE",
-    "TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
-    "TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
-    "TTS_MIN_LINE_SECONDS",
-    "TTS_CONTINUE_ON_FAILURE",
-    "TTS_MAX_PAUSE_SECONDS",
-    "TIMING_MIN_TEMPO",
-    "TIMING_MAX_TEMPO",
-    "MIX_DIALOGUE_GAIN_DB",
-    "MIX_DUCK_DB",
-    "DEVICE",
-    "LOG_LEVEL",
-)
-
-
-@pytest.fixture(autouse=True)
-def _isolate_from_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep tests independent of a developer's local ``.env`` file."""
-
-    monkeypatch.setattr("app.config.load_env_file", lambda *args, **kwargs: None)
-
-
-@pytest.fixture
-def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in _ENV_VARS:
-        monkeypatch.delenv(name, raising=False)
 
 
 def test_defaults_are_project_relative(_clean_env: None) -> None:
@@ -116,17 +60,110 @@ def test_defaults_are_project_relative(_clean_env: None) -> None:
 def test_missing_credentials_do_not_break_construction(_clean_env: None) -> None:
     settings = Settings.from_env()
 
+    assert settings.gemini_api_key is None
     assert settings.deepseek_api_key is None
     assert settings.huggingface_token is None
+    assert settings.has_gemini_credentials is False
     assert settings.has_deepseek_credentials is False
     assert settings.has_huggingface_credentials is False
     # The default backend is an instruction-following endpoint, which needs a key, so both
-    # credentials are reported. Under TRANSLATION_BACKEND=nllb only the token is.
+    # credentials are reported - and the key named is the *default provider's*, because
+    # that is the one a run would actually read. Under TRANSLATION_BACKEND=nllb only the
+    # token is.
     assert settings.translation_backend == "openai"
+    assert settings.translation_provider == "gemini"
+    assert settings.missing_credentials() == [
+        "GEMINI_API_KEY",
+        "HUGGINGFACE_TOKEN",
+    ]
+
+
+def test_the_missing_key_named_follows_the_provider(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    """Naming the wrong variable sends someone hunting for a credential they do not need."""
+
+    monkeypatch.setenv("TRANSLATION_PROVIDER", "deepseek")
+
+    settings = Settings.from_env()
+
+    assert settings.translation_api_key_env == "DEEPSEEK_API_KEY"
     assert settings.missing_credentials() == [
         "DEEPSEEK_API_KEY",
         "HUGGINGFACE_TOKEN",
     ]
+
+
+def test_each_provider_supplies_its_own_key(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    """Only the configured provider's key is read; the other is never consulted."""
+
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+
+    assert Settings.from_env().translation_api_key == "gemini-key"
+
+    monkeypatch.setenv("TRANSLATION_PROVIDER", "deepseek")
+    assert Settings.from_env().translation_api_key == "deepseek-key"
+
+
+@pytest.mark.parametrize("provider", sorted(TRANSLATION_PROVIDERS))
+def test_every_known_provider_is_a_complete_configuration(provider: str) -> None:
+    """``other`` is the exception: it names a server only the operator knows."""
+
+    record = TRANSLATION_PROVIDERS[provider]
+
+    assert record.name == provider
+    assert record.api_key_env
+
+    if record.base_url or record.model:
+        assert record.base_url.startswith("https://")
+        assert record.model
+
+
+def test_the_default_endpoint_and_model_follow_the_provider(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    """One shared default would send a vendor's key to another vendor's host."""
+
+    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+
+    gemini = Settings.from_env()
+    assert gemini.translation_base_url == DEFAULT_TRANSLATION_GEMINI_BASE_URL
+    assert gemini.translation_model == DEFAULT_TRANSLATION_GEMINI_MODEL
+
+    monkeypatch.setenv("TRANSLATION_PROVIDER", "deepseek")
+
+    deepseek = Settings.from_env()
+    assert deepseek.translation_base_url == DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL
+    assert deepseek.translation_model == DEFAULT_TRANSLATION_DEEPSEEK_MODEL
+
+
+def test_the_local_backend_keeps_its_checkpoint_default(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    """NLLB names a local checkpoint, so no served provider may rename it."""
+
+    monkeypatch.setenv("TRANSLATION_BACKEND", "nllb")
+
+    assert Settings.from_env().translation_model == DEFAULT_TRANSLATION_MODEL
+
+
+def test_an_explicit_endpoint_still_wins_over_the_provider_default(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    """Someone pointing at a proxy or a mirror means it."""
+
+    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
+    monkeypatch.setenv("TRANSLATION_BASE_URL", "https://mirror.test/v1")
+    monkeypatch.setenv("TRANSLATION_MODEL", "gemini-3.8-flash")
+    monkeypatch.setenv("TRANSLATION_PROVIDER", "gemini")
+
+    settings = Settings.from_env()
+
+    assert settings.translation_base_url == "https://mirror.test/v1"
+    assert settings.translation_model == "gemini-3.8-flash"
 
 
 def test_missing_credentials_under_the_local_backend(
@@ -146,6 +183,7 @@ def test_environment_variables_override_defaults(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("WORK_DIR", str(tmp_path / "work"))
     monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "out"))
     monkeypatch.setenv("MODEL_CACHE_DIR", str(tmp_path / "models"))
+    monkeypatch.setenv("TRANSLATION_PROVIDER", "deepseek")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf_test_token")
     monkeypatch.setenv("DEVICE", "cpu")
@@ -180,14 +218,17 @@ def test_ensure_directories_creates_all_paths(monkeypatch: pytest.MonkeyPatch, t
 
 
 def test_as_dict_never_exposes_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "super-secret-value")
+    monkeypatch.setenv("GEMINI_API_KEY", "super-secret-value")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "other-secret-value")
     monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf_secret_value")
 
     payload = Settings.from_env().as_dict()
 
+    assert payload["gemini_api_key_set"] is True
     assert payload["deepseek_api_key_set"] is True
     assert payload["huggingface_token_set"] is True
     assert "super-secret-value" not in str(payload)
+    assert "other-secret-value" not in str(payload)
     assert "hf_secret_value" not in str(payload)
 
 
@@ -260,29 +301,34 @@ def test_translation_settings_are_configurable(
 ) -> None:
     defaults = Settings.from_env()
     # The default follows the configured backend: a served endpoint is asked for a served
-    # model name, not for a local checkpoint path.
+    # model name, not for a local checkpoint path. Within the served backend it also
+    # follows the provider, so the default endpoint and model are the same vendor's.
     assert defaults.translation_backend == "openai"
-    assert defaults.translation_model == DEFAULT_TRANSLATION_OPENAI_MODEL
-    assert defaults.translation_base_url == DEFAULT_TRANSLATION_BASE_URL
+    assert defaults.translation_model == DEFAULT_TRANSLATION_GEMINI_MODEL
+    assert defaults.translation_base_url == DEFAULT_TRANSLATION_GEMINI_BASE_URL
     assert defaults.translation_batch_size == DEFAULT_TRANSLATION_BATCH_SIZE
-    assert defaults.translation_disable_thinking is True
+    assert defaults.translation_thinking == DEFAULT_TRANSLATION_THINKING
 
-    monkeypatch.setenv("TRANSLATION_MODEL", "deepseek-reasoner")
+    monkeypatch.setenv("TRANSLATION_MODEL", "gemini-3.6-flash")
     monkeypatch.setenv("TRANSLATION_BASE_URL", "https://example.test/v1")
     monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "4")
-    monkeypatch.setenv("TRANSLATION_DISABLE_THINKING", "false")
+    monkeypatch.setenv("TRANSLATION_THINKING", "HIGH")
 
     settings = Settings.from_env()
-    assert settings.translation_model == "deepseek-reasoner"
+    assert settings.translation_model == "gemini-3.6-flash"
     assert settings.translation_base_url == "https://example.test/v1"
     assert settings.translation_batch_size == 4
-    assert settings.translation_disable_thinking is False
+    assert settings.translation_thinking == "high"  # normalised to lower case
 
     payload = settings.as_dict()
-    assert payload["translation_model"] == "deepseek-reasoner"
+    assert payload["translation_model"] == "gemini-3.6-flash"
     assert payload["translation_base_url"] == "https://example.test/v1"
     assert payload["translation_batch_size"] == 4
-    assert payload["translation_disable_thinking"] is False
+    assert payload["translation_thinking"] == "high"
+    # Which vendor a manifest was produced with is part of the manifest: a later run
+    # cannot be compared with this one without it.
+    assert payload["translation_provider"] == "gemini"
+    assert payload["translation_api_key_env"] == "GEMINI_API_KEY"
 
 
 def test_malformed_integer_setting_is_rejected(
@@ -455,7 +501,7 @@ def test_malformed_float_setting_is_rejected(
 def test_malformed_boolean_setting_is_rejected(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:
-    monkeypatch.setenv("TRANSLATION_DISABLE_THINKING", "maybe")
+    monkeypatch.setenv("TRANSLATION_ENFORCE_BUDGET", "maybe")
     with pytest.raises(ValueError, match="boolean flag"):
         Settings.from_env()
 

@@ -281,20 +281,23 @@ def check_credentials() -> bool:
     """Report the pipeline credentials, flagging unedited ``.env`` placeholders.
 
     Only the credentials the configured run needs are blocking: the Hugging Face
-    token always, because the gated diarization pipeline needs it, and the
-    DeepSeek key only when ``TRANSLATION_BACKEND`` is ``openai``. Failing on a key
-    the configured backend never reads would send someone hunting for a credential
-    they do not need while the real problem waits.
+    token always, because the gated diarization pipeline needs it, and the key of the
+    configured translation provider only when ``TRANSLATION_BACKEND`` is ``openai``.
+    Failing on a key the configured backend never reads would send someone hunting for
+    a credential they do not need while the real problem waits.
     """
 
     from app.config import get_settings
 
     settings = get_settings()
     placeholders = _env_example_placeholders()
-    deepseek_required = settings.translation_backend == "openai"
+    translation_required = settings.translation_backend == "openai"
+    # The key's *name* follows the provider, so the check names the variable the
+    # configured run actually reads instead of the one it used to read.
+    translation_key_env = settings.translation_api_key_env
     configured = {
         "HUGGINGFACE_TOKEN": (settings.huggingface_token, True),
-        "DEEPSEEK_API_KEY": (settings.deepseek_api_key, deepseek_required),
+        translation_key_env: (settings.translation_api_key, translation_required),
     }
 
     healthy = True

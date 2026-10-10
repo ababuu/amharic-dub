@@ -1,6 +1,6 @@
 """Tests for :mod:`app.pipeline.translation`.
 
-The DeepSeek/OpenAI client is replaced by an in-memory fake, so the tests never
+The OpenAI-compatible client is replaced by an in-memory fake, so the tests never
 make a network call, never need an API key, and never touch a model. The fake
 mirrors the real client only where this module depends on it: ``OpenAI(...)``,
 ``client.chat.completions.create(**kwargs)`` and
@@ -20,6 +20,8 @@ import pytest
 from app.config import (
     DEFAULT_TRANSLATION_BASE_URL,
     DEFAULT_TRANSLATION_BATCH_SIZE,
+    DEFAULT_TRANSLATION_DEEPSEEK_MODEL,
+    DEFAULT_TRANSLATION_GEMINI_MODEL,
     DEFAULT_TRANSLATION_MODEL,
     Settings,
 )
@@ -137,12 +139,15 @@ def _settings(**overrides) -> Settings:
         "work_dir": Path("work"),
         "output_dir": Path("output"),
         "model_cache_dir": Path("models"),
-        "deepseek_api_key": "test-key",
-        # This file exercises the instruction-following backend against a fake
-        # client. Pinning it explicitly is what keeps the tests off the network: the
-        # project default is now NLLB, which would try to download real weights.
+        # This file exercises the served instruction-following backend against a fake
+        # client. Backend, provider, endpoint, model and both keys are pinned explicitly
+        # so a test neither reaches the network nor depends on which vendor happens to be
+        # the project default this month.
         "translation_backend": "openai",
-        "translation_model": "deepseek-flash",
+        "translation_provider": "deepseek",
+        "gemini_api_key": "test-key",
+        "deepseek_api_key": "test-key",
+        "translation_model": "deepseek-v4-pro",
     }
     values.update(overrides)
     return Settings(**values)
@@ -374,13 +379,34 @@ def test_client_uses_the_configured_base_url_and_key(monkeypatch):
         [_segment()],
         settings=_settings(
             deepseek_api_key="sk-test",
-            translation_base_url=DEFAULT_TRANSLATION_BASE_URL,
+            translation_base_url="https://api.deepseek.com",
         ),
     )
 
     assert FakeOpenAI.init_kwargs == [
         {"api_key": "sk-test", "base_url": "https://api.deepseek.com"}
     ]
+
+
+def test_the_provider_decides_which_key_reaches_the_client(monkeypatch):
+    """One accessor chooses the key, so no call site has to know the vendor."""
+
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [_segment()],
+        settings=_settings(
+            translation_provider="gemini",
+            gemini_api_key="gemini-key",
+            deepseek_api_key="deepseek-key",
+            translation_base_url="https://example.test/v1",
+        ),
+    )
+
+    # The key for the *configured* provider, not whichever one happens to be set.
+    ((sent,),) = [tuple(FakeOpenAI.init_kwargs)]
+    assert sent["api_key"] == "gemini-key"
+    assert sent["base_url"] == "https://example.test/v1"
 
 
 def test_the_instruction_backend_uses_its_configured_model(monkeypatch):
@@ -390,9 +416,9 @@ def test_the_instruction_backend_uses_its_configured_model(monkeypatch):
 
     adapt_dialogue([_segment()], settings=_settings())
 
-    assert FakeOpenAI.requests[0]["model"] == "deepseek-flash"
+    assert FakeOpenAI.requests[0]["model"] == "deepseek-v4-pro"
     # The default model belongs to the default backend, not to this one.
-    assert DEFAULT_TRANSLATION_MODEL != "deepseek-flash"
+    assert DEFAULT_TRANSLATION_MODEL != "deepseek-v4-pro"
 
 
 def test_the_default_backend_is_the_instructable_one():
@@ -404,10 +430,18 @@ def test_the_default_backend_is_the_instructable_one():
     available with no way to shorten it, so 31 of 38 lines had to be cut.
     """
 
-    from app.config import DEFAULT_TRANSLATION_BACKEND, DEFAULT_TRANSLATION_OPENAI_MODEL
+    from app.config import (
+        DEFAULT_TRANSLATION_BACKEND,
+        DEFAULT_TRANSLATION_GEMINI_MODEL,
+        DEFAULT_TRANSLATION_OPENAI_MODEL,
+        DEFAULT_TRANSLATION_PROVIDER,
+    )
 
     assert DEFAULT_TRANSLATION_BACKEND == "openai"
-    assert DEFAULT_TRANSLATION_OPENAI_MODEL == "deepseek-v4-pro"
+    assert DEFAULT_TRANSLATION_PROVIDER == "gemini"
+    # The legacy name for "the served backend's default model" now follows the provider,
+    # so it and the Gemini default are the same string rather than two that can drift.
+    assert DEFAULT_TRANSLATION_OPENAI_MODEL == DEFAULT_TRANSLATION_GEMINI_MODEL
     assert "nllb" in DEFAULT_TRANSLATION_MODEL
 
 
@@ -497,14 +531,219 @@ def test_json_mode_is_requested(monkeypatch):
     assert FakeOpenAI.requests[0]["response_format"] == {"type": "json_object"}
 
 
-def test_thinking_is_disabled_by_default_and_can_be_turned_off(monkeypatch):
-    _patch(monkeypatch)
-    adapt_dialogue([_segment()], settings=_settings())
-    assert FakeOpenAI.requests[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+def test_a_provider_with_no_thinking_control_is_sent_none(monkeypatch):
+    """A field the endpoint might reject is worse than no field at all.
+
+    Each provider spells reasoning differently - Gemini takes a level, DeepSeek an
+    on/off switch - so the provider record decides, and the pipeline just forwards it.
+    """
 
     _patch(monkeypatch)
-    adapt_dialogue([_segment()], settings=_settings(translation_disable_thinking=False))
+    monkeypatch.setenv("TRANSLATION_API_KEY", "local-key")
+
+    adapt_dialogue(
+        [_segment()],
+        settings=_settings(
+            translation_provider="other",
+            translation_base_url="http://localhost:8080/v1",
+            translation_model="local-model",
+        ),
+    )
+
     assert "extra_body" not in FakeOpenAI.requests[0]
+    assert "reasoning_effort" not in FakeOpenAI.requests[0]
+
+
+def test_a_level_provider_is_sent_the_level_it_understands(monkeypatch):
+    """Gemini cannot stop reasoning, so ``off`` reaches the lowest level and says so."""
+
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [_segment()],
+        settings=_settings(
+            translation_provider="gemini",
+            gemini_api_key="test-key",
+            translation_model="gemini-3.8-flash",
+        ),
+    )
+    assert FakeOpenAI.requests[0]["reasoning_effort"] == "medium"
+    assert "extra_body" not in FakeOpenAI.requests[0]
+
+
+def test_the_thinking_switch_is_used_for_a_provider_that_has_one(monkeypatch):
+    _patch(monkeypatch)
+
+    adapt_dialogue([_segment()], settings=_settings(translation_thinking="off"))
+    assert FakeOpenAI.requests[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "reasoning_effort" not in FakeOpenAI.requests[0]
+
+    _patch(monkeypatch)
+    adapt_dialogue([_segment()], settings=_settings(translation_thinking="high"))
+    # A provider with no levels is not sent a level it cannot honour.
+    assert "extra_body" not in FakeOpenAI.requests[0]
+    assert "reasoning_effort" not in FakeOpenAI.requests[0]
+
+
+def test_an_unknown_thinking_level_is_rejected(monkeypatch):
+    _patch(monkeypatch)
+
+    with pytest.raises(ConfigurationError, match="TRANSLATION_THINKING"):
+        adapt_dialogue([_segment()], settings=_settings(translation_thinking="maximum"))
+
+
+# ---------------------------------------------------------------------------
+# Provider boundary
+#
+# The provider decides exactly four things: the endpoint, the model, the variable the
+# key lives in, and how reasoning is requested. Everything else about a request has to
+# stay identical, because that is what makes swapping the translation model a
+# configuration change instead of a code change.
+# ---------------------------------------------------------------------------
+
+
+def test_only_the_thinking_field_differs_between_providers(monkeypatch):
+    """This is what lets the adaptation model be swapped without touching the pipeline."""
+
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [_segment()],
+        settings=_settings(
+            translation_provider="gemini",
+            translation_model=DEFAULT_TRANSLATION_GEMINI_MODEL,
+        ),
+    )
+    gemini_request = dict(FakeOpenAI.requests[0])
+
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [_segment()],
+        settings=_settings(
+            translation_provider="deepseek",
+            translation_model=DEFAULT_TRANSLATION_DEEPSEEK_MODEL,
+            translation_base_url="https://api.deepseek.com",
+        ),
+    )
+    deepseek_request = dict(FakeOpenAI.requests[0])
+
+    # Same prompt, same protocol, same batching; only the provider facts differ.
+    assert gemini_request["messages"] == deepseek_request["messages"]
+    assert gemini_request["response_format"] == deepseek_request["response_format"]
+    assert gemini_request["model"] == DEFAULT_TRANSLATION_GEMINI_MODEL
+    assert deepseek_request["model"] == DEFAULT_TRANSLATION_DEEPSEEK_MODEL
+
+
+def test_a_self_hosted_server_must_be_told_where_to_go(monkeypatch):
+    """Guessing an address would send a film's requests to a host nobody asked for."""
+
+    _patch(monkeypatch)
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        adapt_dialogue(
+            [_segment()],
+            settings=_settings(
+                translation_provider="other",
+                translation_base_url="",
+                translation_model="",
+            ),
+        )
+
+    message = str(excinfo.value)
+    assert "TRANSLATION_BASE_URL" in message
+    assert "TRANSLATION_MODEL" in message
+    assert not FakeOpenAI.requests
+
+
+def test_a_missing_key_for_a_self_hosted_server_skips_the_escape_hatch_hint(
+    monkeypatch,
+):
+    """Someone already pointing at their own server gains nothing from being told to."""
+
+    _patch(monkeypatch)
+
+    with pytest.raises(MissingApiKeyError) as excinfo:
+        adapt_dialogue(
+            [_segment()],
+            settings=_settings(
+                translation_provider="other",
+                translation_base_url="http://localhost:8080/v1",
+                translation_model="local-model",
+            ),
+        )
+
+    message = str(excinfo.value)
+    assert "TRANSLATION_API_KEY" in message
+    assert "Point TRANSLATION_BASE_URL" not in message
+
+
+def test_the_run_says_what_thinking_it_will_actually_send():
+    """A manifest must not read as "high reasoning" when nothing was asked for."""
+
+    assert (
+        translation.describe_thinking(
+            _settings(translation_provider="gemini", translation_thinking="medium")
+        )
+        == "reasoning_effort=medium"
+    )
+    assert "cannot disable reasoning" in translation.describe_thinking(
+        _settings(translation_provider="gemini", translation_thinking="off")
+    )
+    assert (
+        translation.describe_thinking(_settings(translation_thinking="off"))
+        == "deepseek thinking disabled"
+    )
+    # DeepSeek's switch is on/off, so a level request leaves its own default in place -
+    # which is different from a provider that has no control at all, and must say so.
+    assert "only understands off" in translation.describe_thinking(
+        _settings(translation_thinking="high")
+    )
+    assert "no thinking control" in translation.describe_thinking(
+        _settings(
+            translation_provider="other",
+            translation_base_url="http://localhost:8080/v1",
+            translation_model="local-model",
+            translation_thinking="medium",
+        )
+    )
+
+
+def test_a_json_object_wrapped_in_prose_is_still_read(monkeypatch):
+    """The compatible endpoint is beta, and losing a film to a markdown fence is not a trade."""
+
+    _patch(monkeypatch)
+    body = json.dumps(
+        {
+            "lines": [
+                {
+                    "id": translation._dialogue_id(1),
+                    "amharic": "እኔ እዚህ ነኝ",
+                    "emotion": "neutral",
+                    "intensity": 0.5,
+                    "delivery": "calm",
+                    "pause_before": 0.1,
+                    "pause_after": 0.2,
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    FakeOpenAI.raw = f"Here is the adaptation:\n```json\n{body}\n```\n"
+
+    lines = adapt_dialogue([_segment()], settings=_settings())
+
+    assert [line.amharic for line in lines] == ["እኔ እዚህ ነኝ"]
+
+
+def test_a_reply_that_is_not_a_json_object_is_still_rejected(monkeypatch):
+    """Tolerance for a wrapper must not become tolerance for a broken protocol."""
+
+    _patch(monkeypatch)
+    FakeOpenAI.raw = "I cannot help with that request."
+
+    with pytest.raises(MalformedResponseError):
+        adapt_dialogue([_segment()], settings=_settings())
 
 
 def test_system_prompt_demands_spoken_amharic_adaptation():

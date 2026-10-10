@@ -108,6 +108,56 @@ control*: a 2M-parameter LoRA on a permissively licensed 8B model has been measu
 be told to shorten a line or hold a register. That is the next real upgrade here, and it
 is a fine-tuning job, not a model swap.
 
+### Swapping the adaptation model
+
+`TRANSLATION_PROVIDER` is the one knob that changes *which vendor* the `openai` backend
+talks to. It decides four things and nothing else:
+
+| | `gemini` (default) | `deepseek` | `other` |
+| --- | --- | --- | --- |
+| Endpoint | `https://generativelanguage.googleapis.com/v1beta/openai/` | `https://api.deepseek.com` | you set it |
+| Default model | `gemini-3.8-flash` | `deepseek-v4-pro` | you set it |
+| Key variable | `GEMINI_API_KEY` | `DEEPSEEK_API_KEY` | `TRANSLATION_API_KEY` |
+| Reasoning control | `reasoning_effort` | `thinking: disabled` | none sent |
+
+Everything else - the prompt, the JSON protocol, the batching, the syllable budgets, the
+reduction passes, the character bible - is identical, which is what makes the model a
+configuration choice rather than a code change. Both endpoints speak the OpenAI wire
+protocol, so the same tested request path serves both. `TRANSLATION_PROVIDER=other`
+supplies **no** defaults on purpose: guessing an address or a model name for a server
+this project has never seen would send a film's requests somewhere nobody asked for, so
+`TRANSLATION_BASE_URL` and `TRANSLATION_MODEL` are both required and a missing one is
+reported by name before any request is sent.
+
+**Swapping back is one variable.** `TRANSLATION_PROVIDER=deepseek` plus
+`DEEPSEEK_API_KEY` is the whole change; `TRANSLATION_MODEL` and `TRANSLATION_BASE_URL`
+follow the provider unless set explicitly, so a stale value copied from an old `.env` is
+the only thing that can point one vendor's key at another vendor's host.
+
+**What Gemini buys.** Syllable condensation is the binding constraint for a dub (see
+`TRANSLATION_SYLLABLES_PER_SECOND`), and an instruction-following model that can be told
+"this line has 12 syllables of room, say it in 12" is the mechanism that closes the
+1.7x gap. `TRANSLATION_THINKING` maps onto the provider's own control - Gemini 3 models
+**cannot stop reasoning**, so `off` reaches its lowest level rather than disabling it,
+and the run's `adaptation` line reports what was actually sent rather than what was
+asked for.
+
+**Checked, not assumed.** `gemini-3.7-flash` is deprecated and auto-routes to
+`gemini-3.8-flash`, so the default names the current model. `temperature` and `top_p`
+are deprecated on Gemini 3.x - ignored now, an error in future generations - so this
+pipeline never sends them. Gemini's OpenAI-compatible endpoint is documented as
+**beta**; `json_object` response mode is not guaranteed there, so a reply that arrives
+wrapped in a markdown fence or a sentence of preamble is unwrapped rather than failing a
+whole film's run, while a reply that is not a JSON object at all still fails.
+
+**What is not known.** No Google-published English-to-Amharic benchmark exists, and
+neither Gemini 3.8's nor DeepSeek's Amharic *dialogue* quality can be established from
+the literature - only from a native-speaker read of your own output. Free-tier
+requests-per-minute, -day and token limits are no longer published; a two-hour film is
+thousands of lines, so check the limits on your key in AI Studio before starting a full
+run. Treat the choice as a bake-off over a few hundred representative lines, scored
+against the `qc` block, rather than as a model swap that can be assumed to work.
+
 ## Choosing a speech engine
 
 `TTS_ENGINE` selects between three genuinely different capabilities:
@@ -279,7 +329,9 @@ environment, so values configured on the RunPod pod always win.
 
 | Variable            | Purpose                                             | Default            |
 | ------------------- | --------------------------------------------------- | ------------------ |
-| `DEEPSEEK_API_KEY`  | DeepSeek dialogue adaptation/translation            | *(unset)*          |
+| `GEMINI_API_KEY`    | Google AI Studio key for dialogue adaptation/translation (the default provider) | *(unset)* |
+| `DEEPSEEK_API_KEY`  | DeepSeek key, read only when `TRANSLATION_PROVIDER=deepseek` | *(unset)* |
+| `TRANSLATION_API_KEY` | Key read only when `TRANSLATION_PROVIDER=other`, for a self-hosted server with its own variable name | *(unset)* |
 | `HUGGINGFACE_TOKEN` | Download gated model weights (e.g. pyannote)        | *(unset)*          |
 | `INPUT_DIR`         | Source videos                                       | `./data/input`     |
 | `WORK_DIR`          | Intermediate artifacts                              | `./data/working`   |
@@ -291,8 +343,9 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSCRIPTION_MODEL` | faster-whisper model for transcription            | `large-v3`         |
 | `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
 | `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |
-| `TRANSLATION_BACKEND` | `nllb` (local translation) or `openai` (instruction-following adaptation) | `nllb` |
-| `TRANSLATION_MODEL`  | Model for the selected backend. Defaults per backend: `deepseek-v4-pro` for `openai`, `facebook/nllb-200-3.3B` for `nllb` | per backend |
+| `TRANSLATION_BACKEND` | `nllb` (local translation) or `openai` (instruction-following adaptation) | `openai` |
+| `TRANSLATION_PROVIDER` | Which vendor the served backend talks to: `gemini`, `deepseek`, or `other` for a self-hosted server. Decides the endpoint, the model, the key variable and how reasoning is requested - see [Swapping the adaptation model](#swapping-the-adaptation-model) | `gemini` |
+| `TRANSLATION_MODEL`  | Model for the selected backend. Unset, it follows both: `gemini-3.8-flash` or `deepseek-v4-pro` for `openai`, `facebook/nllb-200-3.3B` for `nllb`, and nothing at all for `other`, which must be told | per backend |
 | `TRANSLATION_NUM_BEAMS` | NLLB beam width; `1` is greedy and deterministic | `1` |
 | `TRANSLATION_MAX_NEW_TOKENS` | Longest NLLB output per chunk, in tokens | `512` |
 | `TRANSLATION_LENGTH_PENALTY` | NLLB's preference over output length; `<1` favours brevity | `1.0` |
@@ -307,9 +360,9 @@ environment, so values configured on the RunPod pod always win.
 | `MMS_SEED`          | Fixes the MMS duration predictor, so a line is the same length every run | `0` |
 | `MMS_SPEAKING_RATE` | Delivery speed for the whole film, asked of the MMS duration predictor before synthesis (`1.2` is ~16% faster; measured, not assumed) | `1.0` |
 | `CHATTERBOX_MODEL`  | The Amharic adapter used when `TTS_ENGINE=chatterbox` | `gabar-tech/chatterbox-amharic` |
-| `TRANSLATION_BASE_URL` | OpenAI-compatible endpoint (only for `TRANSLATION_BACKEND=openai`) | `https://api.deepseek.com` |
+| `TRANSLATION_BASE_URL` | OpenAI-compatible endpoint (only for `TRANSLATION_BACKEND=openai`). Unset, it follows `TRANSLATION_PROVIDER`; required for `other` | per provider |
 | `TRANSLATION_BATCH_SIZE` | Dialogue lines adapted per request           | `10`               |
-| `TRANSLATION_DISABLE_THINKING` | Turn off reasoning/thinking mode       | `true`             |
+| `TRANSLATION_THINKING` | How much the model may reason before answering: `off`, `low`, `medium` or `high`. Mapped onto whatever the provider understands; the run reports what it actually sent | `medium` |
 | `TRANSLATION_ENFORCE_BUDGET` | Send a line that is over its syllable budget back once to be shortened | `true` |
 | `TRANSLATION_ENFORCE_FIDEL_LOANWORDS` | Send a line that still carries Roman-script text back once to be written in Fidel | `true` |
 | `VOICE_PROFILE_DIR` | Per-speaker voice profiles directory                | `$WORK_DIR/voices` |
@@ -354,7 +407,7 @@ default resolved against the project root.
 | | Variables | Why |
 | --- | --- | --- |
 | Required | `HUGGINGFACE_TOKEN` | No fallback value; diarization cannot run without it |
-| Required only for the hosted API | `DEEPSEEK_API_KEY` | Needed only under `TRANSLATION_BACKEND=openai` with `TRANSLATION_BASE_URL` pointing at the hosted DeepSeek API. The default backend (`nllb`) reads no key at all, and a local OpenAI-compatible server needs none either |
+| Required only for the hosted API | `GEMINI_API_KEY` (default provider) or `DEEPSEEK_API_KEY` | Needed only under `TRANSLATION_BACKEND=openai`. A local OpenAI-compatible server needs no key of its own, and the `nllb` backend reads none at all |
 | Required on a Pod | `HF_HOME` | Defaults to the container's `~/.cache/huggingface`, which is lost when the Pod stops |
 | Worth setting | `MODEL_CACHE_DIR`, `SEED_VC_REPO_PATH`, `DIALOGUE_BIBLE_PATH` | The first two default under the project root, so they follow the repository onto the volume. The bible is per-film consistency state worth keeping between runs |
 | Everything else | e.g. `TRANSCRIPTION_MODEL`, `TIMING_MAX_TEMPO`, `MIX_DUCK_DB` | Set only to change behaviour |
@@ -369,9 +422,15 @@ endpoint, so a self-hosted server replaces the hosted one by configuration alone
 no code change:
 
 ```
+TRANSLATION_PROVIDER=other
 TRANSLATION_BASE_URL=http://localhost:8000/v1   # vLLM, Ollama, llama.cpp server
 TRANSLATION_MODEL=<the served model name>
+TRANSLATION_API_KEY=<anything the server expects, or leave it unset>
 ```
+
+`other` supplies no defaults on purpose: this project has never seen your server
+and will not guess its address or a model name for it. Both are required, and a
+missing one is reported by name before any request is sent.
 
 Which local model adapts English dialogue into performable Amharic best is an open
 question: no source publishes credible English-to-Amharic *dubbing* quality
@@ -391,8 +450,9 @@ without exposing secrets:
 python -c "from app.config import get_settings; print(get_settings().as_dict())"
 ```
 
-The two credentials appear only as the booleans `deepseek_api_key_set` and
-`huggingface_token_set`; their values are never printed or logged.
+The credentials appear only as the booleans `gemini_api_key_set`,
+`deepseek_api_key_set` and `huggingface_token_set`; their values are never printed
+or logged.
 
 ## Quickstart - RunPod A40 worker
 
@@ -421,7 +481,7 @@ and it survives reconnects:
 
 ```
 HUGGINGFACE_TOKEN=hf_...             # required - gated pyannote Community-1 weights
-DEEPSEEK_API_KEY=sk-...              # required - the default backend is an LLM
+GEMINI_API_KEY=...                   # required - the default backend is an LLM
 HF_HOME=/workspace/models_cache      # required on a Pod - see below
 MODEL_CACHE_DIR=/workspace/models_cache    # optional; defaults under the repo
 SEED_VC_REPO_PATH=/workspace/seed-vc       # optional - only for TTS_ENGINE=chatterbox
@@ -430,8 +490,9 @@ TTS_ENGINE=omnivoice                 # optional - omnivoice | chatterbox | mms
 ```
 
 Under the defaults **both** credentials are required: the token for the gated
-diarization pipeline, and the key because dialogue adaptation is an LLM call. Setting
-`TRANSLATION_BACKEND=nllb` removes the key requirement and translates locally instead -
+diarization pipeline, and a key because dialogue adaptation is an LLM call and the
+default provider is Gemini. Setting `TRANSLATION_BACKEND=nllb` removes the key
+requirement and translates locally instead -
 `scripts/check_environment.py --full` reports which credentials the configured run
 actually needs, and never blocks on one it will not read.
 
@@ -518,7 +579,8 @@ becomes the session pre-flight: it also checks the credentials the configured ru
 actually needs (flagging a value that is still the `.env.example` placeholder), the
 Seed-VC checkout and its `configs/v2/vc_wrapper.yaml`, and every module the stages
 import at run time. What is required follows the configuration: the Hugging Face
-token always, the DeepSeek key only under `TRANSLATION_BACKEND=openai`, and the
+token always, the configured provider's key only under `TRANSLATION_BACKEND=openai`
+(`GEMINI_API_KEY` by default), and the
 Seed-VC checkout only under `TTS_ENGINE=chatterbox`. Anything the configuration does
 not use is reported `[SKIP]` rather than `[FAIL]`.
 
@@ -608,10 +670,11 @@ targets the A40 GPU; a CPU-only run needs
 `TRANSCRIPTION_COMPUTE_TYPE=int8` because CTranslate2 does not support fp16 on
 CPU. The pipeline never falls back from GPU to CPU on its own.
 
-Dialogue adaptation runs locally by default: NLLB is a local checkpoint, so no key
-and no network access are needed. Only `TRANSLATION_BACKEND=openai` calls out to a
-third party, and only then is `DEEPSEEK_API_KEY` required. Every model that runs
-locally has its weights cached under `MODEL_CACHE_DIR`.
+The `nllb` backend translates locally: NLLB is a local checkpoint, so no key and no
+network access are needed. The default `openai` backend calls out to a third party -
+Gemini, or DeepSeek if `TRANSLATION_PROVIDER=deepseek` - and only then is its key
+required. Every model that runs locally has its weights cached under
+`MODEL_CACHE_DIR`.
 
 Voice profiles are built from the **dialogue stem** produced by separation, never
 from the full movie mix, so each reference is free of music and effects. For every
@@ -1130,7 +1193,7 @@ pytest tests/test_config.py
 - [x] `separation`: BandIt v2 Multi integration
 - [x] `diarization`: pyannote Community-1 integration
 - [x] `transcription`: faster-whisper large-v3 integration
-- [x] `translation`: DeepSeek Amharic dialogue adaptation
+- [x] `translation`: instruction-following Amharic dialogue adaptation (Gemini by default, DeepSeek or self-hosted by configuration)
 - [x] `voice_profiles`: per-speaker voice references and clone-prompt cache
 - [x] `tts`: Chatterbox Amharic synthesis + Seed-VC V2 voice adaptation
 - [x] `timing`: pitch-preserving fit to the original windows
@@ -1206,7 +1269,8 @@ merit. What is currently in use, so the obligations are known rather than assume
 | Chatterbox Multilingual v3 | MIT | base model; does **not** support Amharic on its own |
 | `gabar-tech/chatterbox-amharic` adapter | **CC-BY-SA-4.0** | share-alike propagates from WaxalNLP |
 | Seed-VC V2 | **GPL-3.0**, *archived* | read-only upstream since April 2025; only used by the `chatterbox` engine, so the default run never touches it |
-| DeepSeek API | proprietary service | the adaptation baseline; swappable for a local OpenAI-compatible server |
+| Gemini API | proprietary service | the default adaptation provider; swappable by configuration |
+| DeepSeek API | proprietary service | the alternative adaptation provider; swappable for a local OpenAI-compatible server |
 
 Two of the defaults (NLLB and OmniVoice weights) are **non-commercial only**. For a
 personal, non-commercial dub that is fine, and licences here are documented rather than
@@ -1221,10 +1285,13 @@ Two decisions taken deliberately, for now:
 
 * **Stereo 2.0 is the deliverable.** 5.1 is a possible later output format and does
   not drive the architecture.
-* **DeepSeek remains the adaptation baseline.** It is not replaced merely for being
-  a hosted service; the stage is improved through context, prompting, timing budgets
-  and Amharic-specific processing, and a different model replaces it only if
-  measurement shows a materially better Amharic result.
+* **An instruction-following model is the adaptation baseline, and the vendor is a
+  setting.** Gemini is the default (`gemini-3.8-flash`, free tier) because syllable
+  condensation and scene-aware adaptation are the binding constraints for a dub, and
+  DeepSeek (`deepseek-v4-pro`) remains supported behind one variable. Neither is
+  replaced merely for being a hosted service: the stage is improved through context,
+  prompting, timing budgets and Amharic-specific processing, and a different model
+  replaces one only if measurement shows a materially better Amharic result.
 
 ## License
 

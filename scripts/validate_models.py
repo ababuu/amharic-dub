@@ -9,7 +9,8 @@ one component.
 
 Which translation and synthesis models are checked follows the configuration:
 
-* ``TRANSLATION_BACKEND`` selects ``nllb`` (the default) or ``deepseek``.
+* ``TRANSLATION_BACKEND`` selects a local ``nllb`` checkpoint, or ``openai`` for a
+  served instruction-following model (``TRANSLATION_PROVIDER`` picks the vendor).
 * ``TTS_ENGINE`` selects ``mms`` (the default), or ``chatterbox`` plus ``seed-vc``.
 
 Only the selected ones are loaded. Checking the other pair would download many
@@ -277,11 +278,13 @@ def load_omnivoice() -> None:
     _report("loaded", f"synthesized a cloned line at {engine.sample_rate} Hz")
 
 
-def load_deepseek() -> None:
-    """Build the DeepSeek client and confirm the key is accepted.
+def load_served_model() -> None:
+    """Build the served-model client and confirm the key is accepted.
 
     ``client.models.list()`` is the smallest call that proves the credential works,
-    which is worth knowing before a run reaches the adaptation stage.
+    which is worth knowing before a run reaches the adaptation stage. The provider
+    decides which key is read and which endpoint is called, so this validates whichever
+    one the run would actually use.
     """
 
     from app.pipeline import translation
@@ -289,17 +292,20 @@ def load_deepseek() -> None:
     settings = translation.get_settings()
     if settings.translation_backend != "openai":
         raise RuntimeError(
-            f"TRANSLATION_BACKEND is {settings.translation_backend!r}, so an "
-            "OpenAI-compatible endpoint is not what a run would use; validate "
-            "'nllb' instead"
+            f"TRANSLATION_BACKEND is {settings.translation_backend!r}, so a served "
+            "endpoint is not what a run would use; validate 'nllb' instead"
         )
-    if not settings.deepseek_api_key:
-        raise RuntimeError("DEEPSEEK_API_KEY is not set")
+    if not settings.translation_api_key:
+        raise RuntimeError(f"{settings.translation_api_key_env} is not set")
 
+    _report("provider", settings.translation_provider)
     _report("base url", settings.translation_base_url)
     _report("model", settings.translation_model)
+    _report("thinking", translation.describe_thinking(settings))
 
-    client = translation._build_client(settings, settings.deepseek_api_key)  # noqa: SLF001
+    client = translation._build_client(  # noqa: SLF001
+        settings, settings.translation_api_key
+    )
     models = client.models.list()
     _report("models listed", str(len(getattr(models, "data", []) or [])))
 
@@ -351,9 +357,9 @@ STEPS: tuple[tuple[str, str, object], ...] = (
 CONFIGURED_STEPS: tuple[tuple[str, str, object, str], ...] = (
     ("nllb", "NLLB-200 translation (TRANSLATION_BACKEND=nllb)", load_nllb, "nllb"),
     (
-        "deepseek",
+        "served",
         "instruction-following adaptation (TRANSLATION_BACKEND=openai)",
-        load_deepseek,
+        load_served_model,
         "openai",
     ),
     (
@@ -381,7 +387,7 @@ CONFIGURED_STEPS: tuple[tuple[str, str, object, str], ...] = (
 #: How to make a step that the current configuration does not select part of it.
 ACTIVATION: dict[str, str] = {
     "nllb": "set TRANSLATION_BACKEND=nllb",
-    "deepseek": "set TRANSLATION_BACKEND=openai",
+    "served": "set TRANSLATION_BACKEND=openai",
     "omnivoice": "set TTS_ENGINE=omnivoice",
     "mms": "set TTS_ENGINE=mms",
     "chatterbox": "set TTS_ENGINE=chatterbox",
@@ -404,7 +410,7 @@ def configured_steps() -> tuple[tuple[str, str, object], ...]:
 
     selected: list[tuple[str, str, object]] = list(STEPS)
     for name, description, loader, wanted in CONFIGURED_STEPS:
-        if name in ("nllb", "deepseek") and wanted != backend:
+        if name in ("nllb", "served") and wanted != backend:
             continue
         if name in ("mms", "omnivoice", "chatterbox", "seed-vc") and wanted != engine:
             continue

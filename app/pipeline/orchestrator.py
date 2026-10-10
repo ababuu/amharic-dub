@@ -543,8 +543,20 @@ def run_pipeline(
         # that decides whether the dub fits or has to be squashed, so it is measured and
         # stated here rather than left to be discovered from the timing report later.
         _report_dialogue_fit(dialogue, resolved, report)
-    elif bible:
-        report(f"  dialogue bible: {len(bible)} character(s) applied")
+    else:
+        # Which model produced the Amharic, and how hard it was asked to think, are the
+        # first things to know when comparing two runs. The provider also decides whether
+        # the requested thinking level was even available, which a bare model name would
+        # leave a reader to guess at.
+        report(
+            f"  adaptation: {resolved.translation_provider} "
+            f"{resolved.translation_model} "
+            f"({translation.describe_thinking(resolved)})"
+        )
+        # Only the instruction-following backend reads the bible, so only it can report
+        # having applied one.
+        if bible:
+            report(f"  dialogue bible: {len(bible)} character(s) applied")
     if not dialogue:
         raise EmptyStageError("adaptation produced no lines; nothing to synthesize")
 
