@@ -48,37 +48,68 @@ SEPARATOR = "-" * 60
 #: Top-level import name -> the part of the pipeline that needs it. Kept here,
 #: rather than in each script, so the installer's smoke check and this pre-flight
 #: can never disagree about what has to be importable.
+#: Packages every configuration needs, with what needs each one.
 RUNTIME_MODULES: dict[str, str] = {
     "torch": "runtime",
     "torchaudio": "runtime",
     "numpy": "runtime",
     "soundfile": "audio I/O",
     "av": "faster-whisper decoding",
-    "torchcodec": "pyannote.audio",
     "dotenv": "configuration",
-    "openai": "translation",
-    "sentencepiece": "NLLB-200 tokenizer",
-    "uroman": "MMS-TTS romanisation",
     "faster_whisper": "transcription",
     "pyannote.audio": "diarization",
+    "torchcodec": "pyannote.audio",
     "bandit_infer": "separation",
-    "hydra": "Seed-VC",
-    "omegaconf": "Seed-VC",
-    "yaml": "Seed-VC",
-    "librosa": "Seed-VC / Chatterbox",
-    "pydub": "Seed-VC",
-    "transformers": "Seed-VC / Chatterbox / OmniVoice",
-    "omnivoice": "OmniVoice synthesis",
-    "einops": "Seed-VC",
-    "scipy": "Seed-VC",
-    "munch": "Seed-VC",
-    "tqdm": "Seed-VC",
-    "matplotlib": "Seed-VC (BigVGAN)",
-    "peft": "Chatterbox Amharic adapter",
-    "safetensors": "Chatterbox Amharic adapter",
+    "librosa": "audio analysis",
+    "yaml": "configuration",
+    "pydub": "audio editing",
+    "einops": "audio modelling",
+    "scipy": "audio analysis",
+    "tqdm": "progress reporting",
+    "transformers": "model loading",
     "huggingface_hub": "model downloads",
-    "chatterbox": "speech synthesis",
 }
+
+#: Packages only one translation backend or speech engine needs, keyed by the setting
+#: that selects it. A configuration is checked against its own list and nothing else:
+#: demanding a working Chatterbox for an OmniVoice run would report a failure over
+#: something the run never imports, which sends someone chasing a red mark that does not
+#: affect them. ``openai`` is required by the default backend, so it is listed here rather
+#: than above; running ``TRANSLATION_BACKEND=nllb`` correctly stops requiring it.
+BACKEND_MODULES: dict[str, tuple[str, dict[str, str]]] = {
+    "openai": ("translation_backend", {"openai": "LLM adaptation"}),
+    "nllb": (
+        "translation_backend",
+        {"sentencepiece": "NLLB-200 tokenizer"},
+    ),
+    "omnivoice": (
+        "tts_engine",
+        {"omnivoice": "OmniVoice synthesis", "accelerate": "OmniVoice device placement"},
+    ),
+    "mms": ("tts_engine", {"uroman": "MMS-TTS romanisation"}),
+    "chatterbox": (
+        "tts_engine",
+        {
+            "chatterbox": "Chatterbox synthesis",
+            "peft": "Chatterbox Amharic adapter",
+            "safetensors": "Chatterbox Amharic adapter",
+            "hydra": "Seed-VC",
+            "omegaconf": "Seed-VC",
+            "munch": "Seed-VC",
+            "matplotlib": "Seed-VC (BigVGAN)",
+        },
+    ),
+}
+
+
+def required_runtime_modules(settings: Any) -> dict[str, str]:
+    """Return the packages this configuration actually needs, with what needs each."""
+
+    required = dict(RUNTIME_MODULES)
+    for name, (attribute, modules) in BACKEND_MODULES.items():
+        if getattr(settings, attribute, None) == name:
+            required.update(modules)
+    return required
 
 #: The project's own modules, imported as well. The third-party list above cannot
 #: catch a broken import *inside* the project, so a typo or a bad import in a stage
@@ -326,17 +357,23 @@ def check_seed_vc() -> bool:
 
 
 def check_runtime_imports() -> bool:
-    """Import every third-party module the stages need, and report the failures.
+    """Import every third-party module this configuration needs, and report the failures.
 
     Every import here is top level and none of them downloads a model, so this is
     the cheapest way to find a package that is missing *before* a stage reaches it
-    halfway through a run.
+    halfway through a run. The list is built from the configuration - see
+    :func:`required_runtime_modules` - so a run is never failed over a package its own
+    backend or engine does not import.
     """
 
     import importlib
 
+    from app.config import get_settings
+
+    required = required_runtime_modules(get_settings())
+
     failures: list[tuple[str, str, str]] = []
-    for name, needed_by in RUNTIME_MODULES.items():
+    for name, needed_by in required.items():
         try:
             importlib.import_module(name)
         except Exception as exc:  # noqa: BLE001 - report every failure, never stop
@@ -356,12 +393,12 @@ def check_runtime_imports() -> bool:
         for name, needed_by, error in failures:
             print(f"  FAIL  {name:<16} ({needed_by}): {error}")
         print(
-            f"Runtime imports: {len(failures)} of {len(RUNTIME_MODULES)} failed  "
+            f"Runtime imports: {len(failures)} of {len(required)} failed  "
             "[FAIL]"
         )
         print("        - run: bash scripts/install_dependencies.sh")
     else:
-        print(f"Runtime imports: all {len(RUNTIME_MODULES)} available  [OK]")
+        print(f"Runtime imports: all {len(required)} available  [OK]")
 
     if project_failures:
         print(
