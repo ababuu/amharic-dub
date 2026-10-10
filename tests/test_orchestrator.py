@@ -222,6 +222,7 @@ class Stages:
         bible: object = None,
         enforce_budget: bool = True,
         enforce_fidel_loanwords: bool = True,
+        maximum_reduction_attempts: int = 3,
     ) -> list[AdaptedDialogue]:
         self._record("translation", lines, settings, bible)
         return list(self.dialogue)

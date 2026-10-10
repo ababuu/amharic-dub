@@ -24,6 +24,7 @@ from app.config import (
     Settings,
 )
 from app.pipeline import translation
+from app.pipeline.translation import MAXIMUM_REDUCTION_ATTEMPTS
 from app.pipeline.transcription import TranscriptSegment
 from app.pipeline.translation import (
     AdaptedDialogue,
@@ -394,10 +395,19 @@ def test_the_instruction_backend_uses_its_configured_model(monkeypatch):
     assert DEFAULT_TRANSLATION_MODEL != "deepseek-flash"
 
 
-def test_the_default_backend_is_local_nllb():
-    from app.config import DEFAULT_TRANSLATION_BACKEND
+def test_the_default_backend_is_the_instructable_one():
+    """The default must be a model that can be *told* things, not merely a good translator.
 
-    assert DEFAULT_TRANSLATION_BACKEND == "nllb"
+    NLLB measured better on Amharic translation quality and is still available, but it
+    cannot be asked to be brief, to keep a borrowed word in Fidel, or to match a
+    character - and on a real run those mattered more: its Amharic needed 1.66x the time
+    available with no way to shorten it, so 31 of 38 lines had to be cut.
+    """
+
+    from app.config import DEFAULT_TRANSLATION_BACKEND, DEFAULT_TRANSLATION_OPENAI_MODEL
+
+    assert DEFAULT_TRANSLATION_BACKEND == "openai"
+    assert DEFAULT_TRANSLATION_OPENAI_MODEL == "deepseek-flash"
     assert "nllb" in DEFAULT_TRANSLATION_MODEL
 
 
@@ -506,11 +516,29 @@ def test_system_prompt_demands_spoken_amharic_adaptation():
     assert "humor" in prompt
     assert "sarcasm" in prompt
     assert "profanity" in prompt
-    assert "duration" in prompt
     assert "emotion" in prompt
     assert "intensity" in prompt
     assert "delivery" in prompt
     assert "json" in prompt
+
+
+def test_system_prompt_treats_brevity_as_the_hardest_constraint():
+    """A line that does not fit cannot be rescued later, so the prompt must say so.
+
+    Measured on a real run, the Amharic needed 1.66x the time available and there was no
+    way to shorten it downstream - the prompt is where length is decided, so the
+    instruction to be compact has to be unambiguous and actionable.
+    """
+
+    prompt = translation.SYSTEM_PROMPT.lower()
+
+    assert "syllable_budget" in prompt
+    assert "hard ceiling" in prompt
+    assert "most important constraint" in prompt
+    assert "in fewer words" in prompt
+    # The concrete Amharic-specific levers, not just "be brief".
+    assert "drop pronouns" in prompt
+    assert "copula" in prompt
 
 
 def test_system_prompt_covers_borrowed_english_vocabulary():
@@ -757,7 +785,13 @@ def test_budget_enforcement_can_be_turned_off(monkeypatch):
 
 
 def test_a_retry_that_is_still_too_long_is_reported_not_retried_forever(monkeypatch):
-    """One retry only: a model that cannot shorten a line must not loop."""
+    """The rewrite loop is bounded: a model that cannot shorten a line must not loop.
+
+    More than one attempt is needed in practice - a single pass left every over-long line
+    still over at roughly 1.6-1.8x its budget on real dialogue - but the number of attempts
+    is capped, because an unbounded loop would eventually "fit" the window by losing the
+    meaning, which is worse than a line that has to be delivered quickly.
+    """
 
     _patch(monkeypatch)
 
@@ -770,8 +804,30 @@ def test_a_retry_that_is_still_too_long_is_reported_not_retried_forever(monkeypa
 
     adapted = adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
 
-    assert len(FakeOpenAI.requests) == 2
+    # One initial request, then exactly the bounded number of rewrites - and it stops.
+    assert len(FakeOpenAI.requests) == 1 + MAXIMUM_REDUCTION_ATTEMPTS
     assert adapted[0].amharic == "ሰላም እንደምን ነህ"
+
+
+def test_the_rewrite_attempts_are_configurable(monkeypatch):
+    """A run can trade API calls against how hard it pushes a line to fit."""
+
+    _patch(monkeypatch)
+
+    def transform(body):
+        for line in body["lines"]:
+            line["amharic"] = "ሰላም እንደምን ነህ"
+        return body
+
+    FakeOpenAI.transform = transform
+
+    adapt_dialogue(
+        [_segment(start=0.0, end=1.0)],
+        settings=_settings(),
+        maximum_reduction_attempts=1,
+    )
+
+    assert len(FakeOpenAI.requests) == 2
 
 
 def test_the_scene_is_derived_when_none_is_supplied(monkeypatch):
@@ -867,7 +923,7 @@ def test_only_the_lines_with_roman_text_are_resent(monkeypatch):
 
 
 def test_the_two_rewrite_reasons_share_one_pass(monkeypatch):
-    """A batch is never re-asked twice: both problems go back together."""
+    """A batch is never re-asked twice *per attempt*: both problems go back together."""
 
     _patch(monkeypatch)
     calls: list[int] = []
@@ -883,10 +939,17 @@ def test_the_two_rewrite_reasons_share_one_pass(monkeypatch):
 
     adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
 
-    assert len(FakeOpenAI.requests) == 2
+    # One initial request plus one per bounded attempt, and both problems are stated in
+    # each rewrite rather than each needing its own call.
+    assert len(FakeOpenAI.requests) == 1 + MAXIMUM_REDUCTION_ATTEMPTS
     rewrite = _payload(FakeOpenAI.requests[1])["rewrite"]
     assert "cut at least" in rewrite  # the budget problem
     assert "Walt" in rewrite  # and the script problem
+    # Every later attempt carries the same two problems.
+    for request in FakeOpenAI.requests[1:]:
+        payload = _payload(request)["rewrite"]
+        assert "cut at least" in payload
+        assert "Walt" in payload
 
 
 def test_roman_script_enforcement_can_be_turned_off(monkeypatch):

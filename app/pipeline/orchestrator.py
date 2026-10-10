@@ -509,6 +509,7 @@ def run_pipeline(
             bible=bible,
             enforce_budget=resolved.translation_enforce_budget,
             enforce_fidel_loanwords=resolved.translation_enforce_fidel_loanwords,
+            maximum_reduction_attempts=resolved.translation_max_reduction_attempts,
         )
     )
     if resolved.translation_backend == "nllb":

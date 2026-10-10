@@ -53,20 +53,40 @@ flowchart LR
 `TRANSLATION_BACKEND` selects between two genuinely different things, and the
 difference is worth understanding before changing it:
 
-| | `nllb` (default) | `openai` |
+| | `openai` (default) | `nllb` |
 | --- | --- | --- |
-| What it is | a translation model, 200 languages | an instruction-following LLM |
-| Amharic | real parallel training data behind `amh_Ethi` | incidental, and often weak |
-| Scene/character context | no | yes, via the character bible |
-| Syllable budget + re-ask | no | yes |
-| Borrowed-word policy (Fidel) | prompt-level only, unenforced | enforced |
-| Per-line performance metadata | neutral defaults | emotion, intensity, delivery, pauses |
-| Runs locally, no key | yes | no |
+| What it is | an instruction-following LLM | a translation model, 200 languages |
+| Amharic translation quality | weaker than NLLB on measured benchmarks | stronger |
+| Scene/character context | yes, via the character bible | no |
+| Syllable budget + re-ask | **yes, and iterated** | no |
+| Borrowed-word policy (Fidel) | **enforced** | not expressible |
+| Per-line performance metadata | emotion, intensity, delivery, pauses | neutral defaults |
+| Runs locally, no key | no | yes |
 
-NLLB translates; it does not *adapt*. It has never seen the scene or the character,
-so it cannot keep a joke, match a register, or shorten a line to fit - and the
-performance fields on each line are neutral defaults rather than anything the model
-decided. That is the real cost of the default, and it is stated rather than hidden.
+**Why the LLM is the default even though NLLB translates better.** Measured on a real
+run of the test clip, NLLB produced Amharic needing **1.66x** the time available, left
+`Skyler` in Latin script (which a Fidel-reading voice cannot pronounce - the run's
+`coverage` line reported it as a borrowed word still to pin), and offered no mechanism to
+shorten anything. There was nothing to send a line back *to*. The consequence was 31 of
+38 lines cut short, which is what a listener hears as words chopped mid-syllable.
+
+Translation quality is not the binding constraint for a dub. Length and pronounceability
+are, and only an instructable model can be held to them. Verified against the real API on
+the film's own lines, the LLM returns borrowed words in Fidel (`Skyler` -> `ስካይለር`,
+`Walt` -> `ዋልት`) and inflects for the character it is speaking as (`አታውቂም`, feminine, to
+Skyler). NLLB does neither.
+
+`TRANSLATION_BACKEND=nllb` remains fully supported and is the better choice if you only
+need a rough translation, are offline, or want to compare.
+
+**The honest limitation.** Amharic does not fit into English time. The English actor said
+"I am not in danger, Skyler." in 1.96s; the shortest faithful Amharic is about 12
+syllables, which no delivery squeezes into that. Measured across two independent models,
+both came back at **~1.7-1.8x** the available time. Iterated re-asking (see
+`TRANSLATION_MAX_REDUCTION_ATTEMPTS`) closes some of that, and the silence between lines
+absorbs some more, but a residue remains on tight lines. The pipeline's response is to
+report it rather than to hide it - and specifically **not** to cut the performance
+(see `TIMING_TRIM_TO_FIT`).
 
 **Why NLLB, and why 3.3B.** This was checked against published Amharic numbers rather
 than assumed. NLLB-200 beats every open instruction-following model tried on Amharic:
@@ -261,12 +281,13 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
 | `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |
 | `TRANSLATION_BACKEND` | `nllb` (local translation) or `openai` (instruction-following adaptation) | `nllb` |
-| `TRANSLATION_MODEL`  | Model for the selected backend                | `facebook/nllb-200-3.3B` |
+| `TRANSLATION_MODEL`  | Model for the selected backend. Defaults per backend: `deepseek-flash` for `openai`, `facebook/nllb-200-3.3B` for `nllb` | per backend |
 | `TRANSLATION_NUM_BEAMS` | NLLB beam width; `1` is greedy and deterministic | `1` |
 | `TRANSLATION_MAX_NEW_TOKENS` | Longest NLLB output per chunk, in tokens | `512` |
 | `TRANSLATION_LENGTH_PENALTY` | NLLB's preference over output length; `<1` favours brevity | `1.0` |
 | `TRANSLATION_SHORTEN_PENALTY` | The penalty a line that will not fit is re-translated with | `0.6` |
 | `TRANSLATION_SYLLABLES_PER_SECOND` | Amharic delivery rate used to turn time into a syllable budget | `4.0` |
+| `TRANSLATION_MAX_REDUCTION_ATTEMPTS` | How many times a line may be sent back to be shortened | `3` |
 | `TTS_ENGINE`        | `omnivoice` (cloned, per character) or `chatterbox` or `mms` (single voice) | `omnivoice` |
 | `OMNIVOICE_MODEL`   | OmniVoice checkpoint used when `TTS_ENGINE=omnivoice` | `k2-fsa/OmniVoice` |
 | `OMNIVOICE_STEPS`   | Diffusion steps; `16` is the faster documented setting | `32` |
@@ -297,6 +318,7 @@ environment, so values configured on the RunPod pod always win.
 | `TIMING_MIN_TEMPO` | Slowest a line may be stretched to fit its window | `0.80` |
 | `TIMING_MAX_TEMPO` | Fastest a line may be stretched to fit its window | `1.25` |
 | `TIMING_MIN_LINE_GAP` | Silence kept between one dubbed line and the next, so two voices never sound at once | `0.12` |
+| `TIMING_TRIM_TO_FIT` | Cut a line that will not fit, with a fade, instead of letting it briefly overlap the next | `false` |
 | `MIX_DIALOGUE_GAIN_DB` | Dialogue level in the final mix (signed dB)     | `0.0`              |
 | `MIX_DUCK_DB`       | How far music/effects are ducked under dialogue    | `6.0`              |
 | `DEVICE`            | `cuda` on a GPU worker, `cpu` for CPU-only checks   | `cuda`             |
@@ -745,17 +767,21 @@ Three things happen in order, and only ever as far as needed:
    pitch-preserving `atempo`. Only the speech is stretched; the rendered pauses keep their
    length, and a line's leading pause shifts the file rather than the line, so the speech
    still lands on its original start.
-3. **Only a line that still cannot fit is cut short**, with a 25ms fade, and the cut is
-   reported in the manifest and in the run summary. Cutting is the last resort because two
-   voices at once is unintelligible while a clipped ending is merely abrupt - but it is
-   never silent, because a non-zero `trimmed` means the Amharic was longer than its time.
+3. **A line that still cannot fit is reported, not cut.** `TIMING_TRIM_TO_FIT` (default
+   `false`) decides whether it is faded short instead. Cutting is off by default because it
+   is the one outcome that damages the performance itself: on a real run where the text was
+   too long it fired on 31 of 38 lines, and the result was described as "not a single good
+   sentence without cuts and stutters". A brief overlap is the lesser evil, and the run
+   states the overrun in the manifest and in its summary either way.
 
 A line with no successor - the last in the film, or a clip aligned on its own - is
 **never** cut: it harms nobody by running past its own window, and cutting would be
 mangling for no benefit. `atempo` accepts 0.5-2.0, so a wider band is rejected rather than
 passed through.
 
-Measured on a real failing run of the test clip: **28 overlapping lines became 0.**
+The fix that made lines stop talking over each other is the *deadline*, and it is
+independent of all of this: measured on a real failing run, **28 overlapping lines became
+0.**
 
 Mixing places every aligned line at its own timestamp into a continuous dialogue
 stem, then sums that with the **music and effects only**. The original English
@@ -1008,6 +1034,9 @@ pytest tests/test_config.py
 - [x] A per-line placement deadline: lines use the silence after them, and never
       speak over the next one (28 overlapping lines -> 0 on the real test clip)
 - [x] Re-ask NLLB for a shorter rendering when a line cannot fit its available time
+- [x] Instruction-following adaptation as the default backend, so length and the
+      Fidel-script rule can actually be enforced; the rewrite is iterated and
+      bounded, and a line that still will not fit is reported rather than cut
 - [x] `mms`: MMS-TTS Amharic single-voice engine (and the `chatterbox` alternative)
 - [x] Peak limiting so a clip is attenuated, never silently truncated
 - [ ] Record a scored baseline on real material with the new engines

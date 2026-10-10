@@ -168,20 +168,33 @@ what people say, use it.
 The target is authentic spoken Amharic. Linguistic purity is NOT a goal; sounding
 like a real person on screen IS the goal.
 
-Timing
-------
-Each line comes with the approximate duration of the original performance, and -
-when it is supplied - a `syllable_budget`: the number of Amharic syllables that
-fit that window at a natural speaking pace. Amharic words are usually longer than
-their English equivalents, so a faithful line often needs more time than the
-original took; that is expected, and the budget is what tells you how much room
-you actually have.
+Timing - the hardest constraint
+-------------------------------
+Every line comes with the time it has to fill, in seconds, and a `syllable_budget`:
+the number of Amharic syllables that fit that time at a natural speaking pace.
 
-Treat the budget as a hard limit, not a suggestion. A line that goes over it will
-either be rushed or stretched, and both sound wrong. If a faithful rendering does
-not fit, say the same thing in fewer words - drop filler, use a shorter synonym or
-restructure the sentence - rather than allowing the line to run long. Never pad a
-line to fill its window, and never cut meaning to reach the budget.
+**This is a hard ceiling, and it is the most important constraint on your output.**
+A line that goes over its budget cannot be rescued later. Nothing downstream can make
+it shorter, so an over-long line is either delivered too fast, cut off mid-word, or
+spoken over the next line - and all three are heard instantly and ruin the scene. A
+line that fits needs no help at all. Write for the budget first, then for elegance.
+
+Amharic carries much of its meaning on the verb, so spoken Amharic is far more
+compact than a word-for-word rendering of English. Use that:
+
+- drop pronouns the verb already marks - Amharic verbs carry their subject and object;
+- drop "is", "are", "was" where Amharic needs no copula;
+- prefer one precise verb to a verb plus an adverb;
+- drop a vocative when the scene makes who is being addressed obvious;
+- whenever two phrasings are equally natural, take the shorter one;
+- cut interjections, repetitions and filler that add no meaning.
+
+Say the same thing in fewer words: that is the craft. A faithful rendering that does
+not fit is not a good translation of a *dub* - it is a line that cannot be performed.
+
+Never pad a line to fill its time, and never drop information the scene needs. If the
+budget truly cannot be met, get as close to it as you can rather than exceeding it by
+half. Do not use the borrowed-word licence above as an excuse for length either.
 
 Punctuation should support spoken delivery - use commas, dashes, ellipses and
 question marks the way a performer would breathe and pause.
@@ -708,6 +721,16 @@ def _adapt_batch(
     return [_build(segment, line_id, lines[line_id]) for segment, line_id in zip(batch, ids)]
 
 
+#: How many times a line may be sent back to be shortened, including the first attempt.
+#:
+#: More than one is needed: measured against real dialogue, a single rewrite left every
+#: over-long line still over at roughly 1.6-1.8x its budget, because a model asked to fit a
+#: small window returns something *closer* rather than something inside it. Each pass states
+#: the exact shortfall, which gives it something concrete to cut. Bounded because an
+#: unbounded loop would eventually fit the window by losing the meaning.
+MAXIMUM_REDUCTION_ATTEMPTS = 3
+
+
 def _reduce_overshooting_lines(
     client: Any,
     settings: Settings,
@@ -718,9 +741,11 @@ def _reduce_overshooting_lines(
     *,
     context: str | None,
     tolerance: float,
+    enforce_budget: bool = True,
     enforce_fidel_loanwords: bool = True,
+    maximum_attempts: int = MAXIMUM_REDUCTION_ATTEMPTS,
 ) -> tuple[list[AdaptedDialogue], tuple[BudgetVerdict, ...]]:
-    """Ask once more for the lines that came back wrong, and say how.
+    """Ask again for the lines that came back wrong, and say how.
 
     Two independent problems are handled in a single pass, so a batch is never
     re-asked twice:
@@ -785,11 +810,126 @@ def _reduce_overshooting_lines(
     for slot, line in zip(offenders, retried):
         adapted[slot] = line
 
-    final = tuple(
+    return _reduce_again(
+        client,
+        settings,
+        batch,
+        first_position,
+        adapted,
+        budgets,
+        context=context,
+        tolerance=tolerance,
+        enforce_budget=enforce_budget,
+        enforce_fidel_loanwords=enforce_fidel_loanwords,
+        attempts=maximum_attempts - 1,
+        total_attempts=maximum_attempts,
+    )
+
+
+def _reduce_again(
+    client: Any,
+    settings: Settings,
+    batch: list[TranscriptSegment],
+    first_position: int,
+    adapted: list[AdaptedDialogue],
+    budgets: Sequence[SyllableBudget],
+    *,
+    context: str | None,
+    tolerance: float,
+    enforce_budget: bool,
+    enforce_fidel_loanwords: bool,
+    attempts: int,
+    total_attempts: int,
+) -> tuple[list[AdaptedDialogue], tuple[BudgetVerdict, ...]]:
+    """Keep asking about a line that is still over, while attempts remain.
+
+    One rewrite is often not enough, and the reason is arithmetic rather than stubbornness:
+    a model asked to fit a small window tends to return something *closer* without landing
+    inside it. Measured against real lines, a single pass left every line over its budget
+    at roughly 1.6-1.8x. Re-asking with the exact shortfall - "you used 16 syllables, the
+    limit is 8" - gives it something concrete to remove, and each pass gets closer.
+
+    The loop is bounded, and a line that never fits is returned as it stands and reported.
+    An unbounded loop would eventually produce text that fits by losing the meaning, which
+    is worse than a line that has to be delivered quickly.
+    """
+
+    if attempts <= 0:
+        return adapted, tuple(
+            budget.verdict(line.amharic, tolerance=tolerance)
+            for budget, line in zip(budgets, adapted)
+        )
+
+    verdicts = tuple(
         budget.verdict(line.amharic, tolerance=tolerance)
         for budget, line in zip(budgets, adapted)
     )
-    return adapted, final
+    roman = tuple(
+        latin_spans(line.amharic) if enforce_fidel_loanwords else ()
+        for line in adapted
+    )
+    over_budget = (
+        {index for index, verdict in enumerate(verdicts) if not verdict.within_tolerance}
+        if enforce_budget
+        else set()
+    )
+    with_roman = (
+        {index for index, spans in enumerate(roman) if spans}
+        if enforce_fidel_loanwords
+        else set()
+    )
+    offenders = sorted(over_budget | with_roman)
+    if not offenders:
+        return adapted, verdicts
+
+    ids = [_dialogue_id(first_position + index) for index in offenders]
+    instructions: list[str] = []
+    for index in offenders:
+        if index in over_budget:
+            instructions.append(
+                f"- {_dialogue_id(first_position + index)}: "
+                f"{verdicts[index].describe()} This is attempt "
+                f"{total_attempts - attempts + 1} for this line. Cut words, not meaning: "
+                "drop the vocative, drop a pronoun the verb already marks, drop any word "
+                "the scene makes obvious."
+            )
+        if index in with_roman:
+            instructions.append(
+                f"- {_dialogue_id(first_position + index)}: it still contains the "
+                f"Roman-script word(s) {', '.join(roman[index])}; write each of them "
+                "in Fidel the way an Amharic speaker writes it, keeping the word "
+                "itself unchanged."
+            )
+
+    retried = _adapt_batch(
+        client,
+        settings,
+        [batch[index] for index in offenders],
+        ids,
+        context=context,
+        budgets=[budgets[index] for index in offenders],
+        rewrite=(
+            "Rewrite each of these lines to fix the problem described against it, "
+            "keeping the meaning, tone and character:\n" + "\n".join(instructions)
+        ),
+    )
+    for slot, line in zip(offenders, retried):
+        adapted[slot] = line
+
+    return _reduce_again(
+        client,
+        settings,
+        batch,
+        first_position,
+        adapted,
+        budgets,
+        context=context,
+        tolerance=tolerance,
+        enforce_budget=enforce_budget,
+        enforce_fidel_loanwords=enforce_fidel_loanwords,
+        attempts=attempts - 1,
+        total_attempts=total_attempts,
+    )
 
 
 #: Performance metadata for a line produced by a *translation* backend such as NLLB.
@@ -904,6 +1044,7 @@ def adapt_dialogue(
     budget_tolerance: float = DEFAULT_BUDGET_TOLERANCE,
     enforce_budget: bool = True,
     enforce_fidel_loanwords: bool = True,
+    maximum_reduction_attempts: int = MAXIMUM_REDUCTION_ATTEMPTS,
     translator: Any | None = None,
 ) -> list[AdaptedDialogue]:
     """Adapt transcribed dialogue into dubbing-ready Amharic.
@@ -1009,12 +1150,26 @@ def adapt_dialogue(
 
     resolved_scenes = segment_scenes(transcript) if scenes is None else tuple(scenes)
 
+    # The budget comes from the time each line actually has - its own span plus the
+    # silence after it up to the next line - not from the original English window. The
+    # window is where the *actor* spoke; the room is what a dub may use, and asking for
+    # the window alone would demand a compression no natural delivery can reach.
+    rooms = placement_windows(
+        [(line.start, line.end) for line in transcript],
+        gap=settings.timing_min_line_gap,
+    )
+
     adapted: list[AdaptedDialogue] = []
     position = 1
     for batch in _batches(transcript, batch_size):
         first_position = position
         ids = [_dialogue_id(first_position + offset) for offset in range(len(batch))]
-        budgets = [syllable_budget(line.duration, rate=syllables_per_second) for line in batch]
+        budgets = [
+            syllable_budget(
+                rooms[first_position + offset - 1], rate=syllables_per_second
+            )
+            for offset in range(len(batch))
+        ]
 
         scene = _scene_of(resolved_scenes, first_position - 1)
         context = _context_block(
@@ -1037,7 +1192,9 @@ def adapt_dialogue(
                 budgets,
                 context=context,
                 tolerance=budget_tolerance,
+                enforce_budget=enforce_budget,
                 enforce_fidel_loanwords=enforce_fidel_loanwords,
+                maximum_attempts=maximum_reduction_attempts,
             )
 
         adapted.extend(produced)

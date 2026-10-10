@@ -124,7 +124,11 @@ class AlignedClip:
     available: float | None = None
     #: Seconds cut off the end, with a fade, because the line could not fit even at the
     #: tempo limit. Non-zero means the translation was longer than the time available.
+    #: Stays zero unless ``TIMING_TRIM_TO_FIT`` is on.
     trimmed: float = 0.0
+    #: Seconds this line runs past its available time. Non-zero means it will overlap the
+    #: next line; it is reported rather than cut away.
+    overrun: float = 0.0
 
     def __post_init__(self) -> None:
         if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
@@ -217,6 +221,9 @@ class AlignedClip:
             "speech_duration": self.speech_duration,
             "residual": self.residual,
             "fits": self.fits,
+            "available": self.available,
+            "trimmed": self.trimmed,
+            "overrun": self.overrun,
             "rendered_pause_before": self.rendered_pause_before,
             "rendered_pause_after": self.rendered_pause_after,
             "duration": self.duration,
@@ -480,25 +487,31 @@ def align_clip(
 
     notes: list[str] = []
     trimmed = 0.0
-    # Only a line with a neighbour is cut. A line considered alone - the last line of a
-    # film, or a clip aligned on its own - harms nobody by running past its own window,
-    # so it is stretched as far as the band allows and the overrun is reported instead.
-    # Cutting audio there would be mangling for no benefit, which this stage does not do.
-    if room is not None and speech_duration > limit + EXACT_FIT_TOLERANCE_SECONDS:
-        # Even at the tempo limit this line is too long for the room it has, so it is cut
-        # before the next line begins. Overlapping the next line is the one outcome worth
-        # cutting audio to avoid: two voices at once is unintelligible, while a clipped
-        # ending is merely abrupt and is reported here.
-        keep = int(round(limit * rate))
-        if keep > 0:
-            trimmed = speech_duration - keep / rate
-            stretched = _fade_out(stretched[:keep], rate)
-            speech_duration = keep / rate
+    overrun = 0.0
+    if speech_duration > limit + EXACT_FIT_TOLERANCE_SECONDS:
+        overrun = speech_duration - limit
+        if resolved.timing_trim_to_fit:
+            # Cutting is opt-in, because it is the one outcome that damages the
+            # performance: the listener hears a word clipped off the end. Two voices
+            # briefly at once is the lesser evil, so an over-long line is reported and
+            # left intact unless the run has asked for the guarantee.
+            keep = int(round(limit * rate))
+            if keep > 0:
+                trimmed = speech_duration - keep / rate
+                stretched = _fade_out(stretched[:keep], rate)
+                speech_duration = keep / rate
+                overrun = 0.0
+                notes.append(
+                    f"the line needed {required:.3f}x its own window but even the "
+                    f"{limit:.3f}s available to it (up to the next line) only allows "
+                    f"{maximum:g}x; the last {trimmed:.3f}s were cut with a fade so the "
+                    "next line is not spoken over - the Amharic is longer than its window"
+                )
+        else:
             notes.append(
-                f"the line needed {required:.3f}x its own window but even the "
-                f"{limit:.3f}s available to it (up to the next line) only allows "
-                f"{maximum:g}x; the last {trimmed:.3f}s were cut with a fade so the "
-                "next line is not spoken over - the Amharic is longer than its window"
+                f"the line is {overrun:.3f}s longer than the {limit:.3f}s it has before "
+                "the next line and it is left intact, because cutting a performance is "
+                "worse than a brief overlap; the Amharic is longer than its time"
             )
 
     residual = speech_duration - window
@@ -556,6 +569,7 @@ def align_clip(
         notes=tuple(notes),
         available=limit,
         trimmed=trimmed,
+        overrun=overrun,
     )
 
 

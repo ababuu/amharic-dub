@@ -117,11 +117,19 @@ DEFAULT_TRANSCRIPTION_COMPUTE_TYPE = "float16"
 
 #: Which translation backend :mod:`app.pipeline.translation` uses.
 #:
-#: ``"nllb"`` (the default) translates locally with Meta's NLLB-200. ``"openai"``
-#: talks to any OpenAI-compatible endpoint - which is what provides *adaptation*
-#: rather than translation: scene and character context, a syllable budget, the
+#: ``"openai"`` (the default) talks to any OpenAI-compatible endpoint - DeepSeek by
+#: default - and is what provides *adaptation* rather than translation: scene and
+#: character context, a syllable budget that a line can be sent back to meet, the
 #: borrowed-word policy, and per-line performance metadata.
-DEFAULT_TRANSLATION_BACKEND = "nllb"
+#:
+#: ``"nllb"`` translates locally with Meta's NLLB-200 and needs no key. It is kept
+#: because it is genuinely the stronger *translator* on measured Amharic - it beats every
+#: open instruction model on this direction - but it cannot be instructed, and that turns
+#: out to matter more for dubbing than translation quality does: NLLB cannot be told to
+#: be brief, to keep a borrowed word in Fidel, or to match a character. Measured on a real
+#: run it produced Amharic needing **1.66x** the time available, with no mechanism to
+#: shorten it, which forced the timing stage to cut 31 of 38 lines short.
+DEFAULT_TRANSLATION_BACKEND = "openai"
 
 #: NLLB-200 at 3.3B parameters.
 #:
@@ -138,6 +146,12 @@ DEFAULT_TRANSLATION_BACKEND = "nllb"
 #: anything else. Amharic (``amh_Ethi``) has real parallel data behind it in NLLB-200.
 #: The weights are CC-BY-NC-4.0.
 DEFAULT_TRANSLATION_MODEL = "facebook/nllb-200-3.3B"
+
+#: The model the instruction-following backend asks for by default. ``deepseek-flash`` is
+#: DeepSeek's current model name and is what the default base URL serves; a local
+#: OpenAI-compatible server needs whatever it serves instead, set through
+#: ``TRANSLATION_MODEL``.
+DEFAULT_TRANSLATION_OPENAI_MODEL = "deepseek-flash"
 
 #: Beam search width. ``1`` is greedy, which is deterministic - the same line always
 #: translates the same way, so two runs can be compared against one another. Raise it
@@ -176,6 +190,13 @@ DEFAULT_TRANSLATION_SHORTEN_PENALTY = 0.6
 #: ``app.pipeline.dialogue_context.DEFAULT_SYLLABLES_PER_SECOND`` holds the same prior
 #: for the adaptation prompt, and a test keeps the two in step.
 DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND = 4.0
+
+#: How many times a line may be sent back to be shortened, including the first attempt.
+#: More than one is needed: a single rewrite left every over-long line still over at
+#: roughly 1.6-1.8x its budget, because a model asked to fit a small window returns
+#: something *closer* rather than something inside it. Bounded, because an unbounded loop
+#: would eventually fit the window by losing the meaning.
+DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS = 3
 
 #: DeepSeek API endpoint. The official endpoint is OpenAI-compatible.
 DEFAULT_TRANSLATION_BASE_URL = "https://api.deepseek.com"
@@ -352,6 +373,20 @@ DEFAULT_TIMING_MAX_TEMPO = 1.25
 #: lines is usually short and worth using.
 DEFAULT_TIMING_MIN_LINE_GAP = 0.12
 
+#: Whether a line that will not fit its available time is cut short, with a fade, so that
+#: it never overlaps the next line.
+#:
+#: **Off by default, deliberately.** Cutting is the one thing that damages the
+#: performance: the listener hears a word clipped off the end, and on a real run where
+#: the text was too long it happened to 31 of 38 lines, which sounds broken rather than
+#: fast. The pipeline's answer to a line that runs long is to make the *text* fit, and
+#: that is settled at the adaptation stage - see
+#: :data:`DEFAULT_TRANSLATION_SHORTEN_PENALTY`. When the text fits, this never fires and
+#: the setting is irrelevant. When it does not, the run says so instead: a line that
+#: overruns is reported, and is heard as a brief overlap rather than as a missing word.
+#: Set it true to trade a clipped word for a guaranteed gap between lines.
+DEFAULT_TIMING_TRIM_TO_FIT = False
+
 #: Level of the dubbed dialogue in the final mix, in dB relative to the clips the
 #: TTS stage produced. Never a boost by default: the dialogue was generated at a
 #: consistent level, so raising it here would only invite clipping.
@@ -376,6 +411,24 @@ def load_env_file(path: Optional[Path] = None) -> None:
     env_path = Path(path) if path is not None else PROJECT_ROOT / ".env"
     if env_path.is_file():
         load_dotenv(env_path, override=False)
+
+
+def _translation_model_default() -> str:
+    """Return the model to use when ``TRANSLATION_MODEL`` is not set.
+
+    The two backends name completely different things: a local NLLB *checkpoint path* or
+    the model a *served* endpoint answers to. A single default would silently ask DeepSeek
+    for a model called ``facebook/nllb-200-3.3B`` - which fails - so the default follows
+    the configured backend.
+    """
+
+    backend = (
+        _read_env("TRANSLATION_BACKEND", DEFAULT_TRANSLATION_BACKEND)
+        or DEFAULT_TRANSLATION_BACKEND
+    ).strip().lower()
+    if backend == "nllb":
+        return DEFAULT_TRANSLATION_MODEL
+    return DEFAULT_TRANSLATION_OPENAI_MODEL
 
 
 def _read_env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -564,6 +617,9 @@ class Settings:
     translation_length_penalty: float = DEFAULT_TRANSLATION_LENGTH_PENALTY
     translation_shorten_penalty: float = DEFAULT_TRANSLATION_SHORTEN_PENALTY
     translation_syllables_per_second: float = DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND
+    translation_max_reduction_attempts: int = (
+        DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS
+    )
     translation_enforce_budget: bool = DEFAULT_TRANSLATION_ENFORCE_BUDGET
     translation_enforce_fidel_loanwords: bool = (
         DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS
@@ -611,6 +667,7 @@ class Settings:
     timing_min_tempo: float = DEFAULT_TIMING_MIN_TEMPO
     timing_max_tempo: float = DEFAULT_TIMING_MAX_TEMPO
     timing_min_line_gap: float = DEFAULT_TIMING_MIN_LINE_GAP
+    timing_trim_to_fit: bool = DEFAULT_TIMING_TRIM_TO_FIT
     #: Mix settings for :mod:`app.pipeline.mixing`: the dialogue level and how far
     #: the music and effects are ducked under it.
     mix_dialogue_gain_db: float = DEFAULT_MIX_DIALOGUE_GAIN_DB
@@ -659,8 +716,7 @@ class Settings:
                 or DEFAULT_TRANSLATION_BACKEND
             ).lower(),
             translation_model=(
-                _read_env("TRANSLATION_MODEL", DEFAULT_TRANSLATION_MODEL)
-                or DEFAULT_TRANSLATION_MODEL
+                _read_env("TRANSLATION_MODEL") or _translation_model_default()
             ),
             translation_base_url=(
                 _read_env("TRANSLATION_BASE_URL", DEFAULT_TRANSLATION_BASE_URL)
@@ -685,6 +741,10 @@ class Settings:
             translation_syllables_per_second=_read_float(
                 "TRANSLATION_SYLLABLES_PER_SECOND",
                 DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND,
+            ),
+            translation_max_reduction_attempts=_read_int(
+                "TRANSLATION_MAX_REDUCTION_ATTEMPTS",
+                DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS,
             ),
             translation_enforce_budget=_read_bool(
                 "TRANSLATION_ENFORCE_BUDGET", DEFAULT_TRANSLATION_ENFORCE_BUDGET
@@ -765,6 +825,9 @@ class Settings:
             timing_min_line_gap=_read_float(
                 "TIMING_MIN_LINE_GAP", DEFAULT_TIMING_MIN_LINE_GAP
             ),
+            timing_trim_to_fit=_read_bool(
+                "TIMING_TRIM_TO_FIT", DEFAULT_TIMING_TRIM_TO_FIT
+            ),
             mix_dialogue_gain_db=_read_signed_float(
                 "MIX_DIALOGUE_GAIN_DB", DEFAULT_MIX_DIALOGUE_GAIN_DB
             ),
@@ -840,6 +903,9 @@ class Settings:
             "translation_length_penalty": self.translation_length_penalty,
             "translation_shorten_penalty": self.translation_shorten_penalty,
             "translation_syllables_per_second": self.translation_syllables_per_second,
+            "translation_max_reduction_attempts": (
+                self.translation_max_reduction_attempts
+            ),
             "translation_enforce_budget": self.translation_enforce_budget,
             "translation_enforce_fidel_loanwords": (
                 self.translation_enforce_fidel_loanwords
@@ -875,6 +941,7 @@ class Settings:
             "timing_min_tempo": self.timing_min_tempo,
             "timing_max_tempo": self.timing_max_tempo,
             "timing_min_line_gap": self.timing_min_line_gap,
+            "timing_trim_to_fit": self.timing_trim_to_fit,
             "mix_dialogue_gain_db": self.mix_dialogue_gain_db,
             "mix_duck_db": self.mix_duck_db,
         }
@@ -917,6 +984,8 @@ __all__ = [
     "DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS",
     "DEFAULT_TRANSLATION_LENGTH_PENALTY",
     "DEFAULT_TRANSLATION_MODEL",
+    "DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS",
+    "DEFAULT_TRANSLATION_OPENAI_MODEL",
     "DEFAULT_TRANSLATION_SHORTEN_PENALTY",
     "DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND",
     "DEFAULT_TTS_CONTINUE_ON_FAILURE",
@@ -928,6 +997,7 @@ __all__ = [
     "DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
     "DEFAULT_TIMING_MAX_TEMPO",
     "DEFAULT_TIMING_MIN_LINE_GAP",
+    "DEFAULT_TIMING_TRIM_TO_FIT",
     "DEFAULT_TIMING_MIN_TEMPO",
     "DEFAULT_VOICE_PROFILE_DIR",
     "DEFAULT_VOICE_REFERENCE_MAX_DURATION",

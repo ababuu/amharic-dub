@@ -636,24 +636,61 @@ def test_a_line_may_use_the_silence_after_it(tmp_path: Path) -> None:
     assert first.trimmed == 0.0
 
 
-def test_a_line_still_too_long_is_cut_rather_than_spoken_over(
+def test_a_line_still_too_long_is_cut_only_when_that_is_asked_for(
     tmp_path: Path,
 ) -> None:
-    """Two voices at once is unintelligible, so a cut is the lesser evil - and reported."""
+    """Cutting damages the performance, so it is opt-in and off by default.
+
+    Two voices briefly at once is the lesser evil: a listener notices a word clipped off
+    the end immediately, and on a real run where the text was too long this fired on 31 of
+    38 lines, which sounds broken rather than fast.
+    """
 
     # 4.0s of speech in a 0.8s window with the next line only 0.4s away: even the tempo
-    # limit cannot fit it, so the tail is faded out short of the next line.
+    # limit cannot fit it.
     clips = _pair(tmp_path, first_speech=4.0, first_window=0.8, gap=0.4)
 
+    default = align_dialogue(
+        clips, output_dir=tmp_path / "d", settings=_settings(tmp_path)
+    )
+    assert default[0].trimmed == 0.0
+    assert default[0].overrun > 0
+    assert any("left intact" in note for note in default[0].notes)
+
+    cut = align_dialogue(
+        clips,
+        output_dir=tmp_path / "w",
+        settings=_settings(tmp_path, timing_trim_to_fit=True),
+    )
+    assert cut[0].trimmed > 0
+    assert any("not spoken over" in note for note in cut[0].notes)
+    # The guarantee, when it is asked for.
+    assert cut[0].end <= cut[1].start + 1e-6
+
+
+def test_lines_never_overlap_when_trimming_is_asked_for(tmp_path: Path) -> None:
+    """The property the deadline gives: no two dubbed lines sound at once."""
+
+    clips = [
+        _clip(
+            tmp_path,
+            index=i,
+            start=5.0 + i * 1.1,
+            end=5.8 + i * 1.1,
+            audio=_clip_file(tmp_path, speech=1.4, name=f"c{i}"),
+            speech=1.4,
+        )
+        for i in range(6)
+    ]
+
     aligned = align_dialogue(
-        clips, output_dir=tmp_path / "w", settings=_settings(tmp_path)
+        clips,
+        output_dir=tmp_path / "w",
+        settings=_settings(tmp_path, timing_trim_to_fit=True),
     )
 
-    first = aligned[0]
-    assert first.trimmed > 0
-    assert any("not spoken over" in note for note in first.notes)
-    # The guarantee this whole change exists for.
-    assert first.end <= aligned[1].start + 1e-6
+    for earlier, later in zip(aligned, aligned[1:]):
+        assert earlier.end <= later.start + 1e-6
 
 
 def test_nothing_is_cut_when_there_is_no_next_line(tmp_path: Path) -> None:
@@ -673,24 +710,3 @@ def test_nothing_is_cut_when_there_is_no_next_line(tmp_path: Path) -> None:
     assert aligned.available == pytest.approx(0.8)
 
 
-def test_lines_never_overlap_across_a_whole_dialogue(tmp_path: Path) -> None:
-    """The property the change exists for: no two dubbed lines sound at once."""
-
-    clips = [
-        _clip(
-            tmp_path,
-            index=i,
-            start=5.0 + i * 1.1,
-            end=5.8 + i * 1.1,
-            audio=_clip_file(tmp_path, speech=1.4, name=f"c{i}"),
-            speech=1.4,
-        )
-        for i in range(6)
-    ]
-
-    aligned = align_dialogue(
-        clips, output_dir=tmp_path / "w", settings=_settings(tmp_path)
-    )
-
-    for earlier, later in zip(aligned, aligned[1:]):
-        assert earlier.end <= later.start + 1e-6

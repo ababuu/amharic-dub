@@ -26,6 +26,7 @@ from app.config import (
     DEFAULT_TRANSLATION_BASE_URL,
     DEFAULT_TRANSLATION_BATCH_SIZE,
     DEFAULT_TRANSLATION_MODEL,
+    DEFAULT_TRANSLATION_OPENAI_MODEL,
     DEFAULT_TTS_MIN_LINE_SECONDS,
     DEFAULT_TTS_MAX_PAUSE_SECONDS,
     DEFAULT_TTS_MODEL,
@@ -119,23 +120,25 @@ def test_missing_credentials_do_not_break_construction(_clean_env: None) -> None
     assert settings.huggingface_token is None
     assert settings.has_deepseek_credentials is False
     assert settings.has_huggingface_credentials is False
-    # The default backend is NLLB, which reads no credential, so only the token the
-    # gated diarization pipeline needs is reported.
-    assert settings.translation_backend == "nllb"
-    assert settings.missing_credentials() == ["HUGGINGFACE_TOKEN"]
-
-
-def test_missing_credentials_includes_the_key_the_backend_reads(
-    monkeypatch: pytest.MonkeyPatch, _clean_env: None
-) -> None:
-    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
-
-    settings = Settings.from_env()
-
+    # The default backend is an instruction-following endpoint, which needs a key, so both
+    # credentials are reported. Under TRANSLATION_BACKEND=nllb only the token is.
+    assert settings.translation_backend == "openai"
     assert settings.missing_credentials() == [
         "DEEPSEEK_API_KEY",
         "HUGGINGFACE_TOKEN",
     ]
+
+
+def test_missing_credentials_under_the_local_backend(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    """A local translator needs no key, so reporting one would be a false blocker."""
+
+    monkeypatch.setenv("TRANSLATION_BACKEND", "nllb")
+
+    settings = Settings.from_env()
+
+    assert settings.missing_credentials() == ["HUGGINGFACE_TOKEN"]
 
 
 def test_environment_variables_override_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -256,7 +259,10 @@ def test_translation_settings_are_configurable(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:
     defaults = Settings.from_env()
-    assert defaults.translation_model == DEFAULT_TRANSLATION_MODEL
+    # The default follows the configured backend: a served endpoint is asked for a served
+    # model name, not for a local checkpoint path.
+    assert defaults.translation_backend == "openai"
+    assert defaults.translation_model == DEFAULT_TRANSLATION_OPENAI_MODEL
     assert defaults.translation_base_url == DEFAULT_TRANSLATION_BASE_URL
     assert defaults.translation_batch_size == DEFAULT_TRANSLATION_BATCH_SIZE
     assert defaults.translation_disable_thinking is True
