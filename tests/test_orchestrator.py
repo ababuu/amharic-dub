@@ -46,12 +46,11 @@ def _settings(root: Path, **overrides: object) -> Settings:
         "output_dir": root / "out",
         "model_cache_dir": root / "cache",
         "voice_profile_dir": root / "voices",
-        "seed_vc_repo_path": root / "seed-vc",
         "dialogue_bible_path": root / "work" / "dialogue_bible.json",
         # These tests exercise the per-character path, which needs voice profiles,
         # so they pin the engine that uses them rather than inheriting the default.
-        "tts_engine": "chatterbox",
-        "tts_model": "gabar-tech/chatterbox-amharic",
+        "tts_engine": "omnivoice",
+        "omnivoice_model": "k2-fsa/OmniVoice",
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]
@@ -97,15 +96,15 @@ def _clip(root: Path, index: int, dialogue: AdaptedDialogue) -> TtsClip:
         dialogue=dialogue,
         performance=PerformanceControls.from_dialogue(dialogue, seed=index),
         audio_path=root / "tts" / "clips" / f"{index}.wav",
-        take_path=root / "tts" / "chatterbox" / f"{index}.wav",
-        performance_reference_path=root / "tts" / "performance" / f"{index}.wav",
+        take_path=root / "tts" / "takes" / f"{index}.wav",
+        performance_reference_path=None,
         voice_reference_path=root / "voices" / SPEAKER / "reference.wav",
         sample_rate=24_000,
         speech_duration=2.5,
         rendered_pause_before=0.1,
         rendered_pause_after=0.2,
-        performance_engine="chatterbox-amharic",
-        style_engine="seed-vc-v2",
+        performance_engine="omnivoice",
+        style_engine="none",
     )
 
 
@@ -488,10 +487,8 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert payload["coverage"]["lines"] == len(result.dialogue)
     assert payload["coverage"]["representative"] is False
     assert "long_line" in payload["coverage"]["missing"]
-    # Seed-VC is a checkout, not a pinned dependency, so a run records what it used.
-    assert payload["provenance"]["seed_vc_convert_style"] is False
-    assert payload["provenance"]["seed_vc_revision"] is None
-    assert payload["provenance"]["seed_vc_diffusion_steps"] == 30
+    # Which engine spoke the dub travels with it.
+    assert payload["provenance"]["tts_engine"] == "omnivoice"
     # Which model adapted the dialogue travels with the dub, because the terminal that
     # printed it does not survive the Pod.
     assert payload["provenance"]["translation_backend"] == "openai"

@@ -15,7 +15,6 @@ GPU session is started:
 
 * the credentials the pipeline needs, including a warning when a value is still
   the placeholder copied from ``.env.example``
-* the Seed-VC checkout and the ``configs/v2/vc_wrapper.yaml`` the TTS stage runs
 * every third-party module the stages import at run time
 * every stage module of this project, so a broken import in the checkout is caught
   here rather than halfway through a paid run
@@ -60,19 +59,15 @@ RUNTIME_MODULES: dict[str, str] = {
     "pyannote.audio": "diarization",
     "torchcodec": "pyannote.audio",
     "bandit_infer": "separation",
-    "librosa": "audio analysis",
     "yaml": "configuration",
-    "pydub": "audio editing",
-    "einops": "audio modelling",
     "scipy": "audio analysis",
-    "tqdm": "progress reporting",
     "transformers": "model loading",
     "huggingface_hub": "model downloads",
 }
 
 #: Packages only one translation backend or speech engine needs, keyed by the setting
 #: that selects it. A configuration is checked against its own list and nothing else:
-#: demanding a working Chatterbox for an OmniVoice run would report a failure over
+#: demanding a working MMS install for an OmniVoice run would report a failure over
 #: something the run never imports, which sends someone chasing a red mark that does not
 #: affect them. ``openai`` is required by the default backend, so it is listed here rather
 #: than above; running ``TRANSLATION_BACKEND=nllb`` correctly stops requiring it.
@@ -87,18 +82,6 @@ BACKEND_MODULES: dict[str, tuple[str, dict[str, str]]] = {
         {"omnivoice": "OmniVoice synthesis", "accelerate": "OmniVoice device placement"},
     ),
     "mms": ("tts_engine", {"uroman": "MMS-TTS romanisation"}),
-    "chatterbox": (
-        "tts_engine",
-        {
-            "chatterbox": "Chatterbox synthesis",
-            "peft": "Chatterbox Amharic adapter",
-            "safetensors": "Chatterbox Amharic adapter",
-            "hydra": "Seed-VC",
-            "omegaconf": "Seed-VC",
-            "munch": "Seed-VC",
-            "matplotlib": "Seed-VC (BigVGAN)",
-        },
-    ),
 }
 
 
@@ -135,9 +118,6 @@ PROJECT_MODULES: tuple[str, ...] = (
     "app.pipeline.video",
     "app.pipeline.voice_profiles",
 )
-
-#: The Seed-VC file the TTS stage instantiates its converter from.
-SEED_VC_CONFIG = Path("configs") / "v2" / "vc_wrapper.yaml"
 
 
 def format_gib(num_bytes: float) -> str:
@@ -327,38 +307,6 @@ def check_credentials() -> bool:
     return healthy
 
 
-def check_seed_vc() -> bool:
-    """Report whether the Seed-VC checkout the TTS stage runs is usable.
-
-    Seed-VC converts a synthesized take into a target voice, which only the
-    prompt-and-convert engine does. Under a single-voice engine there is no
-    conversion step, so a missing checkout is reported as unused rather than as a
-    failure - the run does not touch it.
-    """
-
-    from app.config import get_settings
-
-    settings = get_settings()
-    if settings.tts_engine != "chatterbox":
-        print(
-            f"Seed-VC checkout: not used by TTS_ENGINE={settings.tts_engine}  [SKIP]"
-        )
-        return True
-    repo = Path(settings.seed_vc_repo_path)
-    if not repo.is_dir():
-        print(f"Seed-VC checkout: {repo}  [FAIL] (not a directory)")
-        print("        - git clone https://github.com/Plachtaa/seed-vc " + str(repo))
-        return False
-
-    config = repo / SEED_VC_CONFIG
-    if not config.is_file():
-        print(f"Seed-VC checkout: {repo}  [FAIL] (no {SEED_VC_CONFIG})")
-        return False
-
-    print(f"Seed-VC checkout: {repo}  [OK]")
-    return True
-
-
 def check_runtime_imports() -> bool:
     """Import every third-party module this configuration needs, and report the failures.
 
@@ -422,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--full",
         action="store_true",
-        help="also check credentials, the Seed-VC checkout and every runtime import",
+        help="also check credentials and every runtime import",
     )
     args = parser.parse_args(argv)
 
@@ -439,7 +387,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.full:
         print(SEPARATOR)
         checks["Credentials"] = check_credentials()
-        checks["Seed-VC"] = check_seed_vc()
         checks["Runtime imports"] = check_runtime_imports()
 
     print(SEPARATOR)

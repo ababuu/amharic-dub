@@ -17,8 +17,7 @@ stage actually produced, so the pipeline can be validated on the A40::
 
 Output goes to ``data/output/tts-test/``: ``takes/`` holds the raw engine output
 per line, ``clips/`` the final clips to listen to (the take with the line's
-pauses), plus ``performance/`` (the original-performance references cut from the
-speech stem) and ``stages/`` (the extracted mix and the separated stems).
+pauses), and ``stages/`` (the extracted mix and the separated stems).
 
 Notes
 -----
@@ -119,9 +118,6 @@ def report_settings(settings: Settings) -> None:
             f"{settings.omnivoice_steps} @ guidance "
             f"{settings.omnivoice_guidance_scale:g}",
         )
-    elif settings.tts_engine == "chatterbox":
-        _info("chatterbox model", settings.chatterbox_model)
-        _info("seed-vc checkout", settings.seed_vc_repo_path)
     else:
         _info("tts model", settings.tts_model)
 
@@ -222,8 +218,6 @@ def report_profiles(profiles: dict[str, VoiceProfile]) -> None:
 def _engine_label(settings: Settings) -> str:
     """Return the synthesis chain a run with these settings uses, for reporting."""
 
-    if settings.tts_engine == "chatterbox":
-        return "Chatterbox Amharic -> Seed-VC V2"
     if settings.tts_engine == "omnivoice":
         return f"OmniVoice cloned voice ({settings.omnivoice_model})"
     return f"{settings.tts_engine} ({settings.tts_model})"
@@ -249,10 +243,9 @@ def report_clips(
         )
         print(f"        amharic  {_shorten(clip.amharic)}", flush=True)
         print(f"        source   {_shorten(clip.dialogue.source_text)}", flush=True)
-        # Both paths write a raw take and then a clip with the pauses rendered, so
-        # the two files are reported the same way and the engines that produced them
-        # are named: under a single-voice engine there is no conversion, and the
-        # take is the clip's only input.
+        # The engine writes a raw take, and the clip is that take with the line's
+        # pauses rendered into it, so both are reported: the take is what the model
+        # produced, the clip is what the rest of the pipeline sees.
         _info(f"  take  [{clip.performance_engine}]", f"{clip.take_path}")
         _info("", _audio_summary(clip.take_path))
         _info(f"  clip  [{clip.style_engine}]", f"{clip.audio_path}")
@@ -266,17 +259,9 @@ def report_clips(
         _info("  sample rate", f"{clip.sample_rate} Hz")
         _info(
             "  performance",
-            f"exaggeration={controls.exaggeration:.3f} "
-            f"cfg_weight={controls.cfg_weight:.3f} "
-            f"temperature={controls.temperature:.3f} seed={controls.seed}",
-        )
-        _info(
-            "  mapped from",
             f"emotion={controls.emotion!r} intensity={controls.intensity:.2f} "
-            f"delivery={controls.delivery!r}",
+            f"delivery={controls.delivery!r} seed={controls.seed}",
         )
-        if clip.performance_reference_path is not None:
-            _info("  performance prompt", f"{clip.performance_reference_path}")
         if clip.voice_reference_path is not None:
             _info("  identity reference", f"{clip.voice_reference_path}")
 

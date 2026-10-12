@@ -58,21 +58,10 @@ Environment variables
 ``VOICE_REFERENCE_MIN_DURATION`` / ``..._TARGET_DURATION`` / ``..._MAX_DURATION``
                       Preferred length of a voice-cloning reference, in seconds.
 ``TTS_MODEL``         Amharic speech adapter used by the TTS stage.
-``SEED_VC_REPO_PATH`` Seed-VC checkout used for the identity-conversion step.
-``SEED_VC_DIFFUSION_STEPS``
-                      Diffusion steps of the Seed-VC V2 converter.
-``SEED_VC_CONVERT_STYLE``
-                      Whether Seed-VC V2 converts the *reference's* accent and
-                      style as well as its timbre. Off by default: see
-                      :mod:`app.pipeline.tts` for why that is the correct mode
-                      for a voice-matched dub.
 ``DIARIZATION_MIN_SPEAKERS`` / ``DIARIZATION_MAX_SPEAKERS``
                       Optional bounds on how many speakers diarization may find.
                       A cast list turns these into the strongest single guard
                       against a character splitting into several clusters.
-``TTS_PERFORMANCE_REFERENCE_MIN_DURATION`` / ``..._MAX_DURATION``
-                      Length of the original-performance prompt handed to
-                      Chatterbox, in seconds.
 ``TTS_MAX_PAUSE_SECONDS``
                       Longest pause rendered around a synthesized line.
 ``TTS_MIN_LINE_SECONDS``
@@ -310,25 +299,15 @@ DEFAULT_VOICE_REFERENCE_MAX_DURATION = 15.0
 #: Cloning from each character's own audio is what keeps one voice per character for a
 #: whole film, and the rate is what lets a line be asked for at the length its window
 #: allows instead of being stretched into it.
-#: ``"chatterbox"`` is the Chatterbox Multilingual v3 + Amharic LoRA pair, which does
-#: per-character voices by prompting with the original actor's audio and converting the
-#: timbre afterwards. It has the strongest *published* Amharic numbers of the three
-#: (a held-out character error rate of 0.095 and speaker similarity of 0.860), so it is
-#: kept as the measured alternative to OmniVoice's unmeasured one.
 #: ``"mms"`` is Meta's MMS-TTS Amharic: a VITS model trained on Amharic alone. It is a
 #: **single-speaker** model - one voice for the whole film, with no cloning and no
 #: per-character identity - and it needs its text romanised first (see the module).
 DEFAULT_TTS_ENGINE = "omnivoice"
 
 #: The Amharic TTS checkpoint. Which model this id should name depends on
-#: ``TTS_ENGINE``: an MMS-TTS checkpoint for ``mms``. The ``chatterbox`` and
-#: ``omnivoice`` engines name their models through their own settings.
+#: ``TTS_ENGINE``: an MMS-TTS checkpoint for ``mms``. The ``omnivoice`` engine names
+#: its model through its own setting.
 DEFAULT_TTS_MODEL = "facebook/mms-tts-amh"
-
-#: The Chatterbox Amharic adapter, used when ``TTS_ENGINE=chatterbox``. It is a LoRA
-#: delta plus a Fidel tokenizer applied on top of Chatterbox Multilingual v3 at
-#: runtime, so only the adapter is named here.
-DEFAULT_CHATTERBOX_MODEL = "gabar-tech/chatterbox-amharic"
 
 #: The OmniVoice checkpoint used when ``TTS_ENGINE=omnivoice``.
 #:
@@ -359,7 +338,7 @@ DEFAULT_OMNIVOICE_TORCH_DTYPE = "float16"
 
 #: Sample rate MMS-TTS produces, in Hz. VITS models are trained per language and this
 #: one is trained at 16 kHz, so the pipeline resamples its output rather than
-#: pretending it is the 24 kHz Chatterbox produces.
+#: pretending it is at a rate the model never produced.
 DEFAULT_MMS_SAMPLE_RATE = 16_000
 
 #: Fixed seed for the MMS duration predictor. VITS samples its rhythm, so the same
@@ -373,31 +352,6 @@ DEFAULT_MMS_SEED = 0
 #: is still fitted to its own window by ``timing.py``.
 DEFAULT_MMS_SPEAKING_RATE = 1.0
 
-#: Name of the Seed-VC checkout inside ``MODEL_CACHE_DIR``. Seed-VC is not
-#: published as a package, so the identity-conversion step of
-#: :mod:`app.pipeline.tts` runs it from a checkout of its repository.
-DEFAULT_SEED_VC_REPO_NAME = "seed-vc"
-
-#: Seed-VC V2 diffusion steps. The V2 inference script's own default is 30;
-#: fewer steps trade quality for speed.
-DEFAULT_SEED_VC_DIFFUSION_STEPS = 30
-
-#: Whether Seed-VC V2 converts the *reference's* accent and style along with its
-#: timbre. Left **off**, which is the only mode that preserves the performance of
-#: the take: Seed-VC V2's style branch conditions its autoregressive stage on the
-#: reference's acoustic tokens and content indices, so switching it on speaks the
-#: source content in the *reference's* style. With a character reference taken
-#: from the original actor's English audio, that re-imposes an English accent on
-#: the Amharic and discards the performance the Chatterbox prompt carried over.
-DEFAULT_SEED_VC_CONVERT_STYLE = False
-
-#: Preferred length of the original-performance prompt handed to Chatterbox, in
-#: seconds. The Amharic adapter clones from roughly ten seconds of audio, so a
-#: short line is padded with its own surrounding dialogue and a long monologue
-#: is trimmed, both around the line that is being synthesized.
-DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION = 6.0
-DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION = 12.0
-
 #: Longest pause rendered before and after a synthesized line, in seconds. The
 #: dialogue model estimates the pauses of a scene and normally stays below 1.5
 #: seconds; this bound keeps a wildly wrong estimate from becoming a hole in the
@@ -408,8 +362,9 @@ DEFAULT_TTS_MAX_PAUSE_SECONDS = 2.0
 #: is a fragment - a breath, a click, a sliver of a mis-diarized turn - rather than a
 #: spoken line: there is no room for a word in the time it occupied, any Amharic
 #: written for it is unintelligible, and the speech engine can fail on it outright.
-#: Chatterbox does, with an empty mel spectrogram that trips a convolution inside
-#: its vocoder, so such a line must be skipped and reported rather than attempted.
+#: A vocoder can be driven to an empty mel spectrogram by input that short, which
+#: trips a convolution inside it, so such a line must be skipped and reported rather
+#: than attempted.
 DEFAULT_TTS_MIN_LINE_SECONDS = 0.30
 
 #: Whether a line an engine *fails* on is recorded and skipped instead of ending the
@@ -823,12 +778,10 @@ class Settings:
     voice_reference_max_duration: float = DEFAULT_VOICE_REFERENCE_MAX_DURATION
     #: Persistent character/consistency state handed to dialogue adaptation.
     dialogue_bible_path: Path = DEFAULT_DIALOGUE_BIBLE_PATH
-    #: TTS settings for :mod:`app.pipeline.tts`: the Amharic speech adapter, the
-    #: Seed-VC checkout that converts identity, and the performance-prompt and
+    #: TTS settings for :mod:`app.pipeline.tts`: the Amharic speech adapter and the
     #: pause bounds of one synthesized line.
     tts_model: str = DEFAULT_TTS_MODEL
     tts_engine: str = DEFAULT_TTS_ENGINE
-    chatterbox_model: str = DEFAULT_CHATTERBOX_MODEL
     omnivoice_model: str = DEFAULT_OMNIVOICE_MODEL
     omnivoice_steps: int = DEFAULT_OMNIVOICE_STEPS
     omnivoice_guidance_scale: float = DEFAULT_OMNIVOICE_GUIDANCE_SCALE
@@ -836,15 +789,6 @@ class Settings:
     mms_sample_rate: int = DEFAULT_MMS_SAMPLE_RATE
     mms_seed: int = DEFAULT_MMS_SEED
     mms_speaking_rate: float = DEFAULT_MMS_SPEAKING_RATE
-    seed_vc_repo_path: Path = DEFAULT_MODEL_CACHE_DIR / DEFAULT_SEED_VC_REPO_NAME
-    seed_vc_diffusion_steps: int = DEFAULT_SEED_VC_DIFFUSION_STEPS
-    seed_vc_convert_style: bool = DEFAULT_SEED_VC_CONVERT_STYLE
-    tts_performance_reference_min_duration: float = (
-        DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION
-    )
-    tts_performance_reference_max_duration: float = (
-        DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION
-    )
     tts_max_pause_seconds: float = DEFAULT_TTS_MAX_PAUSE_SECONDS
     #: Shortest original window that can be dubbed at all; shorter lines are skipped
     #: and reported instead of being sent to the engine.
@@ -973,10 +917,6 @@ class Settings:
             tts_engine=(
                 _read_env("TTS_ENGINE", DEFAULT_TTS_ENGINE) or DEFAULT_TTS_ENGINE
             ).lower(),
-            chatterbox_model=(
-                _read_env("CHATTERBOX_MODEL", DEFAULT_CHATTERBOX_MODEL)
-                or DEFAULT_CHATTERBOX_MODEL
-            ),
             omnivoice_model=(
                 _read_env("OMNIVOICE_MODEL", DEFAULT_OMNIVOICE_MODEL)
                 or DEFAULT_OMNIVOICE_MODEL
@@ -993,23 +933,6 @@ class Settings:
             mms_seed=_read_nonnegative_int("MMS_SEED", DEFAULT_MMS_SEED),
             mms_speaking_rate=_read_float(
                 "MMS_SPEAKING_RATE", DEFAULT_MMS_SPEAKING_RATE
-            ),
-            seed_vc_repo_path=_read_path(
-                "SEED_VC_REPO_PATH", model_cache_dir / DEFAULT_SEED_VC_REPO_NAME
-            ),
-            seed_vc_diffusion_steps=_read_int(
-                "SEED_VC_DIFFUSION_STEPS", DEFAULT_SEED_VC_DIFFUSION_STEPS
-            ),
-            seed_vc_convert_style=_read_bool(
-                "SEED_VC_CONVERT_STYLE", DEFAULT_SEED_VC_CONVERT_STYLE
-            ),
-            tts_performance_reference_min_duration=_read_float(
-                "TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
-                DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION,
-            ),
-            tts_performance_reference_max_duration=_read_float(
-                "TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
-                DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION,
             ),
             tts_max_pause_seconds=_read_float(
                 "TTS_MAX_PAUSE_SECONDS", DEFAULT_TTS_MAX_PAUSE_SECONDS
@@ -1163,7 +1086,6 @@ class Settings:
             "dialogue_bible_path": str(self.dialogue_bible_path),
             "tts_model": self.tts_model,
             "tts_engine": self.tts_engine,
-            "chatterbox_model": self.chatterbox_model,
             "omnivoice_model": self.omnivoice_model,
             "omnivoice_steps": self.omnivoice_steps,
             "omnivoice_guidance_scale": self.omnivoice_guidance_scale,
@@ -1171,15 +1093,6 @@ class Settings:
             "mms_sample_rate": self.mms_sample_rate,
             "mms_seed": self.mms_seed,
             "mms_speaking_rate": self.mms_speaking_rate,
-            "seed_vc_repo_path": str(self.seed_vc_repo_path),
-            "seed_vc_diffusion_steps": self.seed_vc_diffusion_steps,
-            "seed_vc_convert_style": self.seed_vc_convert_style,
-            "tts_performance_reference_min_duration": (
-                self.tts_performance_reference_min_duration
-            ),
-            "tts_performance_reference_max_duration": (
-                self.tts_performance_reference_max_duration
-            ),
             "tts_max_pause_seconds": self.tts_max_pause_seconds,
             "tts_min_line_seconds": self.tts_min_line_seconds,
             "tts_continue_on_failure": self.tts_continue_on_failure,
@@ -1202,7 +1115,6 @@ def get_settings() -> Settings:
 
 
 __all__ = [
-    "DEFAULT_CHATTERBOX_MODEL",
     "DEFAULT_OMNIVOICE_GUIDANCE_SCALE",
     "DEFAULT_OMNIVOICE_MODEL",
     "DEFAULT_OMNIVOICE_STEPS",
@@ -1217,9 +1129,6 @@ __all__ = [
     "DEFAULT_MMS_SAMPLE_RATE",
     "DEFAULT_MMS_SEED",
     "DEFAULT_MMS_SPEAKING_RATE",
-    "DEFAULT_SEED_VC_CONVERT_STYLE",
-    "DEFAULT_SEED_VC_DIFFUSION_STEPS",
-    "DEFAULT_SEED_VC_REPO_NAME",
     "DEFAULT_TRANSCRIPTION_COMPUTE_TYPE",
     "DEFAULT_QC_PRONUNCIATION",
     "DEFAULT_TRANSCRIPTION_MODEL",
@@ -1251,8 +1160,6 @@ __all__ = [
     "DEFAULT_TTS_MIN_LINE_SECONDS",
     "DEFAULT_TTS_REQUEST_RATE",
     "DEFAULT_TTS_MODEL",
-    "DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION",
-    "DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION",
     "DEFAULT_TIMING_MAX_OVERLAP_SECONDS",
     "DEFAULT_TIMING_MAX_TEMPO",
     "DEFAULT_TIMING_MIN_LINE_GAP",

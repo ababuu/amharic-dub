@@ -44,8 +44,7 @@ flowchart LR
 | Diarization          | pyannote Community-1                    |
 | Transcription        | faster-whisper large-v3                 |
 | Translation/adaptation | **NLLB-200 3.3B** (default, local) or any OpenAI-compatible endpoint (opt-in) |
-| Speech synthesis     | **OmniVoice** (`k2-fsa/OmniVoice`, default, cloned voice per character) - or Chatterbox + the Amharic adapter, or MMS-TTS Amharic (single voice) |
-| Voice conversion     | Seed-VC V2 (timbre-only) - only used by the Chatterbox path |
+| Speech synthesis     | **OmniVoice** (`k2-fsa/OmniVoice`, default, cloned voice per character) or MMS-TTS Amharic (single voice) |
 | Quality control      | `qc.py` (model-free; pronunciation measurement is injected) |
 
 ## Choosing a translation backend
@@ -166,43 +165,36 @@ against the `qc` block, rather than as a model swap that can be assumed to work.
 
 ## Choosing a speech engine
 
-`TTS_ENGINE` selects between three genuinely different capabilities:
+`TTS_ENGINE` selects between two genuinely different capabilities:
 
-| | `omnivoice` (default) | `chatterbox` | `mms` |
-| --- | --- | --- | --- |
-| Voice(s) | **one per character, cloned** | one per character, converted | one for the whole film |
-| Where the voice comes from | the character's own reference audio | the actor's line, converted to the character | nowhere - it has one |
-| Per-line length control | **yes** (`speed`) | no | film-wide only (`MMS_SPEAKING_RATE`) |
-| Output rate | 24 kHz | 24 kHz | 16 kHz |
-| Voice profiles needed | yes | yes | no |
-| Deterministic | **yes** (temperatures pinned) | seeded sampling | seeded duration predictor |
-| Amharic quality evidence | **none published** | CER 0.095, UTMOS 2.711, speaker sim 0.860 (held-out, on `gabar-tech/chatterbox-amharic`) | none published |
+| | `omnivoice` (default) | `mms` |
+| --- | --- | --- |
+| Voice(s) | **one per character, cloned** | one for the whole film |
+| Where the voice comes from | the character's own reference audio | nowhere - it has one |
+| Per-line length control | **yes** (`speed`) | film-wide only (`MMS_SPEAKING_RATE`) |
+| Output rate | 24 kHz | 16 kHz |
+| Voice profiles needed | yes | no |
+| Deterministic | **yes** (temperatures pinned) | seeded duration predictor |
+| Amharic quality evidence | **none published** | none published |
 
-**Why OmniVoice is the default, and what that costs.** It is the only option that
-clones a voice *and* accepts a per-line length, which matters because the two worst
+**Why OmniVoice is the default, and what that costs.** It is the only supported option
+that clones a voice *and* accepts a per-line length, which matters because the two worst
 defects in the last real run were unfitted lines (27 of 38) and a single flat voice.
 OmniVoice is a genuine k2-fsa release - paper, package, 600+ languages, Amharic among
 them - but its Amharic rests on about **12.8 hours** of its training data and has
 **never been evaluated**. So this is a bet on architecture and controllability, not on
 measured Amharic quality, and it is stated that way rather than dressed up.
 
-**The measured alternative is one variable away.** `gabar-tech/chatterbox-amharic` is
-the only Amharic TTS with published evaluation, and it is strong: character error rate
-**0.095** on held-out speaker-disjoint clips, speaker similarity **0.860** - the highest
-of any Amharic model found - for a LoRA adapter plus a Fidel tokenizer on Chatterbox v3.
-Its own authors call it "intelligible Amharic, not yet fully natural". Note that stock
-Chatterbox Multilingual v3 does **not** support Amharic at all (its 23 languages include
-Swahili, not Amharic; its tokenizer maps every Ge'ez character to `[UNK]`), so the
-adapter is doing all of the work.
-
-To compare them on your own film, change one variable:
-
-```bash
-TTS_ENGINE=chatterbox python -m app.pipeline.orchestrator data/input/test.mp4 --out runs/ab-chatterbox
-# and, for the unmeasured-but-cheaper Amharic-only OmniVoice fine-tune:
-TTS_ENGINE=omnivoice OMNIVOICE_MODEL=african-low-resource/omnivoice-amharic \
-  python -m app.pipeline.orchestrator data/input/test.mp4 --out runs/ab-finetune
-```
+**A third engine was removed, and why.** `TTS_ENGINE=chatterbox` used to speak through
+`gabar-tech/chatterbox-amharic` and then convert the take to the character's voice with
+Seed-VC V2. It was the only Amharic TTS with published evaluation and its numbers were
+strong (character error rate **0.095** on held-out speaker-disjoint clips, speaker
+similarity **0.860**), but it was unused, and the pair cost the install a `--no-deps`
+dance around a conflicting `torch` pin plus a separate GPL checkout. Keeping a second
+voice path that no run exercised was worse than dropping it: the code, the settings, the
+dependency and its tests are gone. If a future evaluation shows OmniVoice's unmeasured
+Amharic is not good enough, that adapter is the obvious thing to bring back - and the
+`git` history still has it.
 
 `african-low-resource/omnivoice-amharic` (identical weights to `Lab-et/omnivoice-amharic`)
 is trained on far more Amharic - ~331 h against the base model's 12.8 h - but its model
@@ -297,7 +289,7 @@ amharic-dub/
       nllb.py                 # local NLLB-200 translation (default backend) (implemented)
       dialogue_context.py     # scenes, character bible, syllable budget (implemented)
       amharic_text.py         # Ethiopic syllables + homophone folding (implemented)
-      tts.py                  # Amharic speech synthesis (MMS-TTS or Chatterbox + Seed-VC) (implemented)
+      tts.py                  # Amharic speech synthesis (OmniVoice or MMS-TTS) (implemented)
       timing.py               # pitch-preserving fit to the original timings (implemented)
       mixing.py               # dialogue over ducked music + effects (implemented)
       qc.py                   # measures each run: fit, rate, crosstalk (implemented)
@@ -311,14 +303,14 @@ amharic-dub/
   tests/                      # pytest suite
   scripts/
     check_environment.py      # runtime health check; --full is the session pre-flight
-    install_dependencies.sh   # worker install, including the Chatterbox --no-deps step
+    install_dependencies.sh   # worker install + import smoke check
     validate_models.py        # loads each model on its own and reports the result
     test_gpu.py               # end-to-end run of the implemented stages
   data/
     input/                    # source videos (not committed)
     working/                  # intermediate artifacts (not committed), including
                               #   voices/<SPEAKER_ID>/{reference.wav,voice_clone.pt,profile.json}
-                              #   tts/{performance,chatterbox,converted,clips}/*.wav
+                              #   tts/{takes,clips}/*.wav
     output/                   # final dubbed videos (not committed)
   .env.example
   .gitignore
@@ -358,14 +350,13 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSLATION_SHORTEN_PENALTY` | The penalty a line that will not fit is re-translated with | `0.6` |
 | `TRANSLATION_SYLLABLES_PER_SECOND` | Amharic delivery rate used to turn time into a syllable budget | `4.0` |
 | `TRANSLATION_MAX_REDUCTION_ATTEMPTS` | How many times a line may be sent back to be shortened | `3` |
-| `TTS_ENGINE`        | `omnivoice` (cloned, per character) or `chatterbox` or `mms` (single voice) | `omnivoice` |
+| `TTS_ENGINE`        | `omnivoice` (cloned, per character) or `mms` (single voice) | `omnivoice` |
 | `OMNIVOICE_MODEL`   | OmniVoice checkpoint used when `TTS_ENGINE=omnivoice` | `k2-fsa/OmniVoice` |
 | `OMNIVOICE_STEPS`   | Diffusion steps; `16` is the faster documented setting | `32` |
 | `OMNIVOICE_GUIDANCE_SCALE` | Classifier-free guidance scale         | `2.0` |
 | `OMNIVOICE_TORCH_DTYPE` | Precision of the OmniVoice weights          | `float16` |
 | `MMS_SEED`          | Fixes the MMS duration predictor, so a line is the same length every run | `0` |
 | `MMS_SPEAKING_RATE` | Delivery speed for the whole film, asked of the MMS duration predictor before synthesis (`1.2` is ~16% faster; measured, not assumed) | `1.0` |
-| `CHATTERBOX_MODEL`  | The Amharic adapter used when `TTS_ENGINE=chatterbox` | `gabar-tech/chatterbox-amharic` |
 | `TRANSLATION_BASE_URL` | OpenAI-compatible endpoint (only for `TRANSLATION_BACKEND=openai`). Unset, it follows `TRANSLATION_PROVIDER`; required for `other` | per provider |
 | `TRANSLATION_BATCH_SIZE` | Dialogue lines adapted per request           | `10`               |
 | `TRANSLATION_THINKING` | How much the model may reason before answering: `off`, `low`, `medium`, `high`, or `default` to send no thinking field at all. Mapped onto whatever the provider understands; the run reports what it actually sent | `medium` |
@@ -377,10 +368,6 @@ environment, so values configured on the RunPod pod always win.
 | `VOICE_REFERENCE_MAX_DURATION` | Longest reference kept (a longer continuous turn is scanned with a sliding window) | `15.0` |
 | `DIALOGUE_BIBLE_PATH` | Persistent character/consistency state for adaptation (see [Cinematic dialogue adaptation](#cinematic-dialogue-adaptation-dialogue_contextpy)) | `$WORK_DIR/dialogue_bible.json` |
 | `TTS_MODEL` | The single-voice engine's checkpoint, used when `TTS_ENGINE=mms` | `facebook/mms-tts-amh` |
-| `SEED_VC_REPO_PATH` | Seed-VC checkout for the identity-conversion step | `$MODEL_CACHE_DIR/seed-vc` |
-| `SEED_VC_DIFFUSION_STEPS` | Diffusion steps of the Seed-VC V2 converter | `30` |
-| `SEED_VC_CONVERT_STYLE` | Also convert the *reference's* accent and style. **Keep this off** - see [Speech synthesis](#speech-synthesis-ttspy) | `false` |
-| `TTS_PERFORMANCE_REFERENCE_MIN_DURATION` / `..._MAX_DURATION` | Length of the original-performance prompt handed to Chatterbox | `6.0` / `12.0` |
 | `TTS_MAX_PAUSE_SECONDS` | Longest pause rendered around a synthesized line | `2.0` |
 | `TTS_MIN_LINE_SECONDS` | Shortest original window that can be dubbed; shorter lines are skipped and reported | `0.30` |
 | `TTS_CONTINUE_ON_FAILURE` | Skip and report a line an engine fails on instead of ending the run | `false` |
@@ -415,13 +402,13 @@ default resolved against the project root.
 | Required | `HUGGINGFACE_TOKEN` | No fallback value; diarization cannot run without it |
 | Required only for the hosted API | `GEMINI_API_KEY` (default provider) or `DEEPSEEK_API_KEY` | Needed only under `TRANSLATION_BACKEND=openai`. A local OpenAI-compatible server needs no key of its own, and the `nllb` backend reads none at all |
 | Required on a Pod | `HF_HOME` | Defaults to the container's `~/.cache/huggingface`, which is lost when the Pod stops |
-| Worth setting | `MODEL_CACHE_DIR`, `SEED_VC_REPO_PATH`, `DIALOGUE_BIBLE_PATH` | The first two default under the project root, so they follow the repository onto the volume. The bible is per-film consistency state worth keeping between runs |
+| Worth setting | `MODEL_CACHE_DIR`, `DIALOGUE_BIBLE_PATH` | The first defaults under the project root, so it follows the repository onto the volume. The bible is per-film consistency state worth keeping between runs |
 | Everything else | e.g. `TRANSCRIPTION_MODEL`, `TIMING_MAX_TEMPO`, `MIX_DUCK_DB` | Set only to change behaviour |
 
 Which credentials are *required* follows the configuration, and both
 `scripts/check_environment.py --full` and `scripts/validate_models.py` report
-against it: a key or a checkout the configured backends do not read is reported
-`[SKIP]`, not as a failure, so a pre-flight never fails on work the run will not do.
+against it: a key the configured backend does not read is reported `[SKIP]`, not as
+a failure, so a pre-flight never fails on work the run will not do.
 
 **Running without a commercial API.** Adaptation talks to any OpenAI-compatible
 endpoint, so a self-hosted server replaces the hosted one by configuration alone -
@@ -490,9 +477,8 @@ HUGGINGFACE_TOKEN=hf_...             # required - gated pyannote Community-1 wei
 GEMINI_API_KEY=...                   # required - the default backend is an LLM
 HF_HOME=/workspace/models_cache      # required on a Pod - see below
 MODEL_CACHE_DIR=/workspace/models_cache    # optional; defaults under the repo
-SEED_VC_REPO_PATH=/workspace/seed-vc       # optional - only for TTS_ENGINE=chatterbox
 OMNIVOICE_MODEL=k2-fsa/OmniVoice     # optional - which speech checkpoint to clone with
-TTS_ENGINE=omnivoice                 # optional - omnivoice | chatterbox | mms
+TTS_ENGINE=omnivoice                 # optional - omnivoice | mms
 ```
 
 Under the defaults **both** credentials are required: the token for the gated
@@ -516,30 +502,24 @@ works without it: its default is the container's `~/.cache/huggingface`, which i
 lost when the Pod stops. It is frozen when `huggingface_hub` is first imported, so
 it has to be a real environment variable - exporting it in a shell works but must
 be repeated every session, and putting it in `.env` does not work at all.
-`MODEL_CACHE_DIR` and `SEED_VC_REPO_PATH` are listed for completeness: their
-defaults already resolve under the project root, so if you cloned onto the volume
-they are on the volume too. Set them only to put the weights somewhere else, such
-as a cache shared between checkouts. The other four variables can also go in a
+`MODEL_CACHE_DIR` is listed for completeness: its default already resolves under
+the project root, so if you cloned onto the volume it is on the volume too. Set it
+only to put the weights somewhere else, such as a cache shared between checkouts.
+The other variables can also go in a
 `.env` in the project root, which `app.config` loads while never letting it
 override a real environment variable; `.env` is git-ignored, so it is never
 committed. Changing a running Pod's variables requires restarting it.
 
-Then clone the project onto the volume. Seed-VC is a separate checkout, and is
-needed **only** for `TTS_ENGINE=chatterbox`, so the default engine does not need it:
+Then clone the project onto the volume:
 
 ```bash
 git clone <your fork> /workspace/amharic-dub
 cd /workspace/amharic-dub
-# only for TTS_ENGINE=chatterbox:
-# git clone https://github.com/Plachtaa/seed-vc /workspace/seed-vc
 ```
 
-**3. Install.** Do not install with a plain `pip install -r requirements.txt`: the
-Chatterbox entry pins `torch==2.6.0`, `torchaudio==2.6.0` and `numpy<2`, and
-resolving it would replace the CUDA-matched PyTorch 2.8 the image provides and
-downgrade NumPy below what pyannote needs. `scripts/install_dependencies.sh`
-installs everything except Chatterbox first, then Chatterbox with `--no-deps`, and
-finally imports every runtime module to prove the result is usable:
+**3. Install.** `scripts/install_dependencies.sh` installs the requirements, then
+imports every runtime module to prove the result is usable, and fails if the
+CUDA-matched PyTorch 2.8 the image provides was replaced:
 
 ```bash
 bash scripts/install_dependencies.sh
@@ -565,12 +545,6 @@ plus the Hugging Face token are the only things standing between a fresh pod and
 Skip what you are not using: `scripts/validate_models.py` follows the configuration, so
 it loads only the engine and backend a run will actually use.
 
-Everything Chatterbox's code actually imports is declared in `requirements.txt`
-instead, which is why the manifest lists `s3tokenizer`, `conformer`, `diffusers`
-and the Perth watermarker alongside `peft` and `safetensors`. `pip check` will
-still report Chatterbox's metadata as unsatisfied: that conflict is known and
-intentional, and nothing should be downgraded because of it.
-
 **4. Pre-flight, then validate the models stage by stage.**
 
 ```bash
@@ -582,13 +556,11 @@ python scripts/validate_models.py
 CUDA availability, GPU name, available VRAM, and FFmpeg availability. It needs no
 credentials and downloads nothing, so it is safe to run first. With `--full` it
 becomes the session pre-flight: it also checks the credentials the configured run
-actually needs (flagging a value that is still the `.env.example` placeholder), the
-Seed-VC checkout and its `configs/v2/vc_wrapper.yaml`, and every module the stages
-import at run time. What is required follows the configuration: the Hugging Face
-token always, the configured provider's key only under `TRANSLATION_BACKEND=openai`
-(`GEMINI_API_KEY` by default), and the
-Seed-VC checkout only under `TTS_ENGINE=chatterbox`. Anything the configuration does
-not use is reported `[SKIP]` rather than `[FAIL]`.
+actually needs (flagging a value that is still the `.env.example` placeholder) and
+every module the stages import at run time. What is required follows the
+configuration: the Hugging Face token always, and the configured provider's key only
+under `TRANSLATION_BACKEND=openai` (`GEMINI_API_KEY` by default). Anything the
+configuration does not use is reported `[SKIP]` rather than `[FAIL]`.
 
 `scripts/validate_models.py` loads each model **on its own** - BandIt, pyannote,
 faster-whisper, the configured translation backend, the configured synthesis engine -
@@ -598,10 +570,10 @@ weights have already been downloaded. The translation and synthesis steps go one
 step further than loading and push one probe line through the model, because a
 checkpoint that loads can still reject every input. `--only nllb` (or any
 comma-separated subset) re-checks a single component. As with the environment
-check, only the configured backend and engine are loaded: checking both pairs would
+check, only the configured backend and engine are loaded: checking both would
 download gigabytes a run never touches, and would leave the models it *does* use
-unvalidated. To check the other pair, set the variables:
-`TRANSLATION_BACKEND=openai TTS_ENGINE=chatterbox python scripts/validate_models.py`.
+unvalidated. To check the other engine, set the variable:
+`TRANSLATION_BACKEND=openai TTS_ENGINE=mms python scripts/validate_models.py`.
 Because every step but the runtime report downloads real weights, the script refuses
 to run on a machine where torch reports no CUDA device unless `--allow-cpu` is
 passed, so a development box cannot quietly fill its disk with checkpoints.
@@ -655,15 +627,12 @@ Keeping the repository (and so the output) on the volume is what makes the resul
 survive a stop, and findable from a later session. Anything written to the
 container disk is lost when the Pod stops.
 
-Model weights (BandIt, pyannote, faster-whisper, NLLB, OmniVoice, Chatterbox,
-Seed-VC) are **not** part of this repository. They are downloaded at runtime into
+Model weights (BandIt, pyannote, faster-whisper, NLLB, OmniVoice, MMS-TTS) are
+**not** part of this repository. They are downloaded at runtime into
 `MODEL_CACHE_DIR`; point that variable at the Pod's persistent volume so the weights
-survive restarts. `app.pipeline.tts` snapshots the Chatterbox Amharic adapter and its
-pinned base model into `MODEL_CACHE_DIR` itself; Seed-VC fetches its own
-checkpoints and vocoder through Hugging Face, which takes no cache argument, so
-`HF_HOME` has to be set to the same directory as well (step 2). OmniVoice is the
-same: its loader resolves a repository id through `snapshot_download` and takes no
-cache directory of its own, so it lands under `HF_HOME` too.
+survive restarts. OmniVoice and MMS-TTS fetch their own checkpoints through Hugging
+Face, which takes no cache argument, so `HF_HOME` has to be set to the same
+directory as well (step 2).
 
 The pyannote Community-1 diarization checkpoint is a **gated** Hugging Face
 model, so `HUGGINGFACE_TOKEN` is required before running that stage. The token's
@@ -757,98 +726,38 @@ something the text does not.
 Voice-clone prompts are cached next to each reference as `voice_clone.pt`. Encoding
 is the expensive step, so an existing prompt is always reused and never
 re-encoded; pass a `clone_encoder` callable to `build_voice_profiles` if your setup
-needs a serialized prompt. The TTS stage does not need one: the Amharic adapter
-takes reference audio directly, so `clone_prompt_path` may stay `None`.
+needs a serialized prompt. The TTS stage does not need one: the cloning engine takes
+reference audio directly, so `clone_prompt_path` may stay `None`.
 
 ### Speech synthesis (`tts.py`)
 
-The default engine runs alone: OmniVoice speaks each line in the voice cloned from
-that character's own reference recording, so there is no conversion step - see
+OmniVoice speaks each line in the voice cloned from that character's own reference
+recording, so there is no conversion step - see
 [Choosing a speech engine](#choosing-a-speech-engine).
 
-`TTS_ENGINE=chatterbox` instead runs two engines per line, in this order, which is
-what preserves the original actor's performance:
+`VoiceProfile.reference_audio` is the only reference this stage reads, and it is what
+makes a character sound like themselves across a film: the same reference for every
+line of a speaker is the whole mechanism. A `VoiceProfile` is never modified by this
+stage, and `clone_prompt_path` may stay `None` - the engine takes reference audio
+directly, so nothing needs serializing.
 
-1. **Chatterbox Amharic** (`gabar-tech/chatterbox-amharic`, a LoRA adapter plus a
-   Fidel tokenizer on Chatterbox Multilingual v3) speaks the Amharic text. It is
-   loaded through the loader the adapter repository ships
-   (`amharic_tts.py` → `load_amharic_tts`), so training and inference see the
-   same text front-end - including the Amharic normalization and sentence
-   splitting. The adapter's loader downloads the base checkpoint from
-   `ResembleAI/chatterbox` at the revision the *adapter* pins, which is not the
-   revision `requirements.txt` installs the code from; the loader validates the
-   checkpoint against the installed build and raises if the two disagree, so a
-   mismatch is reported rather than producing a wrong voice. Note also that
-   `chatterbox-tts` is installed with `--no-deps` (see
-   [Quickstart](#quickstart---runpod-a40-worker)): the packages its code needs are
-   declared in `requirements.txt` instead.
-2. **Seed-VC V2** converts that take into the character's identity in its
-   **timbre-only mode** (`convert_style=False`, the default), which replaces the
-   voice without touching the delivery. The style-converting mode must not be used
-   here: Seed-VC V2's style branch conditions its autoregressive stage on the
-   *reference's* acoustic tokens and content indices, so it speaks the source
-   content in the reference's accent and emotion. The character reference is the
-   original actor's English audio, so switching that mode on would re-impose an
-   English accent on the Amharic and overwrite the very performance this stage
-   exists to preserve. `SEED_VC_CONVERT_STYLE=true` remains available for a single
-   controlled comparison, and nothing else uses it. Seed-VC is not a package, so
-   clone it and point
-   `SEED_VC_REPO_PATH` at the checkout:
-   `git clone https://github.com/Plachtaa/seed-vc <SEED_VC_REPO_PATH>`. Upstream
-   has been read-only since April 2025, so **pin a known-good commit**
-   (`git -C <SEED_VC_REPO_PATH> checkout <commit>`): the checkout is the one
-   engine here that is code rather than a pinned dependency, and the run's
-   manifest records `provenance.seed_vc_revision`, so a re-clone that silently
-   moves the engine is visible afterwards. Its V2
-   converter is called as its own `inference_v2.py` calls it: a `torch.device`
-   (it reads `device.type`) and `stream_output=True`, whose generator yields
-   `(mp3_bytes, full_audio)` with the completed `(sample_rate, samples)` only on
-   the final chunk.
-
-   Note that `length_adjust`, which the V2 converter also accepts, only has an
-   effect in the style-converting branch it is not using - in timbre-only mode the
-   converted take follows the length of the take it was given. Fitting the line to
-   its window stays where it already was, in `timing.py`.
-
-The checkout was written against `huggingface_hub` 0.x (its own requirements ask
-only for `>=0.28.1`), while this project runs the 1.x line: `transformers` 5.x,
-which Chatterbox needs, requires `huggingface-hub>=1.3.0`. Two arguments were
-removed in that major release and Seed-VC's BigVGAN vocoder still uses both:
-`ModelHubMixin.from_pretrained` no longer passes `proxies` and `resume_download`
-to `_from_pretrained`, which declares them as required, and `hf_hub_download` no
-longer accepts them either.
-
-Pinning hub down is not an option, because it would break the engine that works, so
-`app.pipeline.tts` adapts the checkout at load time. Note that supplying the two
-arguments from the config does **not** work: hub's argument validator pops both
-names out of the keyword arguments before the call happens, which is how it retires
-them silently, so anything passed from above the method is discarded. They are
-therefore defaulted *inside* `_from_pretrained`, by wrapping it as a classmethod,
-and the vocoder module's own `hf_hub_download` drops them. Both only ever selected
-defaults hub now applies itself, and the adaptation touches nothing else in the
-process. It is the only incompatible call site in the checkout.
-
-Note that Seed-VC's `hf_utils.py` writes its checkpoints to `./checkpoints`
-relative to the current directory, so they land next to wherever a run is started
-rather than under `MODEL_CACHE_DIR`. Run the pipeline from the repository root to
-keep them in one predictable place.
-
-The two references come from two different places on purpose. Chatterbox's prompt
-decides *how* the line is performed, so it is the original actor's own audio for
-that line, cut from the clean BandIt speech stem and centred on the line (padded
-when the line is short, trimmed when it is long, bounded by
-`TTS_PERFORMANCE_REFERENCE_MIN_DURATION` / `..._MAX_DURATION`).
-`VoiceProfile.reference_audio` is used only as the Seed-VC target identity, which
-is what makes a character sound like themselves across a film. A `VoiceProfile`
-is never modified by this stage.
+A removed path used to cut the original actor's audio for each line out of the clean
+speech stem and hand it to the engine as a *performance prompt*, with a second engine
+converting the result to the character's voice. No engine the project supports reads
+such a prompt any more, so that machinery is gone along with the two engines.
+`TtsClip.performance_reference_path` remains in the artifact record and is now always
+`None`. This is also why
+`measure_performance_preservation` in `evaluation.py` reports that it found no
+original-performance audio rather than reporting a result: it needs an input the
+pipeline no longer produces, and saying so is better than a silent "not measured".
 
 **Lines that cannot be dubbed are skipped and reported.** A window shorter than
 `TTS_MIN_LINE_SECONDS` (0.30s by default) is a fragment, not a spoken line: there is
 no room for a word in the time it occupied, so any Amharic written for it is
-unintelligible - and Chatterbox can fail outright on it, with an empty mel
-spectrogram that trips a convolution inside its vocoder. Such a line, and a line with
-nothing to pronounce at all (punctuation, whitespace), is skipped *before* the engines
-are called, the lines around it are unaffected, and both the line and the reason are
+unintelligible, and a vocoder can be driven to an empty mel spectrogram by input that
+short. Such a line, and a line with
+nothing to pronounce at all (punctuation, whitespace), is skipped *before* the engine
+is called, the lines around it are unaffected, and both the line and the reason are
 recorded in the manifest under `run.tts.skipped`. This is input validation, not
 failure tolerance: an engine that actually *fails* on a line still stops the run with
 that line named, unless `TTS_CONTINUE_ON_FAILURE=true` asks for a reported hole
@@ -859,24 +768,20 @@ English-derived word is a word, and silently dropping the line would be worse th
 voicing it imperfectly; getting that word into Fidel is the adaptation stage's job
 (see [Borrowed words](#borrowed-words-keep-the-word-change-the-script)).
 
-`AdaptedDialogue`'s performance metadata is mapped, not discarded. `intensity`
-moves Chatterbox's `exaggeration` and `temperature` predictably; `emotion` and
-`delivery` add a small bias from a cue table; `pause_before` and `pause_after` are
-rendered as silence around the converted line, capped at `TTS_MAX_PAUSE_SECONDS`.
-Every adjustment is bounded around the adapter's own validated defaults, is
-recorded in `PerformanceControls` (with the matched cue terms and the notes that
-explain each change), and an unknown emotion or delivery direction changes nothing
-and says so rather than inventing a mapping.
+`AdaptedDialogue`'s performance metadata is carried through, not discarded.
+`emotion`, `intensity` and `delivery` are recorded in `PerformanceControls` exactly as
+the adaptation stage returned them, so a manifest says what the dialogue model asked
+for; `pause_before` and `pause_after` are rendered as silence around the take, capped
+at `TTS_MAX_PAUSE_SECONDS`. Both the declared pause and the rendered one are kept in
+the clip, so a cap never hides what was asked for.
 
 Artifacts are deterministic and reusable, one file per line per step, under
 `<WORK_DIR>/tts/`:
 
 ```
 tts/
-  performance/  <SPEAKER_ID>_<digest>.wav   # the original performance prompt
-  chatterbox/   <SPEAKER_ID>_<digest>.wav   # the Amharic take
-  converted/    <SPEAKER_ID>_<digest>.wav   # the same take in the character's voice
-  clips/        <SPEAKER_ID>_<digest>.wav   # converted audio + rendered pauses
+  takes/        <SPEAKER_ID>_<digest>.wav   # the engine's raw output for the line
+  clips/        <SPEAKER_ID>_<digest>.wav   # the take + its rendered pauses
 ```
 
 The digest covers the line's timing, text and performance metadata (plus a recipe
@@ -886,11 +791,9 @@ on disk.
 
 Durations are reported, not fitted: `TtsClip` carries `speech_duration`, the
 rendered pauses, the original window and `duration`, and never time-stretches
-anything. Making each line fit its original window is `timing.py`'s job. Both
-engines are lazy and cached per process (keyed by device/model and by
-device/checkout/diffusion steps), so no model is loaded per dialogue line. The
-Chatterbox adapter, its pinned base model and the loader file are snapshotted
-into `MODEL_CACHE_DIR`; Seed-VC's own downloads follow `HF_HOME` (see
+anything. Making each line fit its original window is `timing.py`'s job. Engines are
+lazy and cached per process, keyed by the settings that shape one, so no model is
+loaded per dialogue line. OmniVoice's own checkpoints follow `HF_HOME` (see
 [Quickstart](#quickstart---runpod-a40-worker)).
 
 ### Timing, mixing and muxing (`timing.py`, `mixing.py`, `video.py`)
@@ -1201,7 +1104,7 @@ pytest tests/test_config.py
 - [x] `transcription`: faster-whisper large-v3 integration
 - [x] `translation`: instruction-following Amharic dialogue adaptation (Gemini by default, DeepSeek or self-hosted by configuration)
 - [x] `voice_profiles`: per-speaker voice references and clone-prompt cache
-- [x] `tts`: Chatterbox Amharic synthesis + Seed-VC V2 voice adaptation
+- [x] `tts`: cloned-voice Amharic synthesis (OmniVoice by default, MMS-TTS Amharic as a single-voice alternative)
 - [x] `timing`: pitch-preserving fit to the original windows
 - [x] `mixing`: dialogue over ducked music and effects
 - [x] `video`: FFmpeg extraction and mux into a dubbed MP4
@@ -1223,7 +1126,9 @@ pytest tests/test_config.py
 - [x] Instruction-following adaptation as the default backend, so length and the
       Fidel-script rule can actually be enforced; the rewrite is iterated and
       bounded, and a line that still will not fit is reported rather than cut
-- [x] `mms`: MMS-TTS Amharic single-voice engine (and the `chatterbox` alternative)
+- [x] `mms`: MMS-TTS Amharic single-voice engine
+- [ ] Removed engines: `chatterbox` + Seed-VC V2 were dropped as unused; restore only
+      if a measured comparison shows OmniVoice's Amharic is not good enough
 - [x] Peak limiting so a clip is attenuated, never silently truncated
 - [ ] Record a scored baseline on real material with the new engines
 - [ ] Per-stage resume, so a long run continues instead of restarting
@@ -1272,11 +1177,15 @@ merit. What is currently in use, so the obligations are known rather than assume
 | NLLB-200 (`3.3B`) | **CC-BY-NC-4.0** | non-commercial weights; the code is MIT |
 | `k2-fsa/OmniVoice` | code Apache-2.0, weights **CC-BY-NC-4.0** | non-commercial because of its training data (Emilia) |
 | `african-low-resource/omnivoice-amharic` | card claims Apache-2.0, **unverifiable** | trained on the OmniVoice recipe, whose released weights are CC-BY-NC; no datasets named |
-| Chatterbox Multilingual v3 | MIT | base model; does **not** support Amharic on its own |
-| `gabar-tech/chatterbox-amharic` adapter | **CC-BY-SA-4.0** | share-alike propagates from WaxalNLP |
-| Seed-VC V2 | **GPL-3.0**, *archived* | read-only upstream since April 2025; only used by the `chatterbox` engine, so the default run never touches it |
 | Gemini API | proprietary service | the default adaptation provider; swappable by configuration |
 | DeepSeek API | proprietary service | the alternative adaptation provider; swappable for a local OpenAI-compatible server |
+
+Two engines that were removed are listed here for completeness, since they are one
+`git revert` away from coming back: Chatterbox Multilingual v3 (MIT; does **not**
+support Amharic on its own), the `gabar-tech/chatterbox-amharic` adapter
+(**CC-BY-SA-4.0**, share-alike propagating from WaxalNLP) and Seed-VC V2
+(**GPL-3.0**, *archived* - read-only upstream since April 2025). None of the three is
+installed or used by any run today.
 
 Two of the defaults (NLLB and OmniVoice weights) are **non-commercial only**. For a
 personal, non-commercial dub that is fine, and licences here are documented rather than

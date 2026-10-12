@@ -772,21 +772,14 @@ def run_pipeline(
 def _provenance(settings: Settings) -> dict[str, Any]:
     """Describe what actually produced a run, for reproducibility.
 
-    Seed-VC is the one engine that is a *checkout* rather than a pinned dependency,
-    so the commit it is sitting on is recorded here. A re-clone that silently moved
-    the engine is otherwise invisible in a delivered dub.
-
-    The adaptation model is recorded for the same reason. Which provider and model
-    produced the Amharic, and how hard it was asked to think, are the first things two
-    runs are compared on - and the terminal that printed them is gone as soon as the
-    Pod stops, while the manifest travels home with the dub.
+    Which model adapted the dialogue, which speech engine spoke it, and how hard the
+    model was asked to think are the first things two runs are compared on - and the
+    terminal that printed them is gone as soon as the Pod stops, while the manifest
+    travels home with the dub.
     """
 
     provenance: dict[str, Any] = {
-        "seed_vc_revision": tts.seed_vc_revision(settings.seed_vc_repo_path),
-        "seed_vc_repo_path": portable_path(Path(settings.seed_vc_repo_path)),
-        "seed_vc_convert_style": settings.seed_vc_convert_style,
-        "seed_vc_diffusion_steps": settings.seed_vc_diffusion_steps,
+        "tts_engine": settings.tts_engine,
         "translation_backend": settings.translation_backend,
     }
 
@@ -807,9 +800,9 @@ def _provenance(settings: Settings) -> dict[str, Any]:
 def _engine_note(settings: Settings) -> str:
     """Describe the synthesis chain this run actually used.
 
-    The note used to name Seed-VC whatever the engine was, which made a manifest from an
-    OmniVoice run claim a conversion stage that never ran. What produced a dub has to be
-    readable from the manifest alone.
+    What produced a dub has to be readable from the manifest alone, so the note names
+    the engine and says whether it cloned a per-character voice or spoke everyone in
+    one.
     """
 
     if tts.engine_needs_profiles(settings.tts_engine):
@@ -818,8 +811,7 @@ def _engine_note(settings: Settings) -> str:
             "their own voice, cloned from their isolated English performance"
         )
     return (
-        f"{settings.tts_engine} is a single-voice engine: one voice speaks every part, "
-        "so the source's English performance is used as a prompt rather than converted"
+        f"{settings.tts_engine} is a single-voice engine: one voice speaks every part"
     )
 
 

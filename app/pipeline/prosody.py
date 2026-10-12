@@ -1,11 +1,12 @@
 """Prosody measurement: did the dub keep the actor's delivery?
 
 Preserving the original actor's performance is one of the project's top-level goals,
-and the pipeline's mechanism for it is unusual enough that it needs its own
-measurement: the Chatterbox prompt is the *original actor's own audio* for that
-line, so the generated Amharic take starts out carrying that delivery, and the
-Seed-VC stage is supposed to replace the timbre without touching it. Nothing in the
-pipeline checked that it actually survived - this module does.
+so it needs its own measurement: how high the voice sat, how far it moved, and how
+much of the line was voiced at all, compared against the same figures for the
+original line. What it compares a take *with* is the caller's business - see
+:func:`~app.pipeline.evaluation.measure_performance_preservation`, which needs a
+clip that recorded the original performance beside the take. Nothing in the pipeline
+checked delivery before this module existed.
 
 Why pitch tracking rather than an embedding
 ------------------------------------------

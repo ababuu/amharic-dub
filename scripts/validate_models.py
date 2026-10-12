@@ -11,14 +11,14 @@ Which translation and synthesis models are checked follows the configuration:
 
 * ``TRANSLATION_BACKEND`` selects a local ``nllb`` checkpoint, or ``openai`` for a
   served instruction-following model (``TRANSLATION_PROVIDER`` picks the vendor).
-* ``TTS_ENGINE`` selects ``mms`` (the default), or ``chatterbox`` plus ``seed-vc``.
+* ``TTS_ENGINE`` selects ``omnivoice`` (the default), or ``mms``.
 
 Only the selected ones are loaded. Checking the other pair would download many
 gigabytes a run never touches and, worse, would leave the models it *does* use
 unchecked, so the pre-flight would pass and the run would still fail. To check the
 other configuration, set the environment variables::
 
-    TRANSLATION_BACKEND=openai TTS_ENGINE=chatterbox python scripts/validate_models.py
+    TRANSLATION_BACKEND=openai TTS_ENGINE=mms python scripts/validate_models.py
 
 ::
 
@@ -207,7 +207,7 @@ def load_mms() -> None:
     if settings.tts_engine != "mms":
         raise RuntimeError(
             f"TTS_ENGINE is {settings.tts_engine!r}, so the MMS engine is not what a "
-            "run would use; validate 'chatterbox' and 'seed-vc' instead"
+            "run would use; validate 'omnivoice' instead"
         )
 
     engine = tts.load_mms_engine(settings=settings)
@@ -310,38 +310,6 @@ def load_served_model() -> None:
     _report("models listed", str(len(getattr(models, "data", []) or [])))
 
 
-def load_chatterbox() -> None:
-    """Load the Amharic adapter on top of its pinned Chatterbox base."""
-
-    from app.pipeline import tts
-
-    settings = tts.get_settings()
-    _report("engine", settings.tts_engine)
-    _report("adapter", settings.chatterbox_model)
-    _report("device", settings.device)
-
-    engine = tts.load_chatterbox_engine(settings=settings)
-    # The engine is lazy: ``_load()`` is what fetches the adapter and the base
-    # checkpoint, which is the step worth validating.
-    adapter = engine._load()  # noqa: SLF001
-    _report("sample rate", str(engine.sample_rate))
-    _report("loaded", type(adapter).__name__)
-
-
-def load_seed_vc() -> None:
-    """Build the Seed-VC V2 wrapper from its checkout and load its checkpoints."""
-
-    from app.pipeline import tts
-
-    settings = tts.get_settings()
-    _report("checkout", str(settings.seed_vc_repo_path))
-    _report("diffusion steps", str(settings.seed_vc_diffusion_steps))
-
-    engine = tts.load_seed_vc_engine(settings=settings)
-    engine._load()  # noqa: SLF001 - downloads and builds the V2 wrapper
-    _report("convert style", str(engine.convert_style))
-
-
 #: Steps that every configuration needs, in pipeline order.
 STEPS: tuple[tuple[str, str, object], ...] = (
     ("torch", "compute runtime", load_torch),
@@ -369,18 +337,6 @@ CONFIGURED_STEPS: tuple[tuple[str, str, object, str], ...] = (
         "omnivoice",
     ),
     ("mms", "MMS-TTS Amharic synthesis (TTS_ENGINE=mms)", load_mms, "mms"),
-    (
-        "chatterbox",
-        "Chatterbox Amharic synthesis (TTS_ENGINE=chatterbox)",
-        load_chatterbox,
-        "chatterbox",
-    ),
-    (
-        "seed-vc",
-        "Seed-VC V2 voice conversion (TTS_ENGINE=chatterbox)",
-        load_seed_vc,
-        "chatterbox",
-    ),
 )
 
 
@@ -390,8 +346,6 @@ ACTIVATION: dict[str, str] = {
     "served": "set TRANSLATION_BACKEND=openai",
     "omnivoice": "set TTS_ENGINE=omnivoice",
     "mms": "set TTS_ENGINE=mms",
-    "chatterbox": "set TTS_ENGINE=chatterbox",
-    "seed-vc": "set TTS_ENGINE=chatterbox",
 }
 
 
@@ -412,7 +366,7 @@ def configured_steps() -> tuple[tuple[str, str, object], ...]:
     for name, description, loader, wanted in CONFIGURED_STEPS:
         if name in ("nllb", "served") and wanted != backend:
             continue
-        if name in ("mms", "omnivoice", "chatterbox", "seed-vc") and wanted != engine:
+        if name in ("mms", "omnivoice") and wanted != engine:
             continue
         selected.append((name, description, loader))
     return tuple(selected)

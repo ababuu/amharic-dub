@@ -38,7 +38,7 @@ from app.config import DEFAULT_TIMING_MAX_OVERLAP_SECONDS, DEFAULT_TIMING_MAX_TE
 from app.pipeline.translation import AdaptedDialogue
 from app.pipeline.tts import PerformanceControls, TtsClip
 
-#: What the TTS stage actually produces: Seed-VC writes its own converter rate.
+#: What the TTS stage actually produces: a clip at the engine's own sample rate.
 CLIP_RATE = 22_050
 
 LEAD = 0.10
@@ -119,8 +119,8 @@ def _clip(
         speech_duration=speech,
         rendered_pause_before=lead,
         rendered_pause_after=trail,
-        performance_engine="chatterbox-amharic",
-        style_engine="seed-vc-v2",
+        performance_engine="omnivoice",
+        style_engine="none",
     )
 
 

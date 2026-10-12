@@ -13,8 +13,6 @@ from app.config import (
     DEFAULT_DIARIZATION_MODEL,
     DEFAULT_MIX_DIALOGUE_GAIN_DB,
     DEFAULT_MIX_DUCK_DB,
-    DEFAULT_SEED_VC_DIFFUSION_STEPS,
-    DEFAULT_SEED_VC_REPO_NAME,
     DEFAULT_TIMING_MAX_TEMPO,
     DEFAULT_TIMING_MIN_LINE_GAP,
     DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL,
@@ -35,8 +33,6 @@ from app.config import (
     DEFAULT_TTS_MIN_LINE_SECONDS,
     DEFAULT_TTS_MAX_PAUSE_SECONDS,
     DEFAULT_TTS_MODEL,
-    DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION,
-    DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION,
     DEFAULT_VOICE_REFERENCE_MAX_DURATION,
     DEFAULT_VOICE_REFERENCE_MIN_DURATION,
     DEFAULT_VOICE_REFERENCE_TARGET_DURATION,
@@ -406,80 +402,27 @@ def test_tts_settings_are_configurable(
 ) -> None:
     defaults = Settings.from_env()
     assert defaults.tts_model == DEFAULT_TTS_MODEL
-    assert defaults.seed_vc_repo_path == (
-        defaults.model_cache_dir / DEFAULT_SEED_VC_REPO_NAME
-    )
-    assert defaults.seed_vc_diffusion_steps == DEFAULT_SEED_VC_DIFFUSION_STEPS
-    # Timbre-only by default: Seed-VC's style branch would re-impose the reference's
-    # (English) accent and overwrite the take's performance.
-    assert defaults.seed_vc_convert_style is False
-    assert (
-        defaults.tts_performance_reference_min_duration
-        == DEFAULT_TTS_PERFORMANCE_REFERENCE_MIN_DURATION
-    )
-    assert (
-        defaults.tts_performance_reference_max_duration
-        == DEFAULT_TTS_PERFORMANCE_REFERENCE_MAX_DURATION
-    )
     assert defaults.tts_max_pause_seconds == DEFAULT_TTS_MAX_PAUSE_SECONDS
     assert defaults.tts_min_line_seconds == DEFAULT_TTS_MIN_LINE_SECONDS
     # A failure should be visible, so absorbing one is opt-in.
     assert defaults.tts_continue_on_failure is False
 
     monkeypatch.setenv("TTS_MODEL", "someone/other-adapter")
-    monkeypatch.setenv("SEED_VC_REPO_PATH", "vendor/seed-vc")
-    monkeypatch.setenv("SEED_VC_DIFFUSION_STEPS", "12")
-    monkeypatch.setenv("SEED_VC_CONVERT_STYLE", "on")
-    monkeypatch.setenv("TTS_PERFORMANCE_REFERENCE_MIN_DURATION", "4")
-    monkeypatch.setenv("TTS_PERFORMANCE_REFERENCE_MAX_DURATION", "8.5")
     monkeypatch.setenv("TTS_MAX_PAUSE_SECONDS", "1.5")
     monkeypatch.setenv("TTS_MIN_LINE_SECONDS", "0.45")
     monkeypatch.setenv("TTS_CONTINUE_ON_FAILURE", "true")
 
     settings = Settings.from_env()
     assert settings.tts_model == "someone/other-adapter"
-    assert settings.seed_vc_repo_path.name == "seed-vc"
-    assert settings.seed_vc_repo_path.parent.name == "vendor"
-    assert settings.seed_vc_diffusion_steps == 12
-    assert settings.seed_vc_convert_style is True
-    assert settings.tts_performance_reference_min_duration == 4.0
-    assert settings.tts_performance_reference_max_duration == 8.5
     assert settings.tts_max_pause_seconds == 1.5
     assert settings.tts_min_line_seconds == 0.45
     assert settings.tts_continue_on_failure is True
 
     payload = settings.as_dict()
     assert payload["tts_model"] == "someone/other-adapter"
-    assert payload["seed_vc_diffusion_steps"] == 12
-    assert payload["seed_vc_convert_style"] is True
-    assert payload["tts_performance_reference_min_duration"] == 4.0
-    assert payload["tts_performance_reference_max_duration"] == 8.5
     assert payload["tts_max_pause_seconds"] == 1.5
     assert payload["tts_min_line_seconds"] == 0.45
     assert payload["tts_continue_on_failure"] is True
-    assert str(payload["seed_vc_repo_path"]).endswith("seed-vc")
-
-
-def test_seed_vc_repo_path_follows_a_custom_model_cache(
-    monkeypatch: pytest.MonkeyPatch, _clean_env: None
-) -> None:
-    monkeypatch.setenv("MODEL_CACHE_DIR", "custom-cache")
-
-    settings = Settings.from_env()
-
-    assert settings.seed_vc_repo_path == settings.model_cache_dir / "seed-vc"
-
-
-def test_malformed_seed_vc_diffusion_steps_are_rejected(
-    monkeypatch: pytest.MonkeyPatch, _clean_env: None
-) -> None:
-    monkeypatch.setenv("SEED_VC_DIFFUSION_STEPS", "0")
-    with pytest.raises(ValueError, match="positive integer"):
-        Settings.from_env()
-
-    monkeypatch.setenv("SEED_VC_DIFFUSION_STEPS", "many")
-    with pytest.raises(ValueError, match="integer"):
-        Settings.from_env()
 
 
 def test_malformed_float_setting_is_rejected(

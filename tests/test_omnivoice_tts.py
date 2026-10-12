@@ -533,7 +533,6 @@ def test_a_dtype_the_runtime_does_not_have_is_rejected(
 
 def test_only_the_engines_that_read_a_reference_need_profiles() -> None:
     assert tts.engine_needs_profiles("omnivoice") is True
-    assert tts.engine_needs_profiles("chatterbox") is True
     assert tts.engine_needs_profiles("mms") is False
 
 
@@ -543,12 +542,11 @@ def test_the_artifact_name_distinguishes_engines(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
 
     names = {
-        tts.artifact_model_name("chatterbox", settings=settings),
-        tts.artifact_model_name("omnivoice", settings=settings),
-        tts.artifact_model_name("mms", settings=settings),
+        tts.artifact_model_name(engine, settings=settings)
+        for engine in tts.SUPPORTED_ENGINES
     }
 
-    assert len(names) == 3
+    assert len(names) == len(tts.SUPPORTED_ENGINES)
     assert tts.artifact_model_name("omnivoice", settings=settings) == (
         f"omnivoice:{settings.omnivoice_model}"
     )
@@ -609,29 +607,6 @@ def test_the_cloning_path_gives_each_speaker_their_own_voice(
         str(profiles[SPEAKER].resolve_reference_audio()),
         str(profiles[OTHER_SPEAKER].resolve_reference_audio()),
     }
-
-
-def test_the_chatterbox_prompt_bounds_are_not_imposed_on_a_cloning_engine(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Those bounds describe a prompt this path never cuts, so they cannot apply."""
-
-    _patch(monkeypatch)
-    settings = _settings(
-        tmp_path,
-        tts_performance_reference_min_duration=12.0,
-        tts_performance_reference_max_duration=6.0,
-    )
-
-    result = synthesize_dialogue_detailed(
-        [_line()],
-        _reference(tmp_path, "stem.wav", seconds=8.0),
-        {SPEAKER: _profile(tmp_path)},
-        output_dir=tmp_path / "tts",
-        settings=settings,
-    )
-
-    assert result.clips
 
 
 def test_an_engine_that_meets_no_contract_is_rejected(

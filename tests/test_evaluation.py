@@ -110,8 +110,8 @@ def _clip(
         speech_duration=1.0,
         rendered_pause_before=0.0,
         rendered_pause_after=0.0,
-        performance_engine="chatterbox-amharic",
-        style_engine="seed-vc-v2",
+        performance_engine="omnivoice",
+        style_engine="none",
     )
 
 

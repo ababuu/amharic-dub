@@ -468,6 +468,10 @@ class PerformancePreservationReport:
 
     comparisons: tuple[ProsodyComparison, ...]
     unmeasured: int
+    #: Lines whose clip recorded no original-performance audio to compare against.
+    #: Counted apart from ``unmeasured`` because the cause is a missing input rather
+    #: than audio that could not be read.
+    missing_reference: int = 0
 
     @property
     def measured(self) -> int:
@@ -545,6 +549,7 @@ class PerformancePreservationReport:
         return {
             "measured": self.measured,
             "unmeasured": self.unmeasured,
+            "missing_reference": self.missing_reference,
             "unusable": self.unusable,
             "preserved_ratio": round(self.preserved_ratio, 4),
             "mean_pitch_range_ratio": (
@@ -560,6 +565,13 @@ class PerformancePreservationReport:
         """Return the one-line summary a run prints."""
 
         if not self.usable_comparisons:
+            if self.missing_reference:
+                # Saying only "not measured" would hide *why*: no clip carried the
+                # original performance, so there was nothing to compare a take with.
+                return (
+                    f"performance: not measured - {self.missing_reference} line(s) "
+                    "recorded no original-performance audio"
+                )
             return "performance: not measured"
         range_ratio = self.mean_pitch_range_ratio or 0.0
         shift = self.mean_absolute_pitch_shift_semitones or 0.0
@@ -575,21 +587,31 @@ def measure_performance_preservation(
     *,
     profiler: Callable[[Path], PitchProfile] = profile_of_file,
 ) -> PerformancePreservationReport:
-    """Compare each generated take with the original performance it was prompted on.
+    """Compare each generated take with the original performance it replaced.
 
-    ``clip.performance_reference_path`` is the actor's own audio for that line, cut
-    from the clean speech stem, and ``clip.audio_path`` is the take the character's
-    voice was converted into. Comparing the two is the only direct check that the
-    pipeline did what its design claims: carry the performance, replace the timbre.
+    ``clip.performance_reference_path`` is the actor's own audio for that line, when
+    the engine that produced the clip recorded one, and ``clip.audio_path`` is the
+    take. Comparing the two is the direct check that the dub carried the performance
+    rather than flattening it into a neutral read.
+
+    No engine the pipeline currently supports records that reference, so in practice
+    this counts every line as ``missing_reference`` and measures nothing. It is kept
+    because the alternative - silently reporting "not measured" - would hide which of
+    the two reasons applied, and because a future engine that does carry the original
+    performance can populate the field and get the measurement back.
 
     This reads audio, so it is opt-in rather than part of every run.
     """
 
     comparisons: list[ProsodyComparison] = []
     unmeasured = 0
+    missing_reference = 0
 
     for clip in clips:
         label = f"{clip.dialogue.speaker_id}#{clip.index}"
+        if clip.performance_reference_path is None:
+            missing_reference += 1
+            continue
         try:
             original = profiler(Path(clip.performance_reference_path))
             generated = profiler(Path(clip.audio_path))
@@ -599,7 +621,9 @@ def measure_performance_preservation(
         comparisons.append(compare_profiles(original, generated, label=label))
 
     return PerformancePreservationReport(
-        comparisons=tuple(comparisons), unmeasured=unmeasured
+        comparisons=tuple(comparisons),
+        unmeasured=unmeasured,
+        missing_reference=missing_reference,
     )
 
 

@@ -655,7 +655,7 @@ def test_the_single_voice_engine_is_cached_per_settings(monkeypatch, tmp_path: P
 
 def test_an_unknown_single_voice_engine_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ConfigurationError, match="TTS_ENGINE"):
-        tts.load_tts_engine(settings=_settings(tmp_path, tts_engine="chatterbox"))
+        tts.load_tts_engine(settings=_settings(tmp_path, tts_engine="xtts"))
 
 
 def test_the_result_is_json_safe(monkeypatch, tmp_path: Path) -> None:

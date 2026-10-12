@@ -122,8 +122,8 @@ def _aligned(
         speech_duration=speech,
         rendered_pause_before=lead,
         rendered_pause_after=trail,
-        performance_engine="chatterbox-amharic",
-        style_engine="seed-vc-v2",
+        performance_engine="omnivoice",
+        style_engine="none",
     )
     return AlignedClip(
         index=index,
