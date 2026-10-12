@@ -338,7 +338,7 @@ environment, so values configured on the RunPod pod always win.
 | `DIARIZATION_MODEL` | Hugging Face pipeline id for diarization            | `pyannote/speaker-diarization-community-1` |
 | `DIARIZATION_MIN_SPEAKERS` | Fewest speakers diarization may report; unset lets it decide | *(unset)* |
 | `DIARIZATION_MAX_SPEAKERS` | Most speakers diarization may report; unset lets it decide | *(unset)* |
-| `SEPARATION_INFERENCE_BATCH_SIZE` | BandIt chunks per forward pass in the separation stage. The library defaults to **1**, which left a measured run spending 354 s of 590 s here; the chunks are independent, so batching is the same arithmetic with more of the GPU used | `8` |
+| `SEPARATION_INFERENCE_BATCH_SIZE` | BandIt chunks per forward pass in the separation stage. The library defaults to **1**, which left a measured run spending 354 s of 590 s here; the chunks are independent, so batching is the same arithmetic with more of the GPU used. Sized for the 48 GB A40, and an out-of-memory pass halves the batch instead of failing the run | `32` |
 | `TRANSCRIPTION_MODEL` | faster-whisper model for transcription            | `large-v3`         |
 | `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
 | `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |

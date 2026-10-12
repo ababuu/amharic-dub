@@ -101,14 +101,18 @@ DEFAULT_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
 
 #: How many of BandIt's 8-second chunks are pushed through the model per forward pass.
 #:
-#: The chunk handler defaults to one, which leaves a 48 GB card almost entirely idle: a
+#: The chunk handler defaults to one, which leaves an A40 almost entirely idle: a
 #: measured run spent **354 s of 590 s** in separation on a 135 s clip, because the
 #: 8 s / 1 s chunk geometry needs 8 forwards per second of audio and each one was sent
 #: alone. The chunks are independent - the handler flattens them into the batch
 #: dimension and the model reads each as its own sequence - so batching them is the same
-#: arithmetic with more of the GPU in use. Raise it further on a bigger card; lower it if
-#: a long film runs out of memory.
-DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE = 8
+#: arithmetic with more of the card in use.
+#:
+#: 32 is sized for the 48 GB card this project targets, where the per-chunk activations
+#: leave plenty of headroom. It is not a cliff: an out-of-memory error during
+#: separation halves the batch and retries rather than failing the run, so the cost of
+#: aiming high is a slower stage on a small card, never a failed one.
+DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE = 32
 
 #: Optional bounds on the number of speakers diarization may report, or ``None``
 #: to let the model decide. Supplying them is the strongest single guard against

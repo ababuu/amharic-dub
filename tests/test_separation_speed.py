@@ -312,3 +312,108 @@ def test_a_missing_stem_is_reported(tmp_path: Path) -> None:
 
     with pytest.raises(MissingStemError, match="effects"):
         separate_stems(source, tmp_path / "out", settings=_settings(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Aiming the batch at a 48 GB card without risking the run
+# ---------------------------------------------------------------------------
+
+
+class MemoryLimitedSession(FakeSession):
+    """A session that runs out of memory above a batch size, as a smaller card would."""
+
+    limit = 4
+    attempts: list[int] = []
+
+    def infer(self, audio, *, sample_rate):
+        batch = self._runtime.handler.inference_batch_size
+        MemoryLimitedSession.attempts.append(batch)
+        if batch > self.limit:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return super().infer(audio, sample_rate=sample_rate)
+
+
+def test_an_out_of_memory_batch_is_halved_instead_of_ending_the_run(
+    tmp_path: Path,
+) -> None:
+    """The default is sized for a 48 GB card; a smaller one must cost time, not the run."""
+
+    MemoryLimitedSession.attempts = []
+    separation.BanditSession = MemoryLimitedSession  # type: ignore[assignment]
+    source = _write_video_audio(tmp_path / "clip.wav", 1.0)
+
+    with pytest.warns(RuntimeWarning, match="ran out of memory"):
+        paths = separate_stems(
+            source,
+            tmp_path / "out",
+            settings=_settings(tmp_path, separation_inference_batch_size=32),
+        )
+
+    assert MemoryLimitedSession.attempts == [32, 16, 8, 4]
+    assert isinstance(paths, StemPaths)
+    # And the audio is still produced at the size that worked.
+    assert paths.speech.is_file()
+
+
+def test_an_out_of_memory_error_at_one_chunk_still_fails(tmp_path: Path) -> None:
+    """One chunk per forward is where the library started, so there is nowhere left to go."""
+
+    class AlwaysOutOfMemory(FakeSession):
+        attempts = 0
+
+        def infer(self, audio, *, sample_rate):
+            AlwaysOutOfMemory.attempts += 1
+            raise RuntimeError("CUDA out of memory")
+
+    separation.BanditSession = AlwaysOutOfMemory  # type: ignore[assignment]
+    source = _write_video_audio(tmp_path / "clip.wav", 1.0)
+
+    # It warns on each step down, which is the point: a slow run should say why.
+    with pytest.warns(RuntimeWarning, match="retrying with 1"):
+        with pytest.raises(separation.SeparationInferenceError, match="out of memory"):
+            separate_stems(
+                source,
+                tmp_path / "out",
+                settings=_settings(tmp_path, separation_inference_batch_size=32),
+            )
+
+    # 32, 16, 8, 4, 2, 1 - then it gives up rather than looping.
+    assert AlwaysOutOfMemory.attempts == 6
+
+
+def test_a_failure_that_is_not_memory_is_not_retried(tmp_path: Path) -> None:
+    """Retrying a device-side assert or a shape error would just fail six times slowly."""
+
+    class Broken(FakeSession):
+        attempts = 0
+
+        def infer(self, audio, *, sample_rate):
+            Broken.attempts += 1
+            raise RuntimeError("CUDA error: device-side assert triggered")
+
+    separation.BanditSession = Broken  # type: ignore[assignment]
+    source = _write_video_audio(tmp_path / "clip.wav", 1.0)
+
+    with pytest.raises(separation.SeparationInferenceError, match="device-side assert"):
+        separate_stems(source, tmp_path / "out", settings=_settings(tmp_path))
+
+    assert Broken.attempts == 1
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "CUDA out of memory. Tried to allocate 2.00 GiB",
+        "torch.cuda.OutOfMemoryError: CUDA out of memory",
+        "Out of memory: an allocation failed",
+    ],
+)
+def test_the_memory_error_is_recognised_by_its_message(message: str) -> None:
+    """Recognising it by text keeps torch out of this module's imports."""
+
+    assert separation._is_out_of_memory(RuntimeError(message))
+
+
+def test_an_unrelated_error_is_not_mistaken_for_memory() -> None:
+    assert not separation._is_out_of_memory(RuntimeError("invalid audio shape"))
+    assert not separation._is_out_of_memory(ValueError("sample rate must be 48000"))

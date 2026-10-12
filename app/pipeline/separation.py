@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -256,6 +257,66 @@ def _infer_segmented(
     return blended
 
 
+def _is_out_of_memory(exc: BaseException) -> bool:
+    """``True`` when ``exc`` is the GPU saying the request was too large.
+
+    Matched on the message rather than on ``torch.cuda.OutOfMemoryError`` so this module
+    keeps working without importing torch, and so a cuDNN or allocator variant that
+    raises a plain ``RuntimeError`` is recognised too.
+    """
+
+    return "out of memory" in str(exc).lower()
+
+
+def _release_cuda_cache() -> None:
+    """Give the freed blocks back before retrying with a smaller batch."""
+
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is a runtime dependency
+        return
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # pragma: no cover - a cache hint must never raise
+        pass
+
+
+def _infer_adaptively(
+    session: Any, audio: np.ndarray, sample_rate: int, batch_size: int
+) -> dict[str, np.ndarray]:
+    """Separate in the largest chunk batch that fits, halving it when it does not.
+
+    The default batch is sized for a 48 GB card. A card with less free memory than that
+    should cost a slower stage, not a failed run, so an out-of-memory error halves the
+    batch and tries again, down to one - which is where the library started, so there is
+    always a size that works.
+
+    The audio is identical at every batch size; only the time taken changes. A warning
+    is emitted on each step down so a slower-than-expected run has a stated reason
+    instead of looking like the setting was ignored.
+    """
+
+    current = max(1, int(batch_size))
+    while True:
+        _configure_chunking(session, current)
+        try:
+            return _infer_segmented(session, audio, sample_rate)
+        except Exception as exc:
+            if current == 1 or not _is_out_of_memory(exc):
+                raise
+            _release_cuda_cache()
+            smaller = max(1, current // 2)
+            warnings.warn(
+                f"BandIt ran out of memory with {current} chunks per forward pass; "
+                f"retrying with {smaller}. Lower "
+                f"SEPARATION_INFERENCE_BATCH_SIZE to silence this.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            current = smaller
+
+
 def _run_bandit(
     audio: np.ndarray, settings: Settings, weights_dir: Path
 ) -> Mapping[str, np.ndarray]:
@@ -277,8 +338,9 @@ def _run_bandit(
 
     try:
         session.load()
-        _configure_chunking(session, settings.separation_inference_batch_size)
-        return _infer_segmented(session, audio, REQUIRED_SAMPLE_RATE)
+        return _infer_adaptively(
+            session, audio, REQUIRED_SAMPLE_RATE, settings.separation_inference_batch_size
+        )
     except SeparationError:
         raise
     except Exception as exc:
