@@ -14,6 +14,7 @@ budget is patched down to a few seconds so a split happens at a test-sized input
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -355,6 +356,26 @@ def test_an_out_of_memory_batch_is_halved_instead_of_ending_the_run(
     assert paths.speech.is_file()
 
 
+def test_the_retry_warns_once_with_the_size_it_settled_on(tmp_path: Path) -> None:
+    """One actionable line, not one per halving: the recovery worked and that is the news."""
+
+    MemoryLimitedSession.attempts = []
+    separation.BanditSession = MemoryLimitedSession  # type: ignore[assignment]
+    source = _write_video_audio(tmp_path / "clip.wav", 1.0)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        separate_stems(
+            source,
+            tmp_path / "out",
+            settings=_settings(tmp_path, separation_inference_batch_size=32),
+        )
+
+    assert len(caught) == 1
+    assert "settled on 4" in str(caught[0].message)
+    assert "SEPARATION_INFERENCE_BATCH_SIZE=4" in str(caught[0].message)
+
+
 def test_an_out_of_memory_error_at_one_chunk_still_fails(tmp_path: Path) -> None:
     """One chunk per forward is where the library started, so there is nowhere left to go."""
 
@@ -368,16 +389,15 @@ def test_an_out_of_memory_error_at_one_chunk_still_fails(tmp_path: Path) -> None
     separation.BanditSession = AlwaysOutOfMemory  # type: ignore[assignment]
     source = _write_video_audio(tmp_path / "clip.wav", 1.0)
 
-    # It warns on each step down, which is the point: a slow run should say why.
-    with pytest.warns(RuntimeWarning, match="retrying with 1"):
-        with pytest.raises(separation.SeparationInferenceError, match="out of memory"):
-            separate_stems(
-                source,
-                tmp_path / "out",
-                settings=_settings(tmp_path, separation_inference_batch_size=32),
-            )
+    # It exhausts the sizes it can try and gives up, rather than looping.
+    with pytest.raises(separation.SeparationInferenceError, match="out of memory"):
+        separate_stems(
+            source,
+            tmp_path / "out",
+            settings=_settings(tmp_path, separation_inference_batch_size=32),
+        )
 
-    # 32, 16, 8, 4, 2, 1 - then it gives up rather than looping.
+    # 32, 16, 8, 4, 2, 1 - then the error is reported.
     assert AlwaysOutOfMemory.attempts == 6
 
 

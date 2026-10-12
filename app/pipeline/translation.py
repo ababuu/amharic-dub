@@ -63,11 +63,12 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, translation_provider_defaults
 from app.pipeline import nllb
 from app.pipeline.amharic_text import count_syllables, has_pronounceable_text, latin_spans
 from app.pipeline.dialogue_context import (
@@ -855,9 +856,173 @@ def _build(segment: TranscriptSegment, line_id: str, line: Any) -> AdaptedDialog
         ) from exc
 
 
+def _fallback_settings(settings: Settings) -> Settings | None:
+    """Return the settings for the fallback provider, or ``None`` if unusable.
+
+    The endpoint and model come from the *fallback* provider's own defaults, never from
+    the configured ones - carrying ``gemini-3.8-flash`` across to DeepSeek's host is
+    exactly the mistake the provider table exists to prevent. A provider with no
+    defaults (``other``) is skipped, because there is no address to guess.
+    """
+
+    name = (settings.translation_fallback_provider or "").strip().lower()
+    if not name or name == (settings.translation_provider or "").strip().lower():
+        return None
+
+    provider = translation_provider_defaults(name)
+    if not provider.base_url or not provider.model:
+        return None
+
+    candidate = replace(
+        settings,
+        translation_provider=provider.name,
+        translation_base_url=provider.base_url,
+        translation_model=provider.model,
+    )
+    # No key for the fallback means no fallback. Saying so is the caller's job.
+    if not candidate.translation_api_key:
+        return None
+    return candidate
+
+
+def _could_another_provider_succeed(exc: Exception) -> bool:
+    """``True`` when a *different* provider could plausibly answer this request.
+
+    The distinction matters because switching on the wrong kind of failure hides a bug
+    instead of surviving an outage. A status means the server understood the request and
+    refused it: 400 and 422 are our own bad request, so the other provider would refuse
+    it too - but an expired key, a rate limit, a missing model or a 5xx is the provider
+    being unavailable, which is exactly what the fallback is for. No status at all means
+    the request never arrived, which is the clearest case of all.
+    """
+
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        return True
+    if status in (401, 403, 404, 408, 409, 429):
+        return True
+    return status >= 500
+
+
+class _Failover:
+    """The provider a run is talking to, and the one it moves to if that fails.
+
+    Adaptation is a hosted call, so it is a single point of failure for a long run: a
+    rate limit, an outage or an expired key would otherwise end a film's translation
+    after hours of earlier work. The switch is **sticky** - once the first provider has
+    failed, the rest of the run goes straight to the fallback instead of spending a
+    failed request on every remaining batch - and it announces itself, because a run that
+    silently answered from a different model would be worse than one that stopped.
+
+    Lines already adapted are kept: the failure is survived, not re-paid for.
+    """
+
+    def __init__(self, client: Any, settings: Settings, *, fallback: Any = None) -> None:
+        self._client = client
+        self._settings = settings
+        self._fallback_client = fallback
+        self._fallback_settings = _fallback_settings(settings) if fallback else None
+        self.switched_from: str | None = None
+
+    @property
+    def current(self) -> tuple[Any, Settings]:
+        """The client and settings every request should use right now."""
+
+        return self._client, self._settings
+
+    @property
+    def available(self) -> bool:
+        """``True`` when a usable second provider is configured."""
+
+        return self._fallback_settings is not None
+
+    def send(self, build_kwargs: Any) -> Any:
+        """Send one request, moving to the fallback provider when the first one fails.
+
+        ``build_kwargs`` takes the settings to build for, because the two providers do
+        not share a request: the model name and the thinking field both differ, so the
+        body has to be rebuilt for whichever one is answering.
+        """
+
+        try:
+            return self._client.chat.completions.create(**build_kwargs(self._settings))
+        except TranslationError:
+            # Our own diagnosis - a bad setting, a missing key, an unusable endpoint.
+            # Wrapping it as a transport failure would hide a configuration mistake and
+            # invite a pointless retry on the other provider.
+            raise
+        except Exception as exc:
+            if not self.available or self.switched_from is not None:
+                raise _as_request_error(exc, self._settings) from exc
+            if not _could_another_provider_succeed(exc):
+                raise _as_request_error(exc, self._settings) from exc
+
+            self._announce(exc)
+            try:
+                return self._fallback_client.chat.completions.create(
+                    **build_kwargs(self._settings)
+                )
+            except TranslationError:
+                raise
+            except Exception as second:
+                raise _as_request_error(second, self._settings) from second
+
+    def _announce(self, exc: Exception) -> None:
+        """Move to the fallback and say so on stderr."""
+
+        assert self._fallback_settings is not None  # guarded by ``available``
+        self.switched_from = self._settings.translation_provider
+        self._client = self._fallback_client
+        self._settings = self._fallback_settings
+        warnings.warn(
+            f"{self.switched_from} failed ({type(exc).__name__}: {exc}); the rest of "
+            f"this run will use {self._settings.translation_provider} "
+            f"({self._settings.translation_model}).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def _build_failover(client: Any, settings: Settings) -> _Failover:
+    """Return the failover, building the second client only when it is usable.
+
+    A fallback whose key is missing is not a fallback, so no client is built for it: the
+    run reports that it has none rather than failing at the first request with a
+    credential error from a provider it was never meant to use.
+    """
+
+    fallback_settings = _fallback_settings(settings)
+    if fallback_settings is None:
+        return _Failover(client, settings)
+
+    try:
+        fallback_client = _build_client(
+            fallback_settings, fallback_settings.translation_api_key
+        )
+    except TranslationError:
+        # An unusable fallback must not stop a run that may never need it. The report
+        # says which provider is missing a key, so it is not silent.
+        return _Failover(client, settings)
+
+    return _Failover(client, settings, fallback=fallback_client)
+
+
+def describe_fallback(settings: Settings) -> str:
+    """Describe what the fallback will do, so a run cannot hide that it has none."""
+
+    name = (settings.translation_fallback_provider or "").strip()
+    if not name:
+        return "no fallback provider configured"
+    if _fallback_settings(settings) is None:
+        provider = translation_provider_defaults(name)
+        return (
+            f"{name} fallback unavailable: set {provider.api_key_env} to enable it"
+        )
+    return f"falls back to {name} if {settings.translation_provider} fails"
+
+
 def _adapt_batch(
-    client: Any,
-    settings: Settings,
+    failover: _Failover,
     batch: list[TranscriptSegment],
     ids: list[str],
     *,
@@ -872,14 +1037,11 @@ def _adapt_batch(
     was given the first time.
     """
 
-    kwargs = _request_kwargs(
-        settings, batch, ids, context=context, budgets=budgets, rewrite=rewrite
+    response = failover.send(
+        lambda settings: _request_kwargs(
+            settings, batch, ids, context=context, budgets=budgets, rewrite=rewrite
+        )
     )
-
-    try:
-        response = client.chat.completions.create(**kwargs)
-    except Exception as exc:
-        raise _as_request_error(exc, settings) from exc
 
     lines = _parse_response(_response_content(response), ids)
     return [_build(segment, line_id, lines[line_id]) for segment, line_id in zip(batch, ids)]
@@ -949,8 +1111,7 @@ def _is_improvement(
 
 
 def _reduce_overshooting_lines(
-    client: Any,
-    settings: Settings,
+    failover: _Failover,
     batch: list[TranscriptSegment],
     first_position: int,
     adapted: list[AdaptedDialogue],
@@ -1014,8 +1175,7 @@ def _reduce_overshooting_lines(
             )
 
     retried = _adapt_batch(
-        client,
-        settings,
+        failover,
         [batch[index] for index in offenders],
         ids,
         context=context,
@@ -1035,8 +1195,7 @@ def _reduce_overshooting_lines(
             adapted[slot] = line
 
     return _reduce_again(
-        client,
-        settings,
+        failover,
         batch,
         first_position,
         adapted,
@@ -1051,8 +1210,7 @@ def _reduce_overshooting_lines(
 
 
 def _reduce_again(
-    client: Any,
-    settings: Settings,
+    failover: _Failover,
     batch: list[TranscriptSegment],
     first_position: int,
     adapted: list[AdaptedDialogue],
@@ -1125,8 +1283,7 @@ def _reduce_again(
             )
 
     retried = _adapt_batch(
-        client,
-        settings,
+        failover,
         [batch[index] for index in offenders],
         ids,
         context=context,
@@ -1143,8 +1300,7 @@ def _reduce_again(
             adapted[slot] = line
 
     return _reduce_again(
-        client,
-        settings,
+        failover,
         batch,
         first_position,
         adapted,
@@ -1377,6 +1533,7 @@ def adapt_dialogue(
     api_key = _require_api_key(settings)
     batch_size = _resolve_batch_size(settings)
     client = _build_client(settings, api_key)
+    failover = _build_failover(client, settings)
 
     resolved_scenes = segment_scenes(transcript) if scenes is None else tuple(scenes)
 
@@ -1410,12 +1567,11 @@ def adapt_dialogue(
         )
 
         produced = _adapt_batch(
-            client, settings, batch, ids, context=context, budgets=budgets
+            failover, batch, ids, context=context, budgets=budgets
         )
         if enforce_budget or enforce_fidel_loanwords:
             produced, _ = _reduce_overshooting_lines(
-                client,
-                settings,
+                failover,
                 batch,
                 first_position,
                 produced,
@@ -1455,4 +1611,5 @@ __all__ = [
     "TranslationError",
     "adapt_dialogue",
     "describe_thinking",
+    "describe_fallback",
 ]

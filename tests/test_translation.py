@@ -20,7 +20,9 @@ import pytest
 from app.config import (
     DEFAULT_TRANSLATION_BASE_URL,
     DEFAULT_TRANSLATION_BATCH_SIZE,
+    DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL,
     DEFAULT_TRANSLATION_DEEPSEEK_MODEL,
+    DEFAULT_TRANSLATION_FALLBACK_PROVIDER,
     DEFAULT_TRANSLATION_GEMINI_MODEL,
     DEFAULT_TRANSLATION_MODEL,
     Settings,
@@ -43,6 +45,18 @@ from app.pipeline.translation import (
     TranslationError,
     adapt_dialogue,
 )
+
+
+class _StatusError(Exception):
+    """Stand-in for an SDK error that carries an HTTP status.
+
+    The failover decides whether another provider could answer from this number, so the
+    fake has to expose it the way the real client does.
+    """
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
 
 
 class FakeMessage:
@@ -72,7 +86,6 @@ class FakeCompletions:
 
 class FakeOpenAI:
     """Stand-in for ``openai.OpenAI`` recording every interaction."""
-
     # Recorded state, reset by :func:`_patch`.
     init_kwargs: list[dict[str, object]] = []
     requests: list[dict[str, object]] = []
@@ -404,9 +417,47 @@ def test_the_provider_decides_which_key_reaches_the_client(monkeypatch):
     )
 
     # The key for the *configured* provider, not whichever one happens to be set.
-    ((sent,),) = [tuple(FakeOpenAI.init_kwargs)]
-    assert sent["api_key"] == "gemini-key"
-    assert sent["base_url"] == "https://example.test/v1"
+    primary = FakeOpenAI.init_kwargs[0]
+    assert primary["api_key"] == "gemini-key"
+    assert primary["base_url"] == "https://example.test/v1"
+
+
+def test_the_fallback_gets_its_own_endpoint_not_the_primary_one(monkeypatch):
+    """Carrying the configured endpoint across is how a key reaches the wrong host."""
+
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [_segment()],
+        settings=_settings(
+            translation_provider="gemini",
+            gemini_api_key="gemini-key",
+            deepseek_api_key="deepseek-key",
+            translation_base_url="https://example.test/v1",
+        ),
+    )
+
+    (_, fallback) = FakeOpenAI.init_kwargs
+    assert fallback["api_key"] == "deepseek-key"
+    assert fallback["base_url"] == DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL
+    assert fallback["base_url"] != "https://example.test/v1"
+
+
+def test_no_fallback_client_is_built_without_a_key_for_it(monkeypatch):
+    """A fallback whose key is missing is not a fallback, so nothing is built for it."""
+
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [_segment()],
+        settings=_settings(
+            translation_provider="gemini",
+            gemini_api_key="gemini-key",
+            deepseek_api_key=None,
+        ),
+    )
+
+    assert len(FakeOpenAI.init_kwargs) == 1
 
 
 def test_the_instruction_backend_uses_its_configured_model(monkeypatch):
@@ -764,6 +815,172 @@ def test_a_reply_that_is_not_a_json_object_is_still_rejected(monkeypatch):
 
     with pytest.raises(MalformedResponseError):
         adapt_dialogue([_segment()], settings=_settings())
+
+
+# ---------------------------------------------------------------------------
+# Falling back to a second provider
+#
+# Adaptation is a hosted call, so it is a single point of failure for a run that may
+# have hours of work behind it. These tests pin both halves of that: a provider that
+# is *unavailable* is survived, and a request that is simply *wrong* is not retried
+# somewhere else, which would hide the bug instead of surviving an outage.
+# ---------------------------------------------------------------------------
+
+
+def _fallback_settings(**overrides) -> Settings:
+    """Settings whose fallback is usable, so a switch is possible at all."""
+
+    values: dict[str, object] = {
+        "translation_provider": "gemini",
+        "translation_model": DEFAULT_TRANSLATION_GEMINI_MODEL,
+        "translation_base_url": DEFAULT_TRANSLATION_BASE_URL,
+        "gemini_api_key": "gemini-key",
+        "deepseek_api_key": "deepseek-key",
+        "translation_fallback_provider": "deepseek",
+    }
+    values.update(overrides)
+    return _settings(**values)
+
+
+def test_an_unavailable_provider_is_survived_by_the_fallback(monkeypatch):
+    """The whole point: a rate limit or an outage must not end a film's translation."""
+
+    _patch(monkeypatch)
+    # The first request fails with a rate limit; the fallback then answers normally.
+    FakeOpenAI.error = _StatusError(429)
+    FakeOpenAI.fail_on = 1
+
+    with pytest.warns(RuntimeWarning, match="rest of this run will use deepseek"):
+        lines = adapt_dialogue([_segment()], settings=_fallback_settings())
+
+    assert [line.amharic for line in lines] == ["የአማርኛ መስመር dialogue_000001"]
+    # The retry went to the second client, and the first was asked exactly once.
+    assert FakeOpenAI.requests[0]["model"] == DEFAULT_TRANSLATION_GEMINI_MODEL
+    assert FakeOpenAI.requests[1]["model"] == DEFAULT_TRANSLATION_DEEPSEEK_MODEL
+    assert len(FakeOpenAI.requests) >= 2
+    # The thinking field is provider-specific, so it must be rebuilt for the fallback.
+    assert "reasoning_effort" not in FakeOpenAI.requests[1]
+
+
+def test_the_fallback_is_sticky_across_batches(monkeypatch):
+    """One failure must cost one retry, not one per batch for the rest of the film."""
+
+    _patch(monkeypatch)
+    FakeOpenAI.error = _StatusError(429)
+    FakeOpenAI.fail_on = 1
+
+    with pytest.warns(RuntimeWarning):
+        adapt_dialogue(
+            [_segment(), _segment(start=20.0, end=24.0)],
+            settings=_fallback_settings(translation_batch_size=1),
+        )
+
+    models = [request["model"] for request in FakeOpenAI.requests]
+    # gemini(429) -> deepseek, then deepseek straight away for the second batch.
+    assert models[0] == DEFAULT_TRANSLATION_GEMINI_MODEL
+    assert set(models[1:]) == {DEFAULT_TRANSLATION_DEEPSEEK_MODEL}
+
+
+def test_a_bad_request_is_not_retried_on_the_other_provider(monkeypatch):
+    """400 means the server understood and refused; the other one would refuse it too."""
+
+    _patch(monkeypatch)
+    FakeOpenAI.error = _StatusError(400)
+
+    with pytest.raises(ApiRequestError):
+        adapt_dialogue([_segment()], settings=_fallback_settings())
+
+    assert len(FakeOpenAI.requests) == 1
+
+
+def test_a_rejected_key_falls_back(monkeypatch):
+    """An expired key is exactly the failure a second provider exists to survive."""
+
+    _patch(monkeypatch)
+    FakeOpenAI.error = _StatusError(401)
+    FakeOpenAI.fail_on = 1
+
+    with pytest.warns(RuntimeWarning):
+        lines = adapt_dialogue([_segment()], settings=_fallback_settings())
+
+    assert len(lines) == 1
+
+
+def test_a_network_failure_falls_back(monkeypatch):
+    """No status means the request never arrived, which is the clearest case of all."""
+
+    _patch(monkeypatch)
+    FakeOpenAI.error = ConnectionError("connection reset")
+    FakeOpenAI.fail_on = 1
+
+    with pytest.warns(RuntimeWarning):
+        lines = adapt_dialogue([_segment()], settings=_fallback_settings())
+
+    assert len(lines) == 1
+
+
+def test_a_configuration_error_is_not_dressed_up_as_a_provider_failure(monkeypatch):
+    """Our own bad setting must surface as one, not as a request that failed."""
+
+    _patch(monkeypatch)
+
+    with pytest.raises(ConfigurationError):
+        adapt_dialogue(
+            [_segment()],
+            settings=_fallback_settings(translation_thinking="maximum"),
+        )
+
+    assert not FakeOpenAI.requests
+
+
+def test_without_a_fallback_key_a_failure_is_still_reported(monkeypatch):
+    """No fallback means no rescue, and the original diagnosis has to survive."""
+
+    _patch(monkeypatch)
+    FakeOpenAI.error = _StatusError(429)
+
+    with pytest.raises(ApiRequestError):
+        adapt_dialogue(
+            [_segment()], settings=_fallback_settings(deepseek_api_key=None)
+        )
+
+
+def test_the_report_says_whether_a_fallback_is_actually_available():
+    """A run that learned it had no fallback only on failure learned too late."""
+
+    assert "no fallback" in translation.describe_fallback(
+        _settings(translation_fallback_provider="")
+    )
+    assert "DEEPSEEK_API_KEY" in translation.describe_fallback(
+        _fallback_settings(deepseek_api_key=None)
+    )
+    assert "falls back to deepseek" in translation.describe_fallback(_fallback_settings())
+
+
+def test_a_provider_cannot_fall_back_to_itself():
+    """Otherwise a failure would pointlessly rebuild the same request."""
+
+    assert (
+        translation._fallback_settings(
+            _fallback_settings(translation_fallback_provider="gemini")
+        )
+        is None
+    )
+
+
+def test_the_fallback_defaults_to_the_other_hosted_provider():
+    """The mechanism is useful out of the box, not only when someone configures it."""
+
+    assert DEFAULT_TRANSLATION_FALLBACK_PROVIDER == "deepseek"
+    assert (
+        Settings(
+            input_dir=Path("i"),
+            work_dir=Path("w"),
+            output_dir=Path("o"),
+            model_cache_dir=Path("m"),
+        ).translation_fallback_provider
+        == "deepseek"
+    )
 
 
 def test_system_prompt_demands_spoken_amharic_adaptation():

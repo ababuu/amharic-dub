@@ -287,34 +287,40 @@ def _infer_adaptively(
 ) -> dict[str, np.ndarray]:
     """Separate in the largest chunk batch that fits, halving it when it does not.
 
-    The default batch is sized for a 48 GB card. A card with less free memory than that
-    should cost a slower stage, not a failed run, so an out-of-memory error halves the
-    batch and tries again, down to one - which is where the library started, so there is
-    always a size that works.
+    A batch that is too large for the card should cost a slower stage, not a failed run,
+    so an out-of-memory error halves the batch and tries again down to one - which is
+    where the library itself started, so a size that works always exists.
 
-    The audio is identical at every batch size; only the time taken changes. A warning
-    is emitted on each step down so a slower-than-expected run has a stated reason
-    instead of looking like the setting was ignored.
+    It warns once, at the end, naming the size it settled on: a run that retried should
+    say so, but a warning per step would bury that under three lines of noise about a
+    recovery that worked.
+
+    The audio is identical at every batch size; only the time taken changes.
     """
 
     current = max(1, int(batch_size))
+    asked = current
+
     while True:
         _configure_chunking(session, current)
         try:
-            return _infer_segmented(session, audio, sample_rate)
+            stems = _infer_segmented(session, audio, sample_rate)
         except Exception as exc:
             if current == 1 or not _is_out_of_memory(exc):
                 raise
             _release_cuda_cache()
-            smaller = max(1, current // 2)
+            current = max(1, current // 2)
+            continue
+
+        if current != asked:
             warnings.warn(
-                f"BandIt ran out of memory with {current} chunks per forward pass; "
-                f"retrying with {smaller}. Lower "
-                f"SEPARATION_INFERENCE_BATCH_SIZE to silence this.",
+                f"BandIt ran out of memory with {asked} chunks per forward pass and "
+                f"settled on {current}. Set SEPARATION_INFERENCE_BATCH_SIZE={current} "
+                "to start there and skip the retries.",
                 RuntimeWarning,
                 stacklevel=2,
             )
-            current = smaller
+        return stems
 
 
 def _run_bandit(

@@ -553,6 +553,9 @@ def run_pipeline(
             f"{resolved.translation_model} "
             f"({translation.describe_thinking(resolved)})"
         )
+        # Whether a second provider is standing by is worth stating: a run that found
+        # out only when the first one failed would have found out too late.
+        report(f"  adaptation fallback: {translation.describe_fallback(resolved)}")
         # Only the instruction-following backend reads the bible, so only it can report
         # having applied one.
         if bible:
@@ -790,6 +793,7 @@ def _provenance(settings: Settings) -> dict[str, Any]:
         # requested level was available, and a manifest must not claim reasoning the
         # request never carried.
         provenance["translation_thinking"] = translation.describe_thinking(settings)
+        provenance["translation_fallback"] = translation.describe_fallback(settings)
     else:
         # NLLB is a local checkpoint, so it is the path that identifies it.
         provenance["translation_model"] = settings.translation_model

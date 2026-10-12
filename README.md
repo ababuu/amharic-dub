@@ -361,6 +361,7 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSLATION_BASE_URL` | OpenAI-compatible endpoint (only for `TRANSLATION_BACKEND=openai`). Unset, it follows `TRANSLATION_PROVIDER`; required for `other` | per provider |
 | `TRANSLATION_BATCH_SIZE` | Dialogue lines adapted per request           | `10`               |
 | `TRANSLATION_THINKING` | How much the model may reason before answering: `off`, `low`, `medium`, `high`, or `default` to send no thinking field at all. Mapped onto whatever the provider understands; the run reports what it actually sent | `medium` |
+| `TRANSLATION_FALLBACK_PROVIDER` | Provider to move to when the configured one fails, so a rate limit or an outage cannot end a film's translation. Sticky once it triggers, and announced; needs that provider's key. Not used for 400/422, which the second provider would refuse too | `deepseek` |
 | `TRANSLATION_ENFORCE_BUDGET` | Send a line that is over its syllable budget back once to be shortened | `true` |
 | `TRANSLATION_ENFORCE_FIDEL_LOANWORDS` | Send a line that still carries Roman-script text back once to be written in Fidel | `true` |
 | `VOICE_PROFILE_DIR` | Per-speaker voice profiles directory                | `$WORK_DIR/voices` |

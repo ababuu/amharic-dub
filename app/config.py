@@ -108,11 +108,12 @@ DEFAULT_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
 #: dimension and the model reads each as its own sequence - so batching them is the same
 #: arithmetic with more of the card in use.
 #:
-#: 32 is sized for the 48 GB card this project targets, where the per-chunk activations
-#: leave plenty of headroom. It is not a cliff: an out-of-memory error during
-#: separation halves the batch and retries rather than failing the run, so the cost of
-#: aiming high is a slower stage on a small card, never a failed one.
-DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE = 32
+#: 8 is the measured ceiling on the 48 GB A40 this project targets, not a guess: 32 and
+#: 16 both ran out of memory there, and 8 completed. The peak is dominated by the
+#: per-chunk band features rather than by the weights, so a bigger card can take more -
+#: and raising this is safe, because an out-of-memory pass halves the batch and retries
+#: rather than failing the run.
+DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE = 8
 
 #: Optional bounds on the number of speakers diarization may report, or ``None``
 #: to let the model decide. Supplying them is the strongest single guard against
@@ -207,6 +208,15 @@ DEFAULT_TRANSLATION_GEMINI_BASE_URL = (
 #: ``off`` is honest about being a request rather than a guarantee: Gemini 3 models
 #: cannot disable reasoning, so on that provider it selects the lowest level available.
 DEFAULT_TRANSLATION_THINKING = "medium"
+
+#: The provider a run moves to when the configured one fails, or ``""`` to disable.
+#:
+#: Adaptation is a hosted call, which makes it a single point of failure for a long run:
+#: a rate limit, an outage or an expired key would otherwise end a film's translation
+#: after hours of earlier work. The fallback is only used when its own key is present,
+#: and a switch is sticky - the failed provider is not asked again for each remaining
+#: batch - so one failure costs one retry rather than one per line.
+DEFAULT_TRANSLATION_FALLBACK_PROVIDER = "deepseek"
 
 #: The model the other instruction-following provider asks for by default. Measured
 #: against the test film's real 42-line transcript, ``deepseek-v4-pro`` produced 426
@@ -775,6 +785,9 @@ class Settings:
     translation_batch_size: int = DEFAULT_TRANSLATION_BATCH_SIZE
     #: ``off``/``low``/``medium``/``high``. See :data:`DEFAULT_TRANSLATION_THINKING`.
     translation_thinking: str = DEFAULT_TRANSLATION_THINKING
+    #: Provider to move to when the configured one fails. See
+    #: :data:`DEFAULT_TRANSLATION_FALLBACK_PROVIDER`.
+    translation_fallback_provider: str = DEFAULT_TRANSLATION_FALLBACK_PROVIDER
     translation_num_beams: int = DEFAULT_TRANSLATION_NUM_BEAMS
     translation_max_new_tokens: int = DEFAULT_TRANSLATION_MAX_NEW_TOKENS
     translation_length_penalty: float = DEFAULT_TRANSLATION_LENGTH_PENALTY
@@ -892,6 +905,13 @@ class Settings:
             translation_thinking=(
                 _read_env("TRANSLATION_THINKING", DEFAULT_TRANSLATION_THINKING)
                 or DEFAULT_TRANSLATION_THINKING
+            ).lower(),
+            translation_fallback_provider=(
+                _read_env(
+                    "TRANSLATION_FALLBACK_PROVIDER",
+                    DEFAULT_TRANSLATION_FALLBACK_PROVIDER,
+                )
+                or DEFAULT_TRANSLATION_FALLBACK_PROVIDER
             ).lower(),
             translation_num_beams=_read_int(
                 "TRANSLATION_NUM_BEAMS", DEFAULT_TRANSLATION_NUM_BEAMS
@@ -1087,6 +1107,7 @@ class Settings:
             "translation_model": self.translation_model,
             "translation_base_url": self.translation_base_url,
             "translation_thinking": self.translation_thinking,
+            "translation_fallback_provider": self.translation_fallback_provider,
             "translation_batch_size": self.translation_batch_size,
             "translation_num_beams": self.translation_num_beams,
             "translation_max_new_tokens": self.translation_max_new_tokens,
@@ -1169,6 +1190,7 @@ __all__ = [
     "DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL",
     "DEFAULT_TRANSLATION_DEEPSEEK_MODEL",
     "DEFAULT_TRANSLATION_THINKING",
+    "DEFAULT_TRANSLATION_FALLBACK_PROVIDER",
     "TRANSLATION_PROVIDERS",
     "TRANSLATION_THINKING_LEVELS",
     "TranslationProvider",
