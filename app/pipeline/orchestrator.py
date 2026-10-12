@@ -596,6 +596,32 @@ def run_pipeline(
                 "needs one identity reference per speaker"
             )
 
+        # A reference cut from the film is the original actor speaking English, which the
+        # cloning engine then carries into the Amharic as a foreign accent. Native-speaker
+        # recordings replace that at its source, so they are applied here - once, to the
+        # profiles every later stage reads - rather than anywhere near synthesis.
+        samples = voice_profiles.available_voice_samples(resolved.voice_sample_dir)
+        if samples:
+            profiles = _stage(
+                "voice_samples",
+                seconds,
+                report,
+                voice_profiles.apply_voice_samples,
+                profiles,
+                settings=resolved,
+                transcribe=transcription.build_amharic_transcriber(
+                    resolved, language="am"
+                ),
+            )
+            voices = sorted(
+                f"{speaker} -> {Path(profile.reference_audio).name}"
+                for speaker, profile in profiles.items()
+            )
+            report(
+                f"  voice samples: {len(samples)} recording(s) replaced the film's own "
+                f"audio ({', '.join(speaker for speaker in voices)})"
+            )
+
     spoken = dialogue
     if max_lines is not None and max_lines < len(dialogue):
         if max_lines < 0:

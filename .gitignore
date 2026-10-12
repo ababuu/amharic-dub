@@ -78,6 +78,15 @@ torch_cache/
 *.mov
 *.webm
 
+# Native-speaker voice samples are pipeline *inputs*, not artifacts: the GPU worker
+# needs them to give each character an Amharic voice instead of the film's own English
+# audio, exactly as it needs the test clip above. They are a few hundred KB each. These
+# negations have to come after the media block, because the last matching rule wins.
+!data/voice-samples/*.mp3
+!data/voice-samples/*.wav
+!data/voice-samples/*.flac
+!data/voice-samples/*.m4a
+
 # ---------------------------------------------------------------------------
 # JSON manifests generated during processing
 # ---------------------------------------------------------------------------

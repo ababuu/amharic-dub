@@ -46,6 +46,10 @@ def _settings(root: Path, **overrides: object) -> Settings:
         "output_dir": root / "out",
         "model_cache_dir": root / "cache",
         "voice_profile_dir": root / "voices",
+        # Pointed at a path that does not exist so a test never picks up the real
+        # native-speaker samples in `data/voice-samples`: those switch the run to a
+        # Whisper transcription of each sample, which is not what these tests exercise.
+        "voice_sample_dir": root / "voice-samples",
         "dialogue_bible_path": root / "work" / "dialogue_bible.json",
         # These tests exercise the per-character path, which needs voice profiles,
         # so they pin the engine that uses them rather than inheriting the default.
@@ -604,6 +608,68 @@ def test_the_bible_is_reported_as_applied_only_when_it_is(
     reported = " ".join(messages)
     assert "dialogue bible: 1 character(s) applied" in reported
     assert "NLLB translates line by line" not in reported
+
+
+def test_voice_samples_replace_the_films_own_references(
+    tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wiring is where this can quietly do nothing, so it is asserted end to end.
+
+    A real sample file is written and the real ``apply_voice_samples`` runs, but the
+    transcriber is replaced: loading Whisper inside a unit test would download a model,
+    and what is being checked here is that the orchestration hands the samples to the
+    stage that reads them.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    from app.pipeline import orchestrator as orchestrator_module
+
+    samples = tmp_path / "samples"
+    samples.mkdir()
+    sf.write(
+        str(samples / "native.wav"),
+        (np.random.default_rng(0).standard_normal(20 * 44_100) * 0.3).astype(np.float32),
+        44_100,
+        subtype="PCM_16",
+    )
+    monkeypatch.setattr(
+        orchestrator_module.transcription,
+        "build_amharic_transcriber",
+        lambda *_, **__: (lambda path: "ሰላም"),
+    )
+    settings = _settings(tmp_path, voice_sample_dir=samples)
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+
+    reported = " ".join(messages)
+    assert "voice samples" in reported
+    # The TTS stage must receive the trimmed sample, not the film's own audio. Read from
+    # the fake's record of the call: the fixture's own dict is the *input* to the
+    # replacement, so asserting on that would pass whether or not the wiring worked.
+    (_dialogue, _speech, received, passed_settings) = stages.received["tts"]
+    (profile,) = received.values()
+    assert profile.reference_audio.name == "sample_reference.wav"
+    assert profile.reference_text == "ሰላም"
+    assert profile.reference_audio.exists()
+
+
+def test_without_samples_the_films_own_references_are_used(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """The mechanism is additive: no recordings, no change in behaviour."""
+
+    settings = _settings(tmp_path, voice_sample_dir=tmp_path / "empty")
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+
+    assert "voice samples" not in " ".join(messages)
+    (_dialogue, _speech, received, passed_settings) = stages.received["tts"]
+    (profile,) = received.values()
+    assert profile.reference_audio == stages.profiles["SPEAKER_00"].reference_audio
+    assert profile.reference_text != "ሰላም"
 
 
 def test_the_adaptation_report_names_the_model_and_what_it_was_asked_for(

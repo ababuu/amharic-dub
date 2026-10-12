@@ -316,6 +316,23 @@ DEFAULT_VOICE_REFERENCE_MIN_DURATION = 3.0
 DEFAULT_VOICE_REFERENCE_TARGET_DURATION = 10.0
 DEFAULT_VOICE_REFERENCE_MAX_DURATION = 15.0
 
+#: Directory of recordings of native Amharic voices, one file per character voice.
+#:
+#: A reference cut from the film is the original actor speaking **English**, and the
+#: cloning engine conditions on its reference: the delivered Amharic then carries that
+#: performance's phonetics, which is heard as a heavy English accent. A reference
+#: recorded by a native Amharic speaker removes that, because the audio *and* its
+#: transcript are then Amharic. Empty disables the mechanism, falling back to the film's
+#: own audio as before.
+DEFAULT_VOICE_SAMPLE_DIR = PROJECT_ROOT / "data" / "voice-samples"
+
+#: Which sample each speaker uses, as ``SPEAKER_00=meseret.mp3,SPEAKER_01=eleni.mp3``.
+#:
+#: Speakers left out take the remaining files in sorted order, so two samples and two
+#: speakers need no configuration at all. The samples may be any length: each is trimmed
+#: to a cloning reference and transcribed before use.
+DEFAULT_VOICE_SAMPLE_MAP = ""
+
 #: Amharic speech engine consumed by :mod:`app.pipeline.tts`.
 #:
 #: ``"omnivoice"`` is k2-fsa's OmniVoice: a zero-shot model covering hundreds of
@@ -805,6 +822,10 @@ class Settings:
     voice_reference_min_duration: float = DEFAULT_VOICE_REFERENCE_MIN_DURATION
     voice_reference_target_duration: float = DEFAULT_VOICE_REFERENCE_TARGET_DURATION
     voice_reference_max_duration: float = DEFAULT_VOICE_REFERENCE_MAX_DURATION
+    #: Directory of native-speaker recordings used instead of the film's own audio, and
+    #: an optional ``SPEAKER=file`` list saying which voice each speaker gets.
+    voice_sample_dir: Path = DEFAULT_VOICE_SAMPLE_DIR
+    voice_sample_map: str = DEFAULT_VOICE_SAMPLE_MAP
     #: Persistent character/consistency state handed to dialogue adaptation.
     dialogue_bible_path: Path = DEFAULT_DIALOGUE_BIBLE_PATH
     #: TTS settings for :mod:`app.pipeline.tts`: the Amharic speech adapter and the
@@ -949,6 +970,11 @@ class Settings:
             ),
             voice_reference_max_duration=_read_float(
                 "VOICE_REFERENCE_MAX_DURATION", DEFAULT_VOICE_REFERENCE_MAX_DURATION
+            ),
+            voice_sample_dir=_read_path("VOICE_SAMPLE_DIR", DEFAULT_VOICE_SAMPLE_DIR),
+            voice_sample_map=(
+                _read_env("VOICE_SAMPLE_MAP", DEFAULT_VOICE_SAMPLE_MAP)
+                or DEFAULT_VOICE_SAMPLE_MAP
             ),
             dialogue_bible_path=_read_path(
                 "DIALOGUE_BIBLE_PATH", work_dir / DEFAULT_DIALOGUE_BIBLE_FILENAME
@@ -1125,6 +1151,8 @@ class Settings:
             "voice_reference_min_duration": self.voice_reference_min_duration,
             "voice_reference_target_duration": self.voice_reference_target_duration,
             "voice_reference_max_duration": self.voice_reference_max_duration,
+            "voice_sample_dir": str(self.voice_sample_dir),
+            "voice_sample_map": self.voice_sample_map,
             "dialogue_bible_path": str(self.dialogue_bible_path),
             "tts_model": self.tts_model,
             "tts_engine": self.tts_engine,
@@ -1211,6 +1239,8 @@ __all__ = [
     "DEFAULT_TIMING_MIN_TEMPO",
     "DEFAULT_VOICE_PROFILE_DIR",
     "DEFAULT_VOICE_REFERENCE_MAX_DURATION",
+    "DEFAULT_VOICE_SAMPLE_DIR",
+    "DEFAULT_VOICE_SAMPLE_MAP",
     "DEFAULT_VOICE_REFERENCE_MIN_DURATION",
     "DEFAULT_VOICE_REFERENCE_TARGET_DURATION",
     "PROJECT_ROOT",

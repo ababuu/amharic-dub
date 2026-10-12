@@ -129,7 +129,7 @@ import math
 import re
 import shutil
 import subprocess
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Any
@@ -1607,9 +1607,290 @@ def build_voice_profiles(
     return profiles
 
 
+# ---------------------------------------------------------------------------
+# Native-speaker voice samples
+# ---------------------------------------------------------------------------
+
+
+#: Audio containers an operator's own recordings may arrive in. MP3 is the common one -
+#: a recording made on a phone or downloaded from a voice bank is rarely a WAV - and
+#: ``soundfile`` reads it through libsndfile on the builds this project targets.
+VOICE_SAMPLE_SUFFIXES: tuple[str, ...] = (
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".opus",
+)
+
+#: Name of the trimmed reference cut from a native-speaker sample. Deliberately not
+#: ``reference.wav``: that name belongs to the window taken from the film, and keeping the
+#: two apart means switching the mechanism back does not have to overwrite anything.
+SAMPLE_REFERENCE_FILENAME = "sample_reference.wav"
+
+#: How loud a sample has to be, relative to its own peak, to count as speech rather than
+#: room tone. A recording normally opens with a breath or a moment of noise, and starting
+#: the reference there spends part of a short window on nothing.
+_SAMPLE_SPEECH_THRESHOLD = 0.02
+
+
+class MissingVoiceSampleError(VoiceProfileError):
+    """A configured native-speaker sample is absent or unreadable."""
+
+
+def available_voice_samples(directory: str | Path) -> list[Path]:
+    """Return the sample recordings in ``directory``, in a stable order.
+
+    Sorted rather than arbitrary, because the assignment has to be the same on every run:
+    a character whose voice changed between runs would be a bug nobody could see in the
+    logs. An absent directory is not an error - it means the mechanism is switched off.
+    """
+
+    base = Path(directory)
+    if not base.is_dir():
+        return []
+    return sorted(
+        path
+        for path in base.iterdir()
+        if path.is_file() and path.suffix.lower() in VOICE_SAMPLE_SUFFIXES
+    )
+
+
+def assign_voice_samples(
+    speakers: Iterable[str], samples: Sequence[Path], *, mapping: str = ""
+) -> dict[str, Path]:
+    """Return the sample each speaker should use.
+
+    ``mapping`` is ``SPEAKER_00=file.mp3,SPEAKER_01=other.mp3`` and wins where it names a
+    speaker, so an operator can put the female voice on the female character without the
+    numbering having to line up. Any speaker it leaves out takes the files in order,
+    skipping the ones the mapping already used: two samples and two speakers then need no
+    configuration at all and still get one voice each.
+
+    Raises
+    ------
+    MissingVoiceSampleError
+        The mapping names a file that is not among the samples.
+    """
+
+    ordered = [speaker for speaker in dict.fromkeys(speakers)]
+    if not ordered or not samples:
+        return {}
+
+    by_name = {path.name: path for path in samples}
+    chosen: dict[str, Path] = {}
+    taken: set[Path] = set()
+
+    for entry in (mapping or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        speaker, separator, filename = entry.partition("=")
+        speaker, filename = speaker.strip(), filename.strip()
+        if not separator or not speaker or not filename:
+            raise ConfigurationError(
+                f"VOICE_SAMPLE_MAP entries look like SPEAKER_00=file.mp3, got {entry!r}"
+            )
+        sample = by_name.get(Path(filename).name)
+        if sample is None:
+            raise MissingVoiceSampleError(
+                f"VOICE_SAMPLE_MAP names {filename!r} for {speaker!r}, but no such file "
+                f"is among the {len(samples)} sample(s) available"
+            )
+        if speaker in ordered:
+            chosen[speaker] = sample
+            taken.add(sample)
+
+    # Everyone the mapping did not name takes what is left, in order. The counter tracks
+    # speakers *served from the pool*, not their position in the cast: using the position
+    # would hand the first sample to every alternate speaker whenever the mapping claimed
+    # one from the middle. When there are fewer samples than speakers the list is reused
+    # from the start, which is the only sensible thing to do with two recordings and a
+    # crowd - and the run says so.
+    remaining = [sample for sample in samples if sample not in taken]
+    served = 0
+    for speaker in ordered:
+        if speaker in chosen:
+            continue
+        pool = remaining or samples
+        chosen[speaker] = pool[served % len(pool)]
+        served += 1
+
+    return chosen
+
+
+def _read_sample(path: Path) -> tuple[np.ndarray, int]:
+    """Return a sample recording as a mono ``float32`` array and its rate."""
+
+    try:
+        data, rate = sf.read(str(path), dtype="float32", always_2d=True)
+    except (OSError, RuntimeError) as exc:
+        raise MissingVoiceSampleError(
+            f"could not read the voice sample {path}: {exc}"
+        ) from exc
+
+    if data.size == 0:
+        raise MissingVoiceSampleError(f"the voice sample {path} contains no audio")
+
+    return np.ascontiguousarray(data.mean(axis=1, dtype=np.float32)), int(rate)
+
+
+def _speech_onset(samples: np.ndarray) -> int:
+    """Return the index of the first sample loud enough to be speech."""
+
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    if peak <= 0.0:
+        return 0
+    loud = np.flatnonzero(np.abs(samples) > peak * _SAMPLE_SPEECH_THRESHOLD)
+    return int(loud[0]) if loud.size else 0
+
+
+def _trim_sample(
+    samples: np.ndarray, rate: int, *, target: float, maximum: float
+) -> np.ndarray:
+    """Return a cloning-length stretch of speech from a longer recording.
+
+    Starts at the first sound rather than at the file's first sample: an operator's
+    recording usually opens with a breath, and spending two seconds of a ten-second
+    reference on it wastes a fifth of the voice the model is given.
+    """
+
+    onset = _speech_onset(samples)
+    available = samples[onset:]
+    wanted = int(round(min(target, maximum) * rate))
+    return np.ascontiguousarray(available[:wanted])
+
+
+def _resample(samples: np.ndarray, rate: int, target_rate: int) -> np.ndarray:
+    """Return ``samples`` resampled to ``target_rate``."""
+
+    if rate == target_rate:
+        return samples
+
+    from scipy.signal import resample_poly
+
+    divisor = math.gcd(int(rate), int(target_rate))
+    resampled = resample_poly(samples, target_rate // divisor, rate // divisor)
+    return np.ascontiguousarray(resampled.astype(np.float32))
+
+
+def apply_voice_samples(
+    profiles: Mapping[str, VoiceProfile],
+    *,
+    settings: Settings | None = None,
+    transcribe: Callable[[Path], str] | None = None,
+) -> dict[str, VoiceProfile]:
+    """Replace each character's reference with a native Amharic speaker's recording.
+
+    Why this exists: a reference taken from the film is the original actor speaking
+    **English**, and the cloning engine conditions on its reference. Whatever the
+    language tag says, the model is being asked to speak Amharic in the phonetics of the
+    performance it was given, and that is audible as a foreign accent. A native speaker's
+    recording removes the mismatch at its source, because the reference audio, the
+    reference transcript and the line are then all Amharic.
+
+    Each sample is trimmed to a cloning-length window and, when ``transcribe`` is given,
+    transcribed. The transcript is what keeps the model's text front-end in the same
+    language as the audio: the library will otherwise run its own ASR over the reference,
+    which is another model to download and one more thing to go wrong on a pod.
+
+    Parameters
+    ----------
+    profiles:
+        The profiles built from the film, whose speaker ids decide the assignment.
+    settings:
+        Project settings override; defaults to :func:`app.config.get_settings`.
+    transcribe:
+        Maps an audio path to Amharic text, normally
+        :func:`app.pipeline.transcription.build_amharic_transcriber`. Without it the
+        reference carries no transcript and the library transcribes it itself.
+
+    Returns
+    -------
+    dict[str, VoiceProfile]
+        One profile per input speaker. Speakers are all changed or none: a run that
+        silently kept one character on the film's audio while the rest used samples would
+        be a dub with two of everything.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    samples = available_voice_samples(resolved.voice_sample_dir)
+    if not samples:
+        return dict(profiles)
+
+    assignment = assign_voice_samples(
+        profiles.keys(), samples, mapping=resolved.voice_sample_map
+    )
+
+    target = float(resolved.voice_reference_target_duration)
+    maximum = float(resolved.voice_reference_max_duration)
+    minimum = float(resolved.voice_reference_min_duration)
+
+    replaced: dict[str, VoiceProfile] = {}
+    for speaker_id, profile in profiles.items():
+        sample = assignment[speaker_id]
+        mono, rate = _read_sample(sample)
+        trimmed = _trim_sample(mono, rate, target=target, maximum=maximum)
+        trimmed = _resample(trimmed, rate, REFERENCE_SAMPLE_RATE)
+
+        duration = trimmed.shape[0] / REFERENCE_SAMPLE_RATE
+        if duration < minimum:
+            raise MissingVoiceSampleError(
+                f"the voice sample {sample} gives {duration:.2f}s of speech after "
+                f"trimming, but a cloning reference needs at least {minimum:g}s"
+            )
+
+        destination = (
+            Path(resolved.voice_profile_dir)
+            / speaker_directory_name(speaker_id)
+            / SAMPLE_REFERENCE_FILENAME
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            sf.write(
+                str(destination),
+                trimmed,
+                REFERENCE_SAMPLE_RATE,
+                format="WAV",
+                subtype="PCM_16",
+            )
+        except (OSError, RuntimeError) as exc:
+            raise MissingVoiceSampleError(
+                f"could not write the trimmed reference {destination}: {exc}"
+            ) from exc
+
+        text = ""
+        if transcribe is not None:
+            text = (transcribe(destination) or "").strip()
+
+        replaced[speaker_id] = VoiceProfile(
+            speaker_id=speaker_id,
+            reference_audio=destination,
+            reference_start=0.0,
+            reference_end=duration,
+            reference_text=text or None,
+            clone_prompt_path=None,
+            quality_score=profile.quality_score,
+            selection_reason=(
+                f"native-speaker sample {sample.name}"
+                + (f", transcribed ({len(text)} characters)" if text else ", no transcript")
+            ),
+        )
+
+    return replaced
+
+
 __all__ = [
     "AudioAnalysisError",
     "CLONE_PROMPT_FILENAME",
+    "MissingVoiceSampleError",
+    "SAMPLE_REFERENCE_FILENAME",
+    "VOICE_SAMPLE_SUFFIXES",
+    "apply_voice_samples",
+    "assign_voice_samples",
+    "available_voice_samples",
     "ClonePromptEncoder",
     "ClonePromptError",
     "ConfigurationError",
