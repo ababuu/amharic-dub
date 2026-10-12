@@ -57,8 +57,7 @@ Environment variables
                       adaptation. Absent means an empty bible.
 ``VOICE_REFERENCE_MIN_DURATION`` / ``..._TARGET_DURATION`` / ``..._MAX_DURATION``
                       Preferred length of a voice-cloning reference, in seconds.
-``TTS_MODEL``         Amharic speech adapter used by the TTS stage.
-``DIARIZATION_MIN_SPEAKERS`` / ``DIARIZATION_MAX_SPEAKERS``
+``TTS_MODEL``         Amharic speech adapter used by the TTS stage.``DIARIZATION_MIN_SPEAKERS`` / ``DIARIZATION_MAX_SPEAKERS``
                       Optional bounds on how many speakers diarization may find.
                       A cast list turns these into the strongest single guard
                       against a character splitting into several clusters.
@@ -99,6 +98,17 @@ DEFAULT_MODEL_CACHE_DIR = PROJECT_ROOT / "models_cache"
 
 #: pyannote Community-1 speaker diarization pipeline on the Hugging Face Hub.
 DEFAULT_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
+
+#: How many of BandIt's 8-second chunks are pushed through the model per forward pass.
+#:
+#: The chunk handler defaults to one, which leaves a 48 GB card almost entirely idle: a
+#: measured run spent **354 s of 590 s** in separation on a 135 s clip, because the
+#: 8 s / 1 s chunk geometry needs 8 forwards per second of audio and each one was sent
+#: alone. The chunks are independent - the handler flattens them into the batch
+#: dimension and the model reads each as its own sequence - so batching them is the same
+#: arithmetic with more of the GPU in use. Raise it further on a bigger card; lower it if
+#: a long film runs out of memory.
+DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE = 8
 
 #: Optional bounds on the number of speakers diarization may report, or ``None``
 #: to let the model decide. Supplying them is the strongest single guard against
@@ -738,6 +748,8 @@ class Settings:
     #: Optional speaker-count bounds for diarization; ``None`` lets it decide.
     diarization_min_speakers: Optional[int] = DEFAULT_DIARIZATION_MIN_SPEAKERS
     diarization_max_speakers: Optional[int] = DEFAULT_DIARIZATION_MAX_SPEAKERS
+    #: BandIt chunks pushed through the model per forward pass.
+    separation_inference_batch_size: int = DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE
     #: faster-whisper model and CTranslate2 compute type for transcription.
     transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL
     transcription_compute_type: str = DEFAULT_TRANSCRIPTION_COMPUTE_TYPE
@@ -837,6 +849,10 @@ class Settings:
             ),
             diarization_max_speakers=_read_optional_int(
                 "DIARIZATION_MAX_SPEAKERS", DEFAULT_DIARIZATION_MAX_SPEAKERS
+            ),
+            separation_inference_batch_size=_read_int(
+                "SEPARATION_INFERENCE_BATCH_SIZE",
+                DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE,
             ),
             transcription_model=(
                 _read_env("TRANSCRIPTION_MODEL", DEFAULT_TRANSCRIPTION_MODEL)
@@ -1056,6 +1072,7 @@ class Settings:
             "diarization_model": self.diarization_model,
             "diarization_min_speakers": self.diarization_min_speakers,
             "diarization_max_speakers": self.diarization_max_speakers,
+            "separation_inference_batch_size": self.separation_inference_batch_size,
             "transcription_model": self.transcription_model,
             "transcription_compute_type": self.transcription_compute_type,
             "qc_pronunciation": self.qc_pronunciation,
@@ -1124,6 +1141,7 @@ __all__ = [
     "DEFAULT_DIARIZATION_MAX_SPEAKERS",
     "DEFAULT_DIARIZATION_MIN_SPEAKERS",
     "DEFAULT_DIARIZATION_MODEL",
+    "DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE",
     "DEFAULT_MIX_DIALOGUE_GAIN_DB",
     "DEFAULT_MIX_DUCK_DB",
     "DEFAULT_MMS_SAMPLE_RATE",

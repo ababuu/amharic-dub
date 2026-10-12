@@ -17,7 +17,8 @@ Deliberate non-goals
 --------------------
 * **No resampling.** v2 Multi is a 48 kHz model, so any other rate is rejected.
 * **No manual chunking.** BandIt's v2 runtime already runs its own chunked,
-  overlap-add inference handler.
+  overlap-add inference handler. What this module does is *configure* that handler
+  and bound how much audio is handed to it at once - see :data:`MAX_CHUNK_TENSOR_BYTES`.
 * **No CUDA->CPU fallback.** The device comes from the project settings, and an
   explicit ``cuda`` request that is unavailable must fail loudly.
 * **No weight downloads at import time** (and none in the test suite).
@@ -55,6 +56,24 @@ STEM_NAMES: tuple[str, ...] = ("speech", "music", "effects")
 #: Environment variable shared with ``bandit_infer`` to relocate its weight
 #: cache. The GPU worker points it at a persistent path (e.g. ``/models/bandit``).
 WEIGHTS_DIR_ENV_VAR = "BANDIT_INFER_WEIGHTS"
+
+#: Chunk geometry of BandIt's v2 inference handler, which decides both the cost and the
+#: peak memory of a run: the handler slides an 8-second window with a 1-second hop and
+#: cross-fades the outputs, so every second of audio costs eight forward passes.
+BANDIT_CHUNK_SECONDS = 8.0
+BANDIT_HOP_SECONDS = 1.0
+
+#: Ceiling on the ``(channels, chunks, chunk_samples)`` tensor BandIt's handler builds
+#: from its whole input and holds for the entire call. It grows linearly with duration, so
+#: an unsegmented two-hour stereo film would ask for terabytes and fail the run here.
+#: Above this, the audio is separated in overlapping segments and cross-faded.
+MAX_CHUNK_TENSOR_BYTES = 1 << 30
+
+#: How much neighbouring segments overlap when the input has to be split. The handler
+#: front-pads its own input by ``2 * (chunk - hop)`` so its output is already correct at
+#: the edges of a call, which is what makes a cross-fade in the overlap safe; this is that
+#: margin plus one chunk.
+BANDIT_STITCH_SECONDS = 2 * (BANDIT_CHUNK_SECONDS - BANDIT_HOP_SECONDS) + BANDIT_CHUNK_SECONDS
 
 
 class SeparationError(RuntimeError):
@@ -143,6 +162,100 @@ def _validate_sample_rate(sample_rate: int) -> None:
         )
 
 
+def _configure_chunking(session: Any, batch_size: int) -> None:
+    """Ask BandIt's chunk handler to run several chunks per forward pass.
+
+    The handler defaults to one chunk per forward, which leaves a large GPU mostly
+    idle: its chunks are independent - it flattens them into the batch dimension and the
+    model reads each as its own sequence - so batching them is the same arithmetic with
+    more of the card in use.
+
+    This reaches into the package, so every step is guarded. If a future release renames
+    the handler or the field, the run continues at the library's own default rather than
+    failing: a slow separation is much better than no separation.
+    """
+
+    handler = getattr(getattr(session, "_runtime", None), "handler", None)
+    if handler is None or not hasattr(handler, "inference_batch_size"):
+        return
+    handler.inference_batch_size = max(1, int(batch_size))
+
+
+def _max_segment_seconds(channels: int, sample_rate: int) -> float:
+    """Return the longest input, in seconds, whose chunk tensor stays within budget.
+
+    The bound has to be on the *unfolded* tensor rather than on the audio, because that
+    is what the handler materialises and holds: ``channels * chunks * chunk_samples``
+    floats, with ``chunks`` growing by one per hop.
+    """
+
+    chunk_samples = int(BANDIT_CHUNK_SECONDS * sample_rate)
+    bytes_per_second = (
+        channels
+        * chunk_samples
+        * np.dtype(np.float32).itemsize
+        / BANDIT_HOP_SECONDS
+    )
+    return MAX_CHUNK_TENSOR_BYTES / bytes_per_second
+
+
+def _infer_segmented(
+    session: Any, audio: np.ndarray, sample_rate: int
+) -> dict[str, np.ndarray]:
+    """Separate ``audio``, splitting it only when one call would not fit in memory.
+
+    A short input takes exactly the same path it always did - one call, no cross-fade -
+    so this changes nothing about the audio of a clip that already fits. A long one is
+    separated in overlapping segments and the overlaps blended linearly, which is safe
+    because each call's output is already correct at its own edges.
+    """
+
+    channels, samples = audio.shape
+    longest = _max_segment_seconds(channels, sample_rate)
+    if samples / sample_rate <= longest:
+        return _collect_stems(session.infer(audio, sample_rate=sample_rate))
+
+    segment = int(round(longest * sample_rate))
+    overlap = min(int(round(BANDIT_STITCH_SECONDS * sample_rate)), segment // 2)
+    step = segment - overlap
+    if step <= 0:  # pragma: no cover - only if the budget is set absurdly low
+        raise SeparationInferenceError(
+            f"a {segment}-sample segment leaves no room to advance; raise "
+            f"MAX_CHUNK_TENSOR_BYTES"
+        )
+
+    blended = {name: np.zeros((channels, samples), dtype=np.float32) for name in STEM_NAMES}
+    weight = np.zeros(samples, dtype=np.float32)
+
+    for start in range(0, samples, step):
+        stop = min(start + segment, samples)
+        stems = _collect_stems(
+            session.infer(audio[:, start:stop], sample_rate=sample_rate)
+        )
+
+        # Ramp a segment in at its head and out at its tail, but only where another
+        # segment actually overlaps it, so the first and last segments keep their edges.
+        ramp = np.ones(stop - start, dtype=np.float32)
+        head = overlap if start > 0 else 0
+        if head:
+            ramp[:head] = np.linspace(0.0, 1.0, head, dtype=np.float32)
+        tail = overlap if stop < samples else 0
+        if tail:
+            ramp[-tail:] *= np.linspace(1.0, 0.0, tail, dtype=np.float32)
+
+        for name in STEM_NAMES:
+            blended[name][:, start:stop] += stems[name] * ramp
+        weight[start:stop] += ramp
+
+    # Every sample is covered by at least one segment, so this cannot divide by zero;
+    # the guard is here because a silent failure would be a loud artefact.
+    weight[weight <= 0.0] = 1.0
+    for name in STEM_NAMES:
+        blended[name] /= weight
+
+    return blended
+
+
 def _run_bandit(
     audio: np.ndarray, settings: Settings, weights_dir: Path
 ) -> Mapping[str, np.ndarray]:
@@ -164,7 +277,10 @@ def _run_bandit(
 
     try:
         session.load()
-        stems = session.infer(audio, sample_rate=REQUIRED_SAMPLE_RATE)
+        _configure_chunking(session, settings.separation_inference_batch_size)
+        return _infer_segmented(session, audio, REQUIRED_SAMPLE_RATE)
+    except SeparationError:
+        raise
     except Exception as exc:
         raise SeparationInferenceError(f"BandIt inference failed: {exc}") from exc
     finally:
@@ -172,15 +288,13 @@ def _run_bandit(
         if callable(close):
             close()
 
+
+def _collect_stems(stems: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
     if not isinstance(stems, Mapping):
         raise MissingStemError(
             f"BandIt returned {type(stems).__name__}, expected a mapping of stems"
         )
 
-    return stems
-
-
-def _collect_stems(stems: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
     missing = [name for name in STEM_NAMES if name not in stems]
     if missing:
         raise MissingStemError("BandIt result is missing expected stem(s): " + ", ".join(missing))
