@@ -1293,14 +1293,17 @@ def test_each_rewrite_asks_for_a_different_kind_of_cut(monkeypatch):
     def transform(body):
         calls.append(1)
         for line in body["lines"]:
-            line["amharic"] = amharic if len(calls) == 1 else shorter[: max(2, 12 - calls[-1])]
+            line["amharic"] = (
+                amharic if len(calls) == 1 else shorter[: max(2, 12 - 2 * calls[-1])]
+            )
         return body
 
     FakeOpenAI.transform = transform
 
     adapt_dialogue(
-        [_segment(start=0.0, end=1.0)],
+        [_segment(start=0.0, end=0.25)],
         settings=_settings(translation_max_reduction_attempts=3),
+        maximum_reduction_attempts=3,
     )
 
     assert len(FakeOpenAI.requests) >= 3
@@ -1371,13 +1374,7 @@ def test_budget_enforcement_can_be_turned_off(monkeypatch):
 
 
 def test_a_retry_that_is_still_too_long_is_reported_not_retried_forever(monkeypatch):
-    """The rewrite loop is bounded: a model that cannot shorten a line must not loop.
-
-    More than one attempt is needed in practice - a single pass left every over-long line
-    still over at roughly 1.6-1.8x its budget on real dialogue - but the number of attempts
-    is capped, because an unbounded loop would eventually "fit" the window by losing the
-    meaning, which is worse than a line that has to be delivered quickly.
-    """
+    """A rewrite that makes no progress must not be sent back to the model repeatedly."""
 
     _patch(monkeypatch)
 
@@ -1388,10 +1385,14 @@ def test_a_retry_that_is_still_too_long_is_reported_not_retried_forever(monkeypa
 
     FakeOpenAI.transform = transform
 
-    adapted = adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
+    adapted = adapt_dialogue(
+        [_segment(start=0.0, end=1.0)],
+        settings=_settings(translation_max_reduction_attempts=3),
+        maximum_reduction_attempts=3,
+    )
 
-    # One initial request, then exactly the bounded number of rewrites - and it stops.
-    assert len(FakeOpenAI.requests) == 1 + MAXIMUM_REDUCTION_ATTEMPTS
+    # One initial request and one unsuccessful rewrite; the unchanged line is not retried.
+    assert len(FakeOpenAI.requests) == 2
     assert adapted[0].amharic == "ሰላም እንደምን ነህ"
 
 
@@ -1414,6 +1415,35 @@ def test_the_rewrite_attempts_are_configurable(monkeypatch):
     )
 
     assert len(FakeOpenAI.requests) == 2
+
+
+def test_zero_rewrite_attempts_use_only_the_initial_batch_request(monkeypatch):
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [_segment(start=0.0, end=1.0)],
+        settings=_settings(),
+        maximum_reduction_attempts=0,
+    )
+
+    assert len(FakeOpenAI.requests) == 1
+
+
+def test_batch_progress_reports_elapsed_time(monkeypatch):
+    _patch(monkeypatch)
+    updates: list[str] = []
+
+    adapt_dialogue(
+        [_segment(), _segment(start=20.0, end=24.0)],
+        settings=_settings(translation_batch_size=1),
+        on_progress=updates.append,
+    )
+
+    assert len(updates) == 4
+    assert "batch 1/2" in updates[0]
+    assert "started" in updates[0]
+    assert "completed in" in updates[1]
+    assert "batch 2/2" in updates[2]
 
 
 def test_the_scene_is_derived_when_none_is_supplied(monkeypatch):

@@ -272,12 +272,10 @@ DEFAULT_TRANSLATION_SHORTEN_PENALTY = 0.6
 #: for the adaptation prompt, and a test keeps the two in step.
 DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND = 4.0
 
-#: How many times a line may be sent back to be shortened, including the first attempt.
-#: More than one is needed: a single rewrite left every over-long line still over at
-#: roughly 1.6-1.8x its budget, because a model asked to fit a small window returns
-#: something *closer* rather than something inside it. Bounded, because an unbounded loop
-#: would eventually fit the window by losing the meaning.
-DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS = 3
+#: Maximum number of rewrite requests for lines that miss the syllable budget or
+#: contain Roman-script text. One rewrite keeps the result self-correcting without
+#: multiplying the latency and cost of every batch; zero skips rewrites entirely.
+DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS = 1
 
 #: The endpoint the *served* instruction-following backend talks to by default.
 #: Kept under its original name for callers that already read it; the value follows the

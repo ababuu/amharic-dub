@@ -63,8 +63,9 @@ from __future__ import annotations
 
 import json
 import math
+import time
 import warnings
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -1047,14 +1048,9 @@ def _adapt_batch(
     return [_build(segment, line_id, lines[line_id]) for segment, line_id in zip(batch, ids)]
 
 
-#: How many times a line may be sent back to be shortened, including the first attempt.
-#:
-#: More than one is needed: measured against real dialogue, a single rewrite left every
-#: over-long line still over at roughly 1.6-1.8x its budget, because a model asked to fit a
-#: small window returns something *closer* rather than something inside it. Each pass states
-#: the exact shortfall, which gives it something concrete to cut. Bounded because an
-#: unbounded loop would eventually fit the window by losing the meaning.
-MAXIMUM_REDUCTION_ATTEMPTS = 3
+#: Maximum number of rewrite requests per original batch. Lines that do not improve
+#: after a rewrite are not sent again.
+MAXIMUM_REDUCTION_ATTEMPTS = 1
 
 #: What each successive rewrite is told to cut. Escalating matters more than repeating:
 #: a model asked the same question twice returns nearly the same line, whereas a model
@@ -1136,9 +1132,16 @@ def _reduce_overshooting_lines(
       written in Fidel, because the voice that speaks it reads Fidel. A rule in the
       prompt is not a guarantee, so this is verified rather than trusted.
 
-    Only the offending lines are resent, and only once: what is still wrong afterwards
-    is reported in the verdicts rather than retried indefinitely.
+    Only offending lines are resent. The default is one rewrite request per batch;
+    additional attempts can be configured, but a line is not retried after it stops
+    improving.
     """
+
+    if maximum_attempts <= 0:
+        return adapted, tuple(
+            budget.verdict(line.amharic, tolerance=tolerance)
+            for budget, line in zip(budgets, adapted)
+        )
 
     verdicts = tuple(
         budget.verdict(line.amharic, tolerance=tolerance)
@@ -1185,6 +1188,7 @@ def _reduce_overshooting_lines(
             "keeping the meaning, tone and character:\n" + "\n".join(instructions)
         ),
     )
+    improved: set[int] = set()
     for slot, line in zip(offenders, retried):
         # Only keep the rewrite when it is actually better. A model asked to shorten a
         # line sometimes returns a longer one, and taking that would leave the line
@@ -1193,6 +1197,7 @@ def _reduce_overshooting_lines(
             line, adapted[slot], enforce_fidel_loanwords=enforce_fidel_loanwords
         ):
             adapted[slot] = line
+            improved.add(slot)
 
     return _reduce_again(
         failover,
@@ -1206,6 +1211,7 @@ def _reduce_overshooting_lines(
         enforce_fidel_loanwords=enforce_fidel_loanwords,
         attempts=maximum_attempts - 1,
         total_attempts=maximum_attempts,
+        retryable=frozenset(improved),
     )
 
 
@@ -1222,18 +1228,13 @@ def _reduce_again(
     enforce_fidel_loanwords: bool,
     attempts: int,
     total_attempts: int,
+    retryable: frozenset[int] | None = None,
 ) -> tuple[list[AdaptedDialogue], tuple[BudgetVerdict, ...]]:
     """Keep asking about a line that is still over, while attempts remain.
 
-    One rewrite is often not enough, and the reason is arithmetic rather than stubbornness:
-    a model asked to fit a small window tends to return something *closer* without landing
-    inside it. Measured against real lines, a single pass left every line over its budget
-    at roughly 1.6-1.8x. Re-asking with the exact shortfall - "you used 16 syllables, the
-    limit is 8" - gives it something concrete to remove, and each pass gets closer.
-
-    The loop is bounded, and a line that never fits is returned as it stands and reported.
-    An unbounded loop would eventually produce text that fits by losing the meaning, which
-    is worse than a line that has to be delivered quickly.
+    Only lines improved by their last rewrite remain eligible. This avoids paying for
+    repeated requests that return the same or a worse line; still-overlong results are
+    kept and reported when no better rewrite is available or the configured limit is hit.
     """
 
     if attempts <= 0:
@@ -1261,10 +1262,13 @@ def _reduce_again(
         else set()
     )
     offenders = sorted(over_budget | with_roman)
+    if retryable is not None:
+        offenders = [index for index in offenders if index in retryable]
     if not offenders:
         return adapted, verdicts
 
     ids = [_dialogue_id(first_position + index) for index in offenders]
+    improved: set[int] = set()
     instructions: list[str] = []
     for index in offenders:
         if index in over_budget:
@@ -1298,6 +1302,7 @@ def _reduce_again(
             line, adapted[slot], enforce_fidel_loanwords=enforce_fidel_loanwords
         ):
             adapted[slot] = line
+            improved.add(slot)
 
     return _reduce_again(
         failover,
@@ -1311,6 +1316,7 @@ def _reduce_again(
         enforce_fidel_loanwords=enforce_fidel_loanwords,
         attempts=attempts - 1,
         total_attempts=total_attempts,
+        retryable=frozenset(improved),
     )
 
 
@@ -1428,6 +1434,7 @@ def adapt_dialogue(
     enforce_fidel_loanwords: bool = True,
     maximum_reduction_attempts: int = MAXIMUM_REDUCTION_ATTEMPTS,
     translator: Any | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> list[AdaptedDialogue]:
     """Adapt transcribed dialogue into dubbing-ready Amharic.
 
@@ -1461,15 +1468,20 @@ def adapt_dialogue(
         from :mod:`app.pipeline.dialogue_context`.
     enforce_budget:
         When ``True`` (the default), a line that comes back too long for its window
-        is re-asked once. Set ``False`` to send every line exactly once, which is
-        cheaper and is the right choice for a comparison run.
+        is re-asked once by default. Set ``False`` to send every line exactly once,
+        which is cheaper and is the right choice for a comparison run.
     enforce_fidel_loanwords:
         When ``True`` (the default), a line that comes back with Roman-script text
-        in it is re-asked once to have those words written in Fidel. Borrowed
+        in it is re-asked once by default to have those words written in Fidel. Borrowed
         English words are *meant* to stay - an Amharic speaker says "ኮምፒውተር", not a
         dictionary equivalent - but the voice that speaks the result reads Fidel, so
         a word left in Roman letters cannot be pronounced. Sharing the same pass as
         the budget check, so a batch is never re-asked twice.
+    maximum_reduction_attempts:
+        Maximum number of rewrite requests per batch. Defaults to one; further requests
+        are made only for lines improved by the preceding rewrite.
+    on_progress:
+        Optional callback for batch start and completion updates.
 
     Notes
     -----
@@ -1550,8 +1562,17 @@ def adapt_dialogue(
 
     adapted: list[AdaptedDialogue] = []
     position = 1
-    for batch in _batches(transcript, batch_size):
+    batches = _batches(transcript, batch_size)
+    batch_count = (len(transcript) + batch_size - 1) // batch_size
+    for batch_number, batch in enumerate(batches, start=1):
         first_position = position
+        batch_last_position = first_position + len(batch) - 1
+        batch_started = time.perf_counter()
+        if on_progress is not None:
+            on_progress(
+                f"  translation batch {batch_number}/{batch_count}: "
+                f"lines {first_position}-{batch_last_position} started"
+            )
         ids = [_dialogue_id(first_position + offset) for offset in range(len(batch))]
         budgets = [
             syllable_budget(
@@ -1587,6 +1608,12 @@ def adapt_dialogue(
 
         adapted.extend(produced)
         position += len(batch)
+        if on_progress is not None:
+            on_progress(
+                f"  translation batch {batch_number}/{batch_count}: "
+                f"lines {first_position}-{batch_last_position} completed in "
+                f"{time.perf_counter() - batch_started:.1f}s"
+            )
 
     return adapted
 
