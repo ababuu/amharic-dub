@@ -1512,7 +1512,9 @@ def adapt_dialogue(
         missing.
     """
 
-    settings = settings if settings is not None else get_settings()
+    settings = (
+        settings if settings is not None else get_settings()
+    ).with_available_translation_provider()
 
     transcript = _validate_segments(segments)
     if not transcript:

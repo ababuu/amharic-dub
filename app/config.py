@@ -77,7 +77,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -1036,6 +1036,25 @@ class Settings:
 
         return translation_provider_defaults(self.translation_provider)
 
+    def with_available_translation_provider(self) -> "Settings":
+        """Use DeepSeek when Gemini is selected but only a DeepSeek key is present."""
+
+        if (
+            self.translation_backend != "openai"
+            or self.translation_provider != "gemini"
+            or self.translation_api_key
+            or not (self.deepseek_api_key or "").strip()
+        ):
+            return self
+
+        provider = translation_provider_defaults("deepseek")
+        return replace(
+            self,
+            translation_provider=provider.name,
+            translation_model=provider.model,
+            translation_base_url=provider.base_url,
+        )
+
     @property
     def translation_api_key(self) -> str:
         """Return the API key for the configured provider, or an empty string.
@@ -1181,7 +1200,7 @@ class Settings:
 def get_settings() -> Settings:
     """Return the process-wide, cached :class:`Settings` instance."""
 
-    return Settings.from_env()
+    return Settings.from_env().with_available_translation_provider()
 
 
 __all__ = [

@@ -919,6 +919,30 @@ def test_a_network_failure_falls_back(monkeypatch):
     assert len(lines) == 1
 
 
+def test_missing_gemini_key_starts_with_deepseek(monkeypatch):
+    """DeepSeek is selected before a request when Gemini has no configured key."""
+
+    _patch(monkeypatch)
+    settings = _fallback_settings(gemini_api_key=None)
+
+    lines = adapt_dialogue([_segment()], settings=settings)
+
+    assert len(lines) == 1
+    assert FakeOpenAI.requests
+    assert all(
+        request["model"] == DEFAULT_TRANSLATION_DEEPSEEK_MODEL
+        for request in FakeOpenAI.requests
+    )
+    assert FakeOpenAI.init_kwargs == [
+        {
+            "api_key": "deepseek-key",
+            "base_url": DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL,
+        }
+    ]
+    resolved = settings.with_available_translation_provider()
+    assert resolved.translation_provider == "deepseek"
+
+
 def test_a_configuration_error_is_not_dressed_up_as_a_provider_failure(monkeypatch):
     """Our own bad setting must surface as one, not as a request that failed."""
 
