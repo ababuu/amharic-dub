@@ -27,9 +27,11 @@ voice identity and never becomes a permanent field of a profile.
 
 Reference selection
 -------------------
-The reference is not "the first 10 seconds this speaker says". For every speaker
-the component builds candidate windows out of their own turns, measures them,
-and keeps the best one:
+Exactly one reference is extracted for each speaker, from one continuous
+4-to-10-second interval of their own speech by default. The reference is not
+"the first 10 seconds this speaker says". Candidate intervals can span several
+consecutive transcript lines; their text is combined into one matching prompt.
+The component scores eligible windows and keeps the best one:
 
 * **Speaker confidence.** Candidate windows only ever come from that speaker's
   own diarized turns, so a reference is never taken from another speaker.
@@ -161,6 +163,7 @@ PROFILE_FILENAME = "profile.json"
 #: cannot describe a reference no cloning model could use.
 MIN_REFERENCE_DURATION = 1.0
 MAX_REFERENCE_DURATION = 30.0
+AMHARIC_TUNED_MIN_REFERENCE_DURATION = 4.0
 
 #: Two turns by the same speaker closer together than this are one continuous
 #: stretch of speech. A different speaker always breaks the run, so this only
@@ -422,11 +425,13 @@ def _speaker_directory(directory: Path, speaker_id: str) -> Path:
 class VoiceProfile:
     """The reusable voice identity of one diarized speaker.
 
-    A profile never contains audio: only the path of the extracted reference, the
-    window inside the dialogue stem it came from, the transcript of that window
-    when one is known, and the optionally cached voice-clone prompt. It also
-    never contains performance metadata - emotion, intensity and delivery belong
-    to a later stage and change per line, while this identity must stay stable.
+    A profile never contains audio: it stores the extracted reference path, the
+    source window and its transcript when known, plus selection and acoustic
+    descriptions. It never contains performance metadata - emotion, intensity and
+    delivery belong to a later stage and change per line, while this identity must
+    stay stable.
+    Its optional pitch and vocal-presentation estimates are descriptive only;
+    the actor reference, not the estimate, is what the TTS engine clones.
     """
 
     speaker_id: str
@@ -437,6 +442,8 @@ class VoiceProfile:
     clone_prompt_path: Path | None = None
     quality_score: float = 0.0
     selection_reason: str = ""
+    estimated_vocal_presentation: str = "unknown"
+    estimated_pitch_hz: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.speaker_id, str) or not self.speaker_id.strip():
@@ -487,6 +494,29 @@ class VoiceProfile:
             raise InvalidProfileError("selection_reason must be a string")
         object.__setattr__(self, "selection_reason", self.selection_reason.strip())
 
+        presentation = self.estimated_vocal_presentation
+        if not isinstance(presentation, str) or presentation not in {
+            "unknown",
+            "uncertain",
+            "masculine",
+            "feminine",
+        }:
+            raise InvalidProfileError(
+                "estimated_vocal_presentation must be unknown, uncertain, "
+                "masculine, or feminine"
+            )
+
+        pitch = self.estimated_pitch_hz
+        if pitch is not None:
+            pitch = _finite_number(
+                "estimated_pitch_hz", pitch, InvalidProfileError
+            )
+            if pitch <= 0:
+                raise InvalidProfileError(
+                    f"estimated_pitch_hz must be positive, got {pitch}"
+                )
+        object.__setattr__(self, "estimated_pitch_hz", pitch)
+
     @property
     def reference_duration(self) -> float:
         """Length of the reference window in seconds.
@@ -525,6 +555,8 @@ class VoiceProfile:
             ),
             "quality_score": self.quality_score,
             "selection_reason": self.selection_reason,
+            "estimated_vocal_presentation": self.estimated_vocal_presentation,
+            "estimated_pitch_hz": self.estimated_pitch_hz,
         }
 
     @classmethod
@@ -558,6 +590,10 @@ class VoiceProfile:
             ),
             quality_score=payload.get("quality_score", 0.0),  # type: ignore[arg-type]
             selection_reason=payload.get("selection_reason", ""),  # type: ignore[arg-type]
+            estimated_vocal_presentation=payload.get(
+                "estimated_vocal_presentation", "unknown"
+            ),  # type: ignore[arg-type]
+            estimated_pitch_hz=payload.get("estimated_pitch_hz"),  # type: ignore[arg-type]
         )
 
 
@@ -874,7 +910,9 @@ def _validate_audio_path(path: str | Path) -> Path:
     return source
 
 
-def _resolve_duration_bounds(settings: Settings) -> tuple[float, float, float]:
+def _resolve_duration_bounds(
+    settings: Settings, *, minimum_required: float = MIN_REFERENCE_DURATION
+) -> tuple[float, float, float]:
     """Return the validated ``(minimum, target, maximum)`` reference durations."""
 
     minimum = _finite_number(
@@ -889,6 +927,7 @@ def _resolve_duration_bounds(settings: Settings) -> tuple[float, float, float]:
         "voice_reference_max_duration", settings.voice_reference_max_duration, ConfigurationError
     )
 
+    minimum = max(minimum, minimum_required)
     if not MIN_REFERENCE_DURATION <= minimum:
         raise ConfigurationError(
             "VOICE_REFERENCE_MIN_DURATION must be at least "
@@ -1099,11 +1138,10 @@ def _candidates_for(
     """Build and measure every candidate window for one speaker.
 
     Two families of window are offered: ones cut on the speaker's own line
-    boundaries, which a transcript can describe exactly, and the older sliding
-    windows for a speaker whose lines are too short to reach the minimum on their
-    own. Every candidate records whether it contains simultaneous speech; the choice
-    between a clean and a contaminated window is made by the caller, so a film with
-    no clean stretch still gets a voice instead of failing.
+    boundaries, which can combine several lines into one continuous reference with
+    exact text, and sliding windows for short turns. Every candidate records whether
+    it contains simultaneous speech; production selects only a clean candidate with
+    exact transcript coverage.
     """
 
     contaminated = list(contaminated)
@@ -1418,6 +1456,69 @@ def _clone_prompt(
     return destination
 
 
+def _estimate_vocal_presentation(reference_audio: Path) -> tuple[float | None, str]:
+    """Estimate vocal register from voiced frames, without asserting a person's gender."""
+
+    try:
+        audio, sample_rate = sf.read(reference_audio, dtype="float32", always_2d=True)
+    except (OSError, RuntimeError, ValueError, sf.LibsndfileError) as exc:
+        raise AudioAnalysisError(
+            f"could not estimate vocal register from {reference_audio}: {exc}"
+        ) from exc
+
+    mono = np.asarray(audio, dtype=np.float64).mean(axis=1)
+    if mono.size == 0 or sample_rate <= 0:
+        return None, "unknown"
+
+    decimation = max(1, int(round(sample_rate / 8_000)))
+    samples = mono[::decimation]
+    rate = sample_rate / decimation
+    frame_size = int(round(rate * 0.04))
+    hop_size = int(round(rate * 0.1))
+    minimum_lag = max(1, int(rate / 400.0))
+    maximum_lag = min(frame_size - 2, int(rate / 70.0))
+    if frame_size <= 2 or maximum_lag <= minimum_lag:
+        return None, "unknown"
+
+    window = np.hanning(frame_size)
+    pitches: list[float] = []
+    for offset in range(0, samples.size - frame_size + 1, hop_size):
+        frame = samples[offset : offset + frame_size]
+        frame = frame - np.mean(frame)
+        if float(np.sqrt(np.mean(np.square(frame)))) < 0.003:
+            continue
+        frame = frame * window
+        correlation = np.correlate(frame, frame, mode="full")[frame_size - 1 :]
+        if correlation[0] <= 0:
+            continue
+
+        search = correlation[minimum_lag : maximum_lag + 1]
+        peak_index = int(np.argmax(search)) + minimum_lag
+        if correlation[peak_index] / correlation[0] < 0.25:
+            continue
+
+        lag = float(peak_index)
+        if 0 < peak_index < correlation.size - 1:
+            left, center, right = correlation[peak_index - 1 : peak_index + 2]
+            curvature = left - 2.0 * center + right
+            if curvature != 0:
+                lag += float(0.5 * (left - right) / curvature)
+        if lag > 0:
+            pitches.append(rate / lag)
+
+    if len(pitches) < 3:
+        return None, "uncertain"
+
+    median_pitch = float(np.median(pitches))
+    if median_pitch <= 150.0:
+        presentation = "masculine"
+    elif median_pitch >= 180.0:
+        presentation = "feminine"
+    else:
+        presentation = "uncertain"
+    return median_pitch, presentation
+
+
 def _build_profile(
     candidate: _ReferenceCandidate,
     *,
@@ -1439,6 +1540,7 @@ def _build_profile(
 
     reference = speaker_dir / REFERENCE_FILENAME
     _extract_reference(source, candidate, destination=reference)
+    pitch_hz, vocal_presentation = _estimate_vocal_presentation(reference)
 
     return VoiceProfile(
         speaker_id=speaker_id,
@@ -1454,6 +1556,8 @@ def _build_profile(
         ),
         quality_score=candidate.quality_score(target),
         selection_reason=candidate.selection_reason(),
+        estimated_vocal_presentation=vocal_presentation,
+        estimated_pitch_hz=pitch_hz,
     )
 
 
@@ -1465,6 +1569,7 @@ def build_voice_profiles(
     crosstalk: Iterable[CrosstalkRegion] | None = None,
     settings: Settings | None = None,
     clone_encoder: ClonePromptEncoder | None = None,
+    require_reference_transcript: bool = False,
 ) -> dict[str, VoiceProfile]:
     """Build one voice identity per diarized speaker.
 
@@ -1498,6 +1603,11 @@ def build_voice_profiles(
         reference. It is the only model-specific hook, so a cloning encoder can
         be injected without this module depending on one. When it is omitted,
         ``clone_prompt_path`` stays ``None``.
+    require_reference_transcript:
+        When true, accept only references of at least four seconds that have an
+        exact transcript and contain no diarized crosstalk or other-speaker
+        overlap. The production Amharic voice-cloning path enables this so the
+        model receives a valid voice-cloning prompt rather than mismatched text.
 
     Returns
     -------
@@ -1533,7 +1643,14 @@ def build_voice_profiles(
 
     resolved = settings if settings is not None else get_settings()
     source = _validate_audio_path(audio_path)
-    minimum, target, maximum = _resolve_duration_bounds(resolved)
+    minimum, target, maximum = _resolve_duration_bounds(
+        resolved,
+        minimum_required=(
+            AMHARIC_TUNED_MIN_REFERENCE_DURATION
+            if require_reference_transcript
+            else MIN_REFERENCE_DURATION
+        ),
+    )
     directory = Path(resolved.voice_profile_dir)
 
     # Simultaneous speech is where a reference goes wrong: a window cut across it is a
@@ -1562,8 +1679,29 @@ def build_voice_profiles(
                 transcript=lines,
                 contaminated=regions,
             )
-            usable = [item for item in candidates if item.is_usable(minimum)]
+            usable = [
+                item
+                for item in candidates
+                if item.is_usable(minimum)
+                and (
+                    not require_reference_transcript
+                    or (
+                        item.text is not None
+                        and not item.contaminated
+                        and item.overlap_seconds <= TIMESTAMP_TOLERANCE
+                    )
+                )
+            ]
             if not usable:
+                if require_reference_transcript and any(
+                    item.is_usable(minimum) for item in candidates
+                ):
+                    raise NoUsableReferenceError(
+                        f"no clean, transcript-matched voice reference for speaker "
+                        f"{speaker_id!r}: the Amharic voice-cloning path requires at "
+                        f"least {minimum:.2f}s of speech with an exact transcript and "
+                        "no overlapping speaker"
+                    )
                 raise _no_usable_reference(speaker_id, candidates, minimum=minimum)
 
             # Reference quality is a matter of what the window *is*, not of a weighted
@@ -1608,9 +1746,12 @@ def build_voice_profiles(
 
 
 # ---------------------------------------------------------------------------
-# Native-speaker voice samples
+# Legacy external voice-sample utilities
 # ---------------------------------------------------------------------------
 
+# These helpers remain import-compatible for callers that used the old optional
+# sample workflow. The production orchestrator does not call them: OmniVoice now
+# clones each character's own clean, transcript-matched actor reference.
 
 #: Audio containers an operator's own recordings may arrive in. MP3 is the common one -
 #: a recording made on a phone or downloaded from a voice bank is rarely a WAV - and

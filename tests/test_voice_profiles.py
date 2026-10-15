@@ -699,7 +699,7 @@ def test_a_clipped_candidate_loses_to_a_clean_one(tmp_path: Path, ffmpeg: FakeFf
 def test_too_short_candidates_are_rejected(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
     stem = _write_stem(tmp_path / "speech.wav", [(10.0, 12.0, LOUD)])
 
-    with pytest.raises(NoUsableReferenceError, match="at least 3.00s is required"):
+    with pytest.raises(NoUsableReferenceError, match="at least 4.00s is required"):
         build_voice_profiles(
             [SpeakerSegment("SPEAKER_00", 10.0, 12.0)], stem, settings=_settings(tmp_path)
         )
@@ -1620,6 +1620,83 @@ def test_a_window_no_line_covers_carries_no_transcript(
     assert profile.reference_text is None
     assert profile.clone_prompt_path is None
     assert "no transcript describes this window" in profile.selection_reason
+
+
+def test_production_reference_requires_exact_transcript_and_four_seconds(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 15.0, LOUD)])
+    transcript = [TranscriptSegment("SPEAKER_00", 10.0, 15.0, RICH_TEXT)]
+
+    profile = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", 10.0, 15.0)],
+        stem,
+        transcript=transcript,
+        settings=_settings(tmp_path, voice_reference_min_duration=2.0),
+        require_reference_transcript=True,
+    )["SPEAKER_00"]
+
+    assert profile.reference_duration == 5.0
+    assert 4.0 <= profile.reference_duration <= 10.0
+    assert profile.reference_text == RICH_TEXT
+
+
+def test_production_builds_one_continuous_reference_from_multiple_lines(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    stem = _write_stem(
+        tmp_path / "speech.wav",
+        [(10.0, 12.5, LOUD), (12.6, 15.1, LOUD)],
+    )
+    lines = [
+        TranscriptSegment("SPEAKER_00", 10.0, 12.5, "first phrase"),
+        TranscriptSegment("SPEAKER_00", 12.6, 15.1, "second phrase"),
+    ]
+
+    profile = build_voice_profiles(
+        [
+            SpeakerSegment("SPEAKER_00", 10.0, 12.5),
+            SpeakerSegment("SPEAKER_00", 12.6, 15.1),
+        ],
+        stem,
+        transcript=lines,
+        settings=_settings(tmp_path),
+        require_reference_transcript=True,
+    )["SPEAKER_00"]
+
+    assert profile.reference_duration == pytest.approx(5.1)
+    assert 4.0 <= profile.reference_duration <= 10.0
+    assert profile.reference_text == "first phrase second phrase"
+    assert profile.reference_audio == (
+        tmp_path / "voices" / "SPEAKER_00" / REFERENCE_FILENAME
+    )
+
+
+def test_production_reference_rejects_missing_matching_transcript(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD)])
+
+    with pytest.raises(NoUsableReferenceError, match="exact transcript"):
+        build_voice_profiles(
+            [SpeakerSegment("SPEAKER_00", 10.0, 20.0)],
+            stem,
+            settings=_settings(tmp_path),
+            require_reference_transcript=True,
+        )
+
+
+def test_vocal_presentation_is_a_tentative_pitch_estimate(tmp_path: Path) -> None:
+    sample_rate = 24_000
+    seconds = 1.0
+    times = np.arange(int(sample_rate * seconds), dtype=np.float32) / sample_rate
+    reference = tmp_path / "reference.wav"
+    sf.write(reference, 0.1 * np.sin(2.0 * np.pi * 120.0 * times), sample_rate)
+
+    pitch_hz, presentation = voice_profiles._estimate_vocal_presentation(reference)
+
+    assert pitch_hz == pytest.approx(120.0, abs=2.0)
+    assert presentation == "masculine"
 
 
 def test_variety_cannot_outweigh_a_clear_audio_difference(

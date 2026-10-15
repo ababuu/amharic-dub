@@ -64,9 +64,8 @@ from __future__ import annotations
 import json
 import math
 import time
-import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 from app.config import Settings, get_settings, translation_provider_defaults
@@ -100,7 +99,7 @@ DIALOGUE_ID_PREFIX = "dialogue_"
 DIALOGUE_ID_DIGITS = 6
 
 #: The reuseable system prompt for cinematic English -> Amharic adaptation.
-SYSTEM_PROMPT = """\
+_LEGACY_SYSTEM_PROMPT = """\
 You are a veteran dialogue adaptor and dubbing script writer for Ethiopian cinema.
 
 You adapt movie dialogue into Amharic for a DUB, not for a subtitle track. Your
@@ -259,6 +258,33 @@ Return exactly one object per input line, in the same order, and copy each "id"
 back unchanged. Never invent, rename, merge, split, reorder or omit ids, and never
 add or drop lines. Do not return speaker names, start times or end times: the
 application owns those.
+"""
+
+SYSTEM_PROMPT = """\
+Adapt film dialogue into concise, natural, contemporary spoken Amharic for dubbing,
+not subtitles. Use the scene and character context. Preserve intent, subtext, plot
+facts, names, numbers, relationships and tone. Do not invent, explain, sanitize, or
+make casual speech formal.
+
+FIT IS A HARD REQUIREMENT. Each line has a duration and syllable_budget. Stay within
+that budget while sounding natural. Use compact Amharic grammar; remove filler,
+repetition, recoverable pronouns, obvious vocatives, and details already conveyed by
+the scene. Merge clauses or omit nonessential asides. Never remove plot-critical
+names, numbers, threats, promises, reveals, or other facts. Do not pad short lines.
+
+Use ordinary spoken loanwords and names when appropriate. Write all words in Fidel,
+never Latin script. For example, Walt -> ዋልት and computer -> ኮምፒውተር. Keep recurring
+spellings consistent.
+
+For each line return concise performance metadata: emotion (short label), intensity
+(0.0-1.0), delivery (2-5 words), and realistic pause_before/pause_after values in
+seconds. Do not invent long silences.
+
+Return exactly one JSON object matching this schema, with every input id copied
+exactly once and in order. Do not add, omit, merge, split, or reorder lines or fields.
+Return no prose, markdown, or code fences:
+{"lines":[{"id":"<id>","amharic":"...","emotion":"...","intensity":0.0,
+"delivery":"...","pause_before":0.0,"pause_after":0.0}]}
 """
 
 
@@ -494,7 +520,11 @@ def _build_client(settings: Settings, api_key: str) -> Any:
         # The key is passed straight to the client and never logged or embedded in
         # any message we raise. Every supported provider speaks this protocol, which is
         # why the pipeline itself has no idea which vendor it is talking to.
-        return OpenAI(api_key=api_key, base_url=settings.translation_base_url)
+        return OpenAI(
+            api_key=api_key,
+            base_url=settings.translation_base_url,
+            max_retries=0,
+        )
     except Exception as exc:
         raise ApiClientError(
             f"could not create the {settings.translation_provider} client for "
@@ -857,179 +887,47 @@ def _build(segment: TranscriptSegment, line_id: str, line: Any) -> AdaptedDialog
         ) from exc
 
 
-def _fallback_settings(settings: Settings) -> Settings | None:
-    """Return the settings for the fallback provider, or ``None`` if unusable.
+class _SingleRequest:
+    """Send one provider request, with neither SDK retries nor provider failover."""
 
-    The endpoint and model come from the *fallback* provider's own defaults, never from
-    the configured ones - carrying ``gemini-3.8-flash`` across to DeepSeek's host is
-    exactly the mistake the provider table exists to prevent. A provider with no
-    defaults (``other``) is skipped, because there is no address to guess.
-    """
-
-    name = (settings.translation_fallback_provider or "").strip().lower()
-    if not name or name == (settings.translation_provider or "").strip().lower():
-        return None
-
-    provider = translation_provider_defaults(name)
-    if not provider.base_url or not provider.model:
-        return None
-
-    candidate = replace(
-        settings,
-        translation_provider=provider.name,
-        translation_base_url=provider.base_url,
-        translation_model=provider.model,
-    )
-    # No key for the fallback means no fallback. Saying so is the caller's job.
-    if not candidate.translation_api_key:
-        return None
-    return candidate
-
-
-def _could_another_provider_succeed(exc: Exception) -> bool:
-    """``True`` when a *different* provider could plausibly answer this request.
-
-    The distinction matters because switching on the wrong kind of failure hides a bug
-    instead of surviving an outage. A status means the server understood the request and
-    refused it: 400 and 422 are our own bad request, so the other provider would refuse
-    it too - but an expired key, a rate limit, a missing model or a 5xx is the provider
-    being unavailable, which is exactly what the fallback is for. No status at all means
-    the request never arrived, which is the clearest case of all.
-    """
-
-    status = getattr(exc, "status_code", None)
-    if status is None:
-        return True
-    if status in (401, 403, 404, 408, 409, 429):
-        return True
-    return status >= 500
-
-
-class _Failover:
-    """The provider a run is talking to, and the one it moves to if that fails.
-
-    Adaptation is a hosted call, so it is a single point of failure for a long run: a
-    rate limit, an outage or an expired key would otherwise end a film's translation
-    after hours of earlier work. The switch is **sticky** - once the first provider has
-    failed, the rest of the run goes straight to the fallback instead of spending a
-    failed request on every remaining batch - and it announces itself, because a run that
-    silently answered from a different model would be worse than one that stopped.
-
-    Lines already adapted are kept: the failure is survived, not re-paid for.
-    """
-
-    def __init__(self, client: Any, settings: Settings, *, fallback: Any = None) -> None:
+    def __init__(self, client: Any, settings: Settings) -> None:
         self._client = client
         self._settings = settings
-        self._fallback_client = fallback
-        self._fallback_settings = _fallback_settings(settings) if fallback else None
-        self.switched_from: str | None = None
 
     @property
     def current(self) -> tuple[Any, Settings]:
-        """The client and settings every request should use right now."""
+        """The configured client and settings used for every request."""
 
         return self._client, self._settings
 
-    @property
-    def available(self) -> bool:
-        """``True`` when a usable second provider is configured."""
-
-        return self._fallback_settings is not None
-
     def send(self, build_kwargs: Any) -> Any:
-        """Send one request, moving to the fallback provider when the first one fails.
-
-        ``build_kwargs`` takes the settings to build for, because the two providers do
-        not share a request: the model name and the thinking field both differ, so the
-        body has to be rebuilt for whichever one is answering.
-        """
+        """Make exactly one request and surface its failure without retrying."""
 
         try:
-            return self._client.chat.completions.create(**build_kwargs(self._settings))
+            return self._client.chat.completions.create(
+                **build_kwargs(self._settings)
+            )
         except TranslationError:
-            # Our own diagnosis - a bad setting, a missing key, an unusable endpoint.
-            # Wrapping it as a transport failure would hide a configuration mistake and
-            # invite a pointless retry on the other provider.
             raise
         except Exception as exc:
-            if not self.available or self.switched_from is not None:
-                raise _as_request_error(exc, self._settings) from exc
-            if not _could_another_provider_succeed(exc):
-                raise _as_request_error(exc, self._settings) from exc
-
-            self._announce(exc)
-            try:
-                return self._fallback_client.chat.completions.create(
-                    **build_kwargs(self._settings)
-                )
-            except TranslationError:
-                raise
-            except Exception as second:
-                raise _as_request_error(second, self._settings) from second
-
-    def _announce(self, exc: Exception) -> None:
-        """Move to the fallback and say so on stderr."""
-
-        assert self._fallback_settings is not None  # guarded by ``available``
-        self.switched_from = self._settings.translation_provider
-        self._client = self._fallback_client
-        self._settings = self._fallback_settings
-        warnings.warn(
-            f"{self.switched_from} failed ({type(exc).__name__}: {exc}); the rest of "
-            f"this run will use {self._settings.translation_provider} "
-            f"({self._settings.translation_model}).",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
-
-def _build_failover(client: Any, settings: Settings) -> _Failover:
-    """Return the failover, building the second client only when it is usable.
-
-    A fallback whose key is missing is not a fallback, so no client is built for it: the
-    run reports that it has none rather than failing at the first request with a
-    credential error from a provider it was never meant to use.
-    """
-
-    fallback_settings = _fallback_settings(settings)
-    if fallback_settings is None:
-        return _Failover(client, settings)
-
-    try:
-        fallback_client = _build_client(
-            fallback_settings, fallback_settings.translation_api_key
-        )
-    except TranslationError:
-        # An unusable fallback must not stop a run that may never need it. The report
-        # says which provider is missing a key, so it is not silent.
-        return _Failover(client, settings)
-
-    return _Failover(client, settings, fallback=fallback_client)
+            raise _as_request_error(exc, self._settings) from exc
 
 
 def describe_fallback(settings: Settings) -> str:
-    """Describe what the fallback will do, so a run cannot hide that it has none."""
+    """Report that translation requests are never retried or failed over."""
 
-    name = (settings.translation_fallback_provider or "").strip()
-    if not name:
-        return "no fallback provider configured"
-    if _fallback_settings(settings) is None:
-        provider = translation_provider_defaults(name)
-        return (
-            f"{name} fallback unavailable: set {provider.api_key_env} to enable it"
-        )
-    return f"falls back to {name} if {settings.translation_provider} fails"
+    return "disabled; each batch makes one request and failures stop the run"
 
 
 def _adapt_batch(
-    failover: _Failover,
+    failover: _SingleRequest,
     batch: list[TranscriptSegment],
     ids: list[str],
     *,
     context: str | None = None,
     budgets: Sequence[SyllableBudget] | None = None,
     rewrite: str | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> list[AdaptedDialogue]:
     """Adapt one batch of consecutive lines, in order.
 
@@ -1038,11 +936,41 @@ def _adapt_batch(
     was given the first time.
     """
 
-    response = failover.send(
-        lambda settings: _request_kwargs(
-            settings, batch, ids, context=context, budgets=budgets, rewrite=rewrite
+    request_kind = "rewrite" if rewrite is not None else "initial"
+    provider = failover.current[1].translation_provider
+    request_started = time.perf_counter()
+    try:
+        response = failover.send(
+            lambda settings: _request_kwargs(
+                settings, batch, ids, context=context, budgets=budgets, rewrite=rewrite
+            )
         )
-    )
+    except Exception:
+        current_provider = failover.current[1].translation_provider
+        provider_path = (
+            provider
+            if current_provider == provider
+            else f"{provider} -> {current_provider}"
+        )
+        if on_progress is not None:
+            on_progress(
+                f"  translation {request_kind} request for {len(batch)} line(s) "
+                f"via {provider_path} failed after "
+                f"{time.perf_counter() - request_started:.1f}s"
+            )
+        raise
+    if on_progress is not None:
+        current_provider = failover.current[1].translation_provider
+        provider_path = (
+            provider
+            if current_provider == provider
+            else f"{provider} -> {current_provider}"
+        )
+        on_progress(
+            f"  translation {request_kind} request for {len(batch)} line(s) "
+            f"via {provider_path} completed in "
+            f"{time.perf_counter() - request_started:.1f}s"
+        )
 
     lines = _parse_response(_response_content(response), ids)
     return [_build(segment, line_id, lines[line_id]) for segment, line_id in zip(batch, ids)]
@@ -1050,7 +978,7 @@ def _adapt_batch(
 
 #: Maximum number of rewrite requests per original batch. Lines that do not improve
 #: after a rewrite are not sent again.
-MAXIMUM_REDUCTION_ATTEMPTS = 1
+MAXIMUM_REDUCTION_ATTEMPTS = 0
 
 #: What each successive rewrite is told to cut. Escalating matters more than repeating:
 #: a model asked the same question twice returns nearly the same line, whereas a model
@@ -1107,7 +1035,7 @@ def _is_improvement(
 
 
 def _reduce_overshooting_lines(
-    failover: _Failover,
+    failover: _SingleRequest,
     batch: list[TranscriptSegment],
     first_position: int,
     adapted: list[AdaptedDialogue],
@@ -1118,6 +1046,7 @@ def _reduce_overshooting_lines(
     enforce_budget: bool = True,
     enforce_fidel_loanwords: bool = True,
     maximum_attempts: int = MAXIMUM_REDUCTION_ATTEMPTS,
+    on_progress: Callable[[str], None] | None = None,
 ) -> tuple[list[AdaptedDialogue], tuple[BudgetVerdict, ...]]:
     """Ask again for the lines that came back wrong, and say how.
 
@@ -1132,16 +1061,38 @@ def _reduce_overshooting_lines(
       written in Fidel, because the voice that speaks it reads Fidel. A rule in the
       prompt is not a guarantee, so this is verified rather than trusted.
 
-    Only offending lines are resent. The default is one rewrite request per batch;
-    additional attempts can be configured, but a line is not retried after it stops
-    improving.
+    Only offending lines are resent. Rewriting is disabled by default to keep each
+    batch to one hosted request; it can be opted into, and a line is not retried after
+    it stops improving.
     """
 
     if maximum_attempts <= 0:
-        return adapted, tuple(
+        verdicts = tuple(
             budget.verdict(line.amharic, tolerance=tolerance)
             for budget, line in zip(budgets, adapted)
         )
+        over_budget = (
+            sum(not verdict.within_tolerance for verdict in verdicts)
+            if enforce_budget
+            else 0
+        )
+        roman_lines = (
+            sum(bool(latin_spans(line.amharic)) for line in adapted)
+            if enforce_fidel_loanwords
+            else 0
+        )
+        if on_progress is not None and (over_budget or roman_lines):
+            issues: list[str] = []
+            if over_budget:
+                issues.append(f"{over_budget} over syllable budget")
+            if roman_lines:
+                issues.append(f"{roman_lines} with Roman-script text")
+            on_progress(
+                "  translation rewrites disabled; "
+                + " and ".join(issues)
+                + " left as initially generated"
+            )
+        return adapted, verdicts
 
     verdicts = tuple(
         budget.verdict(line.amharic, tolerance=tolerance)
@@ -1187,6 +1138,7 @@ def _reduce_overshooting_lines(
             "Rewrite each of these lines to fix the problem described against it, "
             "keeping the meaning, tone and character:\n" + "\n".join(instructions)
         ),
+        on_progress=on_progress,
     )
     improved: set[int] = set()
     for slot, line in zip(offenders, retried):
@@ -1212,11 +1164,12 @@ def _reduce_overshooting_lines(
         attempts=maximum_attempts - 1,
         total_attempts=maximum_attempts,
         retryable=frozenset(improved),
+        on_progress=on_progress,
     )
 
 
 def _reduce_again(
-    failover: _Failover,
+    failover: _SingleRequest,
     batch: list[TranscriptSegment],
     first_position: int,
     adapted: list[AdaptedDialogue],
@@ -1229,6 +1182,7 @@ def _reduce_again(
     attempts: int,
     total_attempts: int,
     retryable: frozenset[int] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> tuple[list[AdaptedDialogue], tuple[BudgetVerdict, ...]]:
     """Keep asking about a line that is still over, while attempts remain.
 
@@ -1296,6 +1250,7 @@ def _reduce_again(
             "Rewrite each of these lines to fix the problem described against it, "
             "keeping the meaning, tone and character:\n" + "\n".join(instructions)
         ),
+        on_progress=on_progress,
     )
     for slot, line in zip(offenders, retried):
         if _is_improvement(
@@ -1317,6 +1272,7 @@ def _reduce_again(
         attempts=attempts - 1,
         total_attempts=total_attempts,
         retryable=frozenset(improved),
+        on_progress=on_progress,
     )
 
 
@@ -1345,27 +1301,13 @@ def _adapt_with_nllb(
     Amharic text and nothing else - see :data:`NEUTRAL_EMOTION` for why the
     performance fields are defaults here.
 
-    A line whose Amharic will not fit the time it has is translated a second time with a
-    decoding preference for brevity (see
-    :data:`app.config.DEFAULT_TRANSLATION_SHORTEN_PENALTY`) and the shorter rendering is
-    kept when it is genuinely shorter. That is the only lever NLLB offers over the length
-    of a translation - it cannot be instructed, only searched - and it exists because a
-    dub of a longer language otherwise has to choose between two bad outcomes: speak over
-    the next line, or cut this one short. Neither is necessary if the text itself can be
-    made more economical, and a shorter rendering of the same sentence is the cheapest
-    place to find the time.
+    Each line is translated exactly once. Lines that exceed their available time remain
+    intact and are reported by the downstream timing and quality checks.
     """
 
     engine = translator if translator is not None else nllb.load_translator(settings=settings)
 
-    rate = settings.translation_syllables_per_second
-    rooms = placement_windows(
-        [(segment.start, segment.end) for segment in transcript],
-        gap=settings.timing_min_line_gap,
-    )
-
     adapted: list[AdaptedDialogue] = []
-    shortened = 0
     for index, segment in enumerate(transcript, start=1):
         line_id = _dialogue_id(index)
         try:
@@ -1377,24 +1319,6 @@ def _adapt_with_nllb(
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
-        text = translated.text
-        room = rooms[index - 1]
-        budget = max(1, round(room * rate))
-        if count_syllables(text) > budget:
-            try:
-                shorter = engine.translate(
-                    segment.text, length_penalty=settings.translation_shorten_penalty
-                )
-            except Exception:
-                # A best-effort improvement: the first rendering is already valid, so a
-                # failure here leaves the line usable rather than failing the run.
-                shorter = None
-            if shorter is not None and 0 < count_syllables(shorter.text) < count_syllables(
-                text
-            ):
-                text = shorter.text
-                shortened += 1
-
         try:
             adapted.append(
                 AdaptedDialogue(
@@ -1402,7 +1326,7 @@ def _adapt_with_nllb(
                     start=segment.start,
                     end=segment.end,
                     source_text=segment.text,
-                    amharic=text,
+                    amharic=translated.text,
                     emotion=NEUTRAL_EMOTION,
                     intensity=NEUTRAL_INTENSITY,
                     delivery=NEUTRAL_DELIVERY,
@@ -1415,10 +1339,6 @@ def _adapt_with_nllb(
                 f"NLLB returned an unusable translation for {line_id!r}: {exc}"
             ) from exc
 
-    if shortened:
-        # Reported by the caller: this module returns dialogue, and the orchestrator owns
-        # what a run says about itself.
-        pass
     return adapted
 
 
@@ -1467,19 +1387,16 @@ def adapt_dialogue(
         budget a line may be before it is sent back to be shortened. Both come
         from :mod:`app.pipeline.dialogue_context`.
     enforce_budget:
-        When ``True`` (the default), a line that comes back too long for its window
-        is re-asked once by default. Set ``False`` to send every line exactly once,
-        which is cheaper and is the right choice for a comparison run.
+        When ``True`` (the default), the result is checked against its time budget.
+        A line that misses the budget is reported but never re-asked.
     enforce_fidel_loanwords:
-        When ``True`` (the default), a line that comes back with Roman-script text
-        in it is re-asked once by default to have those words written in Fidel. Borrowed
-        English words are *meant* to stay - an Amharic speaker says "ኮምፒውተር", not a
-        dictionary equivalent - but the voice that speaks the result reads Fidel, so
-        a word left in Roman letters cannot be pronounced. Sharing the same pass as
-        the budget check, so a batch is never re-asked twice.
+        When ``True`` (the default), Roman-script text is detected and reported.
+        Borrowed English words are *meant* to stay - an Amharic speaker says
+        "ኮምፒውተር", not a dictionary equivalent - but the voice that speaks the result
+        reads Fidel, so a word left in Roman letters cannot be pronounced.
     maximum_reduction_attempts:
-        Maximum number of rewrite requests per batch. Defaults to one; further requests
-        are made only for lines improved by the preceding rewrite.
+        Retained for compatibility. Hosted translation is one request per batch;
+        this value is ignored and no rewrite request is ever sent.
     on_progress:
         Optional callback for batch start and completion updates.
 
@@ -1541,13 +1458,19 @@ def adapt_dialogue(
             f"{settings.translation_backend!r}"
         )
 
+    if maximum_reduction_attempts != 0 and on_progress is not None:
+        on_progress(
+            "  translation rewrites disabled; each batch is sent exactly once"
+        )
+    maximum_reduction_attempts = 0
+
     # The endpoint is checked first: for a self-hosted server, being told which address
     # to state is more useful than being told about a key for an address never given.
     _require_served_endpoint(settings)
     api_key = _require_api_key(settings)
     batch_size = _resolve_batch_size(settings)
     client = _build_client(settings, api_key)
-    failover = _build_failover(client, settings)
+    single_request = _SingleRequest(client, settings)
 
     resolved_scenes = segment_scenes(transcript) if scenes is None else tuple(scenes)
 
@@ -1590,11 +1513,12 @@ def adapt_dialogue(
         )
 
         produced = _adapt_batch(
-            failover, batch, ids, context=context, budgets=budgets
+            single_request, batch, ids, context=context, budgets=budgets,
+            on_progress=on_progress,
         )
         if enforce_budget or enforce_fidel_loanwords:
             produced, _ = _reduce_overshooting_lines(
-                failover,
+                single_request,
                 batch,
                 first_position,
                 produced,
@@ -1604,6 +1528,7 @@ def adapt_dialogue(
                 enforce_budget=enforce_budget,
                 enforce_fidel_loanwords=enforce_fidel_loanwords,
                 maximum_attempts=maximum_reduction_attempts,
+                on_progress=on_progress,
             )
 
         adapted.extend(produced)

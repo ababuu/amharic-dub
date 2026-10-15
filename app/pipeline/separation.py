@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import math
 import os
+import time
 import warnings
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -201,7 +202,11 @@ def _max_segment_seconds(channels: int, sample_rate: int) -> float:
 
 
 def _infer_segmented(
-    session: Any, audio: np.ndarray, sample_rate: int
+    session: Any,
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    on_progress: Callable[[str], None] | None = None,
 ) -> dict[str, np.ndarray]:
     """Separate ``audio``, splitting it only when one call would not fit in memory.
 
@@ -214,7 +219,19 @@ def _infer_segmented(
     channels, samples = audio.shape
     longest = _max_segment_seconds(channels, sample_rate)
     if samples / sample_rate <= longest:
-        return _collect_stems(session.infer(audio, sample_rate=sample_rate))
+        started = time.perf_counter()
+        if on_progress is not None:
+            on_progress(
+                f"  separation inference segment 1/1 started "
+                f"({samples / sample_rate:.1f}s of audio)"
+            )
+        stems = _collect_stems(session.infer(audio, sample_rate=sample_rate))
+        if on_progress is not None:
+            on_progress(
+                f"  separation inference segment 1/1 completed in "
+                f"{time.perf_counter() - started:.1f}s"
+            )
+        return stems
 
     segment = int(round(longest * sample_rate))
     overlap = min(int(round(BANDIT_STITCH_SECONDS * sample_rate)), segment // 2)
@@ -228,11 +245,23 @@ def _infer_segmented(
     blended = {name: np.zeros((channels, samples), dtype=np.float32) for name in STEM_NAMES}
     weight = np.zeros(samples, dtype=np.float32)
 
-    for start in range(0, samples, step):
+    segment_count = (samples - 1) // step + 1
+    for segment_number, start in enumerate(range(0, samples, step), start=1):
         stop = min(start + segment, samples)
+        segment_started = time.perf_counter()
+        if on_progress is not None:
+            on_progress(
+                f"  separation inference segment {segment_number}/{segment_count} "
+                f"started ({(stop - start) / sample_rate:.1f}s of audio)"
+            )
         stems = _collect_stems(
             session.infer(audio[:, start:stop], sample_rate=sample_rate)
         )
+        if on_progress is not None:
+            on_progress(
+                f"  separation inference segment {segment_number}/{segment_count} "
+                f"completed in {time.perf_counter() - segment_started:.1f}s"
+            )
 
         # Ramp a segment in at its head and out at its tail, but only where another
         # segment actually overlaps it, so the first and last segments keep their edges.
@@ -283,7 +312,12 @@ def _release_cuda_cache() -> None:
 
 
 def _infer_adaptively(
-    session: Any, audio: np.ndarray, sample_rate: int, batch_size: int
+    session: Any,
+    audio: np.ndarray,
+    sample_rate: int,
+    batch_size: int,
+    *,
+    on_progress: Callable[[str], None] | None = None,
 ) -> dict[str, np.ndarray]:
     """Separate in the largest chunk batch that fits, halving it when it does not.
 
@@ -303,13 +337,28 @@ def _infer_adaptively(
 
     while True:
         _configure_chunking(session, current)
+        attempt_started = time.perf_counter()
+        if on_progress is not None:
+            on_progress(
+                f"  separation inference started "
+                f"(batch size {current} chunks per forward pass)"
+            )
         try:
-            stems = _infer_segmented(session, audio, sample_rate)
+            stems = _infer_segmented(
+                session, audio, sample_rate, on_progress=on_progress
+            )
         except Exception as exc:
             if current == 1 or not _is_out_of_memory(exc):
                 raise
             _release_cuda_cache()
-            current = max(1, current // 2)
+            next_size = max(1, current // 2)
+            if on_progress is not None:
+                on_progress(
+                    f"  separation inference ran out of memory at batch size "
+                    f"{current} after {time.perf_counter() - attempt_started:.1f}s; "
+                    f"retrying at {next_size}"
+                )
+            current = next_size
             continue
 
         if current != asked:
@@ -320,11 +369,21 @@ def _infer_adaptively(
                 RuntimeWarning,
                 stacklevel=2,
             )
+        if on_progress is not None:
+            on_progress(
+                f"  separation inference completed in "
+                f"{time.perf_counter() - attempt_started:.1f}s "
+                f"(batch size {current})"
+            )
         return stems
 
 
 def _run_bandit(
-    audio: np.ndarray, settings: Settings, weights_dir: Path
+    audio: np.ndarray,
+    settings: Settings,
+    weights_dir: Path,
+    *,
+    on_progress: Callable[[str], None] | None = None,
 ) -> Mapping[str, np.ndarray]:
     """Load a BandIt session, run inference, and always close the session."""
 
@@ -343,9 +402,21 @@ def _run_bandit(
         ) from exc
 
     try:
+        load_started = time.perf_counter()
+        if on_progress is not None:
+            on_progress("  separation model loading started")
         session.load()
+        if on_progress is not None:
+            on_progress(
+                f"  separation model loading completed in "
+                f"{time.perf_counter() - load_started:.1f}s"
+            )
         return _infer_adaptively(
-            session, audio, REQUIRED_SAMPLE_RATE, settings.separation_inference_batch_size
+            session,
+            audio,
+            REQUIRED_SAMPLE_RATE,
+            settings.separation_inference_batch_size,
+            on_progress=on_progress,
         )
     except SeparationError:
         raise
@@ -395,6 +466,7 @@ def separate_stems(
     output_dir: str | Path | None = None,
     *,
     settings: Settings | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> StemPaths:
     """Split ``input_path`` into speech/music/effects stems with BandIt v2 Multi.
 
@@ -407,6 +479,8 @@ def separate_stems(
         project ``WORK_DIR``. Created when missing.
     settings:
         Project settings override; defaults to :func:`app.config.get_settings`.
+    on_progress:
+        Optional callback for audio I/O, model loading and inference timing updates.
 
     Returns
     -------
@@ -417,11 +491,17 @@ def separate_stems(
     settings = settings if settings is not None else get_settings()
     source = Path(input_path)
 
+    read_started = time.perf_counter()
     audio, sample_rate = read_audio(source)
     _validate_sample_rate(sample_rate)
+    if on_progress is not None:
+        on_progress(
+            f"  separation audio read in {time.perf_counter() - read_started:.1f}s "
+            f"({audio.shape[1] / sample_rate:.1f}s, {audio.shape[0]} channel(s))"
+        )
 
     weights_dir = resolve_weights_dir(settings)
-    stems = _run_bandit(audio, settings, weights_dir)
+    stems = _run_bandit(audio, settings, weights_dir, on_progress=on_progress)
     collected = _collect_stems(stems)
 
     destination = Path(output_dir) if output_dir is not None else Path(settings.work_dir)
@@ -429,10 +509,16 @@ def separate_stems(
 
     prefix = source.stem
     written: dict[str, Path] = {}
+    write_started = time.perf_counter()
     for name in STEM_NAMES:
         stem_path = destination / f"{prefix}_{name}.wav"
         _write_stem(stem_path, collected[name], sample_rate)
         written[name] = stem_path
+    if on_progress is not None:
+        on_progress(
+            f"  separation stem writes completed in "
+            f"{time.perf_counter() - write_started:.1f}s"
+        )
 
     return StemPaths(
         speech=written["speech"],

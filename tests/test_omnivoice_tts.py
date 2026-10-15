@@ -226,8 +226,7 @@ def test_amharic_is_named_the_way_omnivoice_spells_it(
     )
 
     call = FakeOmniVoice.instances[0].calls[0]
-    assert call["language"] == tts.OMNIVOICE_AMHARIC == "am"
-    assert call["language"] != "amh"
+    assert call["language"] == tts.OMNIVOICE_AMHARIC == "Amharic"
 
 
 def test_sampling_is_pinned_so_a_run_can_be_reproduced(
@@ -607,6 +606,41 @@ def test_the_cloning_path_gives_each_speaker_their_own_voice(
         str(profiles[SPEAKER].resolve_reference_audio()),
         str(profiles[OTHER_SPEAKER].resolve_reference_audio()),
     }
+
+
+def test_changed_actor_reference_invalidates_the_cached_take(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch(monkeypatch)
+    settings = _settings(tmp_path)
+    profile = _profile(tmp_path)
+    output_dir = tmp_path / "tts"
+
+    first = synthesize_dialogue_detailed(
+        [_line()],
+        _reference(tmp_path, "stem.wav", seconds=8.0),
+        {SPEAKER: profile},
+        output_dir=output_dir,
+        settings=settings,
+    )
+
+    sf.write(
+        str(profile.resolve_reference_audio()),
+        np.full(24_000 * 5, 0.2, dtype=np.float32),
+        24_000,
+        format="WAV",
+        subtype="PCM_16",
+    )
+    second = synthesize_dialogue_detailed(
+        [_line()],
+        _reference(tmp_path, "stem.wav", seconds=8.0),
+        {SPEAKER: profile},
+        output_dir=output_dir,
+        settings=settings,
+    )
+
+    assert first.clips[0].audio_path != second.clips[0].audio_path
+    assert len(FakeOmniVoice.instances[0].calls) == 2
 
 
 def test_an_engine_that_meets_no_contract_is_rejected(

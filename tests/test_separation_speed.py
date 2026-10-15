@@ -124,6 +124,26 @@ def test_several_chunks_are_pushed_per_forward_pass(tmp_path: Path) -> None:
     assert session._runtime.handler.inference_batch_size == 8
 
 
+def test_separation_reports_io_loading_and_inference_progress(tmp_path: Path) -> None:
+    source = _write_video_audio(tmp_path / "clip.wav", 1.0)
+    updates: list[str] = []
+
+    separate_stems(
+        source,
+        tmp_path / "out",
+        settings=_settings(tmp_path),
+        on_progress=updates.append,
+    )
+
+    assert any("separation audio read in" in update for update in updates)
+    assert "  separation model loading started" in updates
+    assert any("separation model loading completed in" in update for update in updates)
+    assert any("inference segment 1/1 started" in update for update in updates)
+    assert any("inference segment 1/1 completed in" in update for update in updates)
+    assert any("separation inference completed in" in update for update in updates)
+    assert any("separation stem writes completed in" in update for update in updates)
+
+
 def test_a_batch_size_below_one_is_clamped(tmp_path: Path) -> None:
     """A zero or negative batch would make the handler loop forever."""
 
@@ -342,15 +362,19 @@ def test_an_out_of_memory_batch_is_halved_instead_of_ending_the_run(
     MemoryLimitedSession.attempts = []
     separation.BanditSession = MemoryLimitedSession  # type: ignore[assignment]
     source = _write_video_audio(tmp_path / "clip.wav", 1.0)
+    updates: list[str] = []
 
     with pytest.warns(RuntimeWarning, match="ran out of memory"):
         paths = separate_stems(
             source,
             tmp_path / "out",
             settings=_settings(tmp_path, separation_inference_batch_size=32),
+            on_progress=updates.append,
         )
 
     assert MemoryLimitedSession.attempts == [32, 16, 8, 4]
+    assert any("out of memory at batch size 32" in update for update in updates)
+    assert any("retrying at 16" in update for update in updates)
     assert isinstance(paths, StemPaths)
     # And the audio is still produced at the size that worked.
     assert paths.speech.is_file()

@@ -87,6 +87,7 @@ def _clip(
     index: int = 0,
     start: float = 5.0,
     end: float = 5.8,
+    speaker_id: str = "SPEAKER_00",
     audio: Path | None = None,
     speech: float = SPEECH,
     lead: float = LEAD,
@@ -95,7 +96,7 @@ def _clip(
     """Return a TtsClip whose original window is ``start``-``end``."""
 
     dialogue = AdaptedDialogue(
-        speaker_id="SPEAKER_00",
+        speaker_id=speaker_id,
         start=start,
         end=end,
         source_text="I love you.",
@@ -712,6 +713,55 @@ def test_lines_never_overlap_when_trimming_is_asked_for(tmp_path: Path) -> None:
         assert earlier.end <= later.start + 1e-6
 
 
+@pytest.mark.parametrize(
+    ("second_start", "speaker_id", "expected_start"),
+    [
+        (5.75, "SPEAKER_01", 5.75),
+        (5.1, "SPEAKER_01", 5.7),
+        (5.1, "SPEAKER_00", 6.0),
+    ],
+)
+def test_cascade_caps_source_overlap_and_prevents_same_speaker_overlap(
+    tmp_path: Path, second_start: float, speaker_id: str, expected_start: float
+) -> None:
+    first_clip = _clip(
+        tmp_path, index=0, start=5.0, end=6.0, speech=1.0, lead=0.0, trail=0.0
+    )
+    second_clip = _clip(
+        tmp_path,
+        index=1,
+        start=second_start,
+        end=second_start + 1.0,
+        speaker_id=speaker_id,
+        speech=1.0,
+        lead=0.0,
+        trail=0.0,
+    )
+
+    def aligned(index: int, clip: TtsClip, start: float) -> AlignedClip:
+        return AlignedClip(
+            index=index,
+            clip=clip,
+            audio_path=clip.audio_path,
+            sample_rate=CLIP_RATE,
+            start=start,
+            tempo=1.0,
+            required_tempo=1.0,
+            speech_duration=1.0,
+            original_window=1.0,
+            rendered_pause_before=0.0,
+            rendered_pause_after=0.0,
+        )
+
+    result = timing._cascade(
+        [aligned(0, first_clip, 5.0), aligned(1, second_clip, second_start)],
+        guard=0.0,
+        overlap=0.3,
+    )
+
+    assert result[1].start == pytest.approx(expected_start)
+
+
 def test_nothing_is_cut_when_there_is_no_next_line(tmp_path: Path) -> None:
     """A lone line harms nobody by running long, so cutting it would be gratuitous."""
 
@@ -727,5 +777,3 @@ def test_nothing_is_cut_when_there_is_no_next_line(tmp_path: Path) -> None:
 
     assert aligned.trimmed == 0.0
     assert aligned.available == pytest.approx(0.8)
-
-

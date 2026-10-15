@@ -217,6 +217,8 @@ class PipelineResult:
                     ),
                     "quality_score": profile.quality_score,
                     "selection_reason": profile.selection_reason,
+                    "estimated_vocal_presentation": profile.estimated_vocal_presentation,
+                    "estimated_pitch_hz": profile.estimated_pitch_hz,
                 }
                 for speaker_id, profile in self.profiles.items()
             },
@@ -476,6 +478,7 @@ def run_pipeline(
         track,
         output_dir=stages_dir,
         settings=resolved,
+        on_progress=report,
     )
 
     diarized = _stage(
@@ -554,9 +557,10 @@ def run_pipeline(
             f"{resolved.translation_model} "
             f"({translation.describe_thinking(resolved)})"
         )
-        # Whether a second provider is standing by is worth stating: a run that found
-        # out only when the first one failed would have found out too late.
         report(f"  adaptation fallback: {translation.describe_fallback(resolved)}")
+        report(
+            "  adaptation requests: one per batch; no rewrites, retries, or failover"
+        )
         # Only the instruction-following backend reads the bible, so only it can report
         # having applied one.
         if bible:
@@ -590,37 +594,28 @@ def run_pipeline(
             crosstalk=crosstalk,
             transcript=lines,
             settings=resolved,
+            require_reference_transcript=True,
         )
         if not profiles:
             raise EmptyStageError(
                 "no voice profile could be built from the dialogue stem; the TTS stage "
                 "needs one identity reference per speaker"
             )
-
-        # A reference cut from the film is the original actor speaking English, which the
-        # cloning engine then carries into the Amharic as a foreign accent. Native-speaker
-        # recordings replace that at its source, so they are applied here - once, to the
-        # profiles every later stage reads - rather than anywhere near synthesis.
-        samples = voice_profiles.available_voice_samples(resolved.voice_sample_dir)
-        if samples:
-            profiles = _stage(
-                "voice_samples",
-                seconds,
-                report,
-                voice_profiles.apply_voice_samples,
-                profiles,
-                settings=resolved,
-                transcribe=transcription.build_amharic_transcriber(
-                    resolved, language="am"
-                ),
-            )
-            voices = sorted(
-                f"{speaker} -> {Path(profile.reference_audio).name}"
-                for speaker, profile in profiles.items()
+        report(
+            "  voice references: using clean, transcript-matched film-actor audio "
+            "(one continuous 4-10 second interval per character; "
+            "Amharic-tuned OmniVoice)"
+        )
+        for speaker_id, profile in profiles.items():
+            pitch = (
+                f", median pitch {profile.estimated_pitch_hz:.0f} Hz"
+                if profile.estimated_pitch_hz is not None
+                else ""
             )
             report(
-                f"  voice samples: {len(samples)} recording(s) replaced the film's own "
-                f"audio ({', '.join(speaker for speaker in voices)})"
+                f"  voice presentation estimate: {speaker_id} "
+                f"{profile.estimated_vocal_presentation}{pitch}; actor reference "
+                "is the voice identity"
             )
 
     spoken = dialogue

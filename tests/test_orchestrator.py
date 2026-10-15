@@ -196,7 +196,14 @@ class Stages:
         self._record("extract", source, destination, settings)
         return self.track
 
-    def separate_stems(self, track: Path, *, output_dir: Path, settings: Settings):  # noqa: ANN201
+    def separate_stems(
+        self,
+        track: Path,
+        *,
+        output_dir: Path,
+        settings: Settings,
+        on_progress: object = None,
+    ):  # noqa: ANN201
         from app.pipeline.separation import StemPaths
 
         self._record("separation", track, output_dir, settings)
@@ -240,8 +247,16 @@ class Stages:
         transcript: object,
         crosstalk: object = (),
         settings: Settings,
+        require_reference_transcript: bool = False,
     ) -> dict[str, VoiceProfile]:
-        self._record("voice_profiles", turns, speech, transcript, settings)
+        self._record(
+            "voice_profiles",
+            turns,
+            speech,
+            transcript,
+            settings,
+            require_reference_transcript,
+        )
         self.seen_crosstalk = crosstalk
         return dict(self.profiles)
 
@@ -340,6 +355,14 @@ def test_stage_order_is_the_documented_order() -> None:
         "mixing",
         "mux",
     )
+
+
+def test_omnivoice_profiles_require_clean_matching_actor_transcripts(
+    tmp_path: Path, stages: Stages
+) -> None:
+    run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    assert stages.received["voice_profiles"][-1] is True
 
 
 def test_every_stage_runs_once_in_order(
@@ -611,49 +634,25 @@ def test_the_bible_is_reported_as_applied_only_when_it_is(
     assert "NLLB translates line by line" not in reported
 
 
-def test_voice_samples_replace_the_films_own_references(
-    tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch
+def test_voice_sample_files_do_not_replace_film_actor_references(
+    tmp_path: Path, stages: Stages
 ) -> None:
-    """The wiring is where this can quietly do nothing, so it is asserted end to end.
-
-    A real sample file is written and the real ``apply_voice_samples`` runs, but the
-    transcriber is replaced: loading Whisper inside a unit test would download a model,
-    and what is being checked here is that the orchestration hands the samples to the
-    stage that reads them.
-    """
-    import numpy as np
-    import soundfile as sf
-
-    from app.pipeline import orchestrator as orchestrator_module
-
     samples = tmp_path / "samples"
     samples.mkdir()
-    sf.write(
-        str(samples / "native.wav"),
-        (np.random.default_rng(0).standard_normal(20 * 44_100) * 0.3).astype(np.float32),
-        44_100,
-        subtype="PCM_16",
-    )
-    monkeypatch.setattr(
-        orchestrator_module.transcription,
-        "build_amharic_transcriber",
-        lambda *_, **__: (lambda path: "ሰላም"),
-    )
+    (samples / "native.wav").write_bytes(b"sample")
     settings = _settings(tmp_path, voice_sample_dir=samples)
     messages: list[str] = []
 
-    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+    result = run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
 
     reported = " ".join(messages)
-    assert "voice samples" in reported
-    # The TTS stage must receive the trimmed sample, not the film's own audio. Read from
-    # the fake's record of the call: the fixture's own dict is the *input* to the
-    # replacement, so asserting on that would pass whether or not the wiring worked.
+    assert "voice samples" not in reported
+    assert "voice references: using the film actors" in reported
+    assert "voice_samples" not in result.stage_seconds
     (_dialogue, _speech, received, passed_settings) = stages.received["tts"]
     (profile,) = received.values()
-    assert profile.reference_audio.name == "sample_reference.wav"
-    assert profile.reference_text == "ሰላም"
-    assert profile.reference_audio.exists()
+    assert profile.reference_audio == stages.profiles[SPEAKER].reference_audio
+    assert profile.reference_text == stages.profiles[SPEAKER].reference_text
 
 
 def test_without_samples_the_films_own_references_are_used(
@@ -841,6 +840,10 @@ def test_progress_receives_one_line_per_stage(
     reported = [message.strip() for message in messages]
     for name in STAGE_ORDER:
         assert f"-> {name}" in reported
+    assert (
+        "adaptation requests: one per batch; no rewrites, retries, or failover"
+        in reported
+    )
 
 
 # ---------------------------------------------------------------------------

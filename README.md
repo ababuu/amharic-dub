@@ -44,7 +44,7 @@ flowchart LR
 | Diarization          | pyannote Community-1                    |
 | Transcription        | faster-whisper large-v3                 |
 | Translation/adaptation | **NLLB-200 3.3B** (default, local) or any OpenAI-compatible endpoint (opt-in) |
-| Speech synthesis     | **OmniVoice** (`k2-fsa/OmniVoice`, default, cloned voice per character) or MMS-TTS Amharic (single voice) |
+| Speech synthesis     | **OmniVoice Amharic** (`african-low-resource/omnivoice-amharic`, default, cloned voice per character) or MMS-TTS Amharic (single voice) |
 | Quality control      | `qc.py` (model-free; pronunciation measurement is injected) |
 
 ## Choosing a translation backend
@@ -57,7 +57,7 @@ difference is worth understanding before changing it:
 | What it is | an instruction-following LLM | a translation model, 200 languages |
 | Amharic translation quality | weaker than NLLB on measured benchmarks | stronger |
 | Scene/character context | yes, via the character bible | no |
-| Syllable budget + re-ask | **yes, and iterated** | no |
+| Syllable budget + validation | **yes; one request per batch** | no |
 | Borrowed-word policy (Fidel) | **enforced** | not expressible |
 | Per-line performance metadata | emotion, intensity, delivery, pauses | neutral defaults |
 | Runs locally, no key | no | yes |
@@ -81,11 +81,14 @@ need a rough translation, are offline, or want to compare.
 **The honest limitation.** Amharic does not fit into English time. The English actor said
 "I am not in danger, Skyler." in 1.96s; the shortest faithful Amharic is about 12
 syllables, which no delivery squeezes into that. Measured across two independent models,
-both came back at **~1.7-1.8x** the available time. Iterated re-asking (see
-`TRANSLATION_MAX_REDUCTION_ATTEMPTS`) closes some of that, and the silence between lines
-absorbs some more, but a residue remains on tight lines. The pipeline's response is to
-report it rather than to hide it - and specifically **not** to cut the performance
-(see `TIMING_TRIM_TO_FIT`).
+both came back at **~1.7-1.8x** the available time. By default the pipeline makes one
+hosted call per batch; it still asks for concise Amharic and Fidel script in that first
+call, then reports lines that miss those targets rather than charging for a rewrite.
+Each batch is sent once: there are no rewrite requests, SDK retries, or provider
+failovers. The first prompt asks for concise Amharic and Fidel script, then the pipeline
+reports lines that miss those targets. A missing `GEMINI_API_KEY` selects DeepSeek before
+the first request; an actual request failure stops the run. The pipeline does not cut the
+performance (see `TIMING_TRIM_TO_FIT`).
 
 **Why NLLB, and why 3.3B.** This was checked against published Amharic numbers rather
 than assumed. NLLB-200 beats every open instruction-following model tried on Amharic:
@@ -180,10 +183,10 @@ against the `qc` block, rather than as a model swap that can be assumed to work.
 **Why OmniVoice is the default, and what that costs.** It is the only supported option
 that clones a voice *and* accepts a per-line length, which matters because the two worst
 defects in the last real run were unfitted lines (27 of 38) and a single flat voice.
-OmniVoice is a genuine k2-fsa release - paper, package, 600+ languages, Amharic among
-them - but its Amharic rests on about **12.8 hours** of its training data and has
-**never been evaluated**. So this is a bet on architecture and controllability, not on
-measured Amharic quality, and it is stated that way rather than dressed up.
+The Amharic-tuned checkpoint is used rather than the multilingual base model so the
+spoken language matches the fine-tuning. Its model card documents cloning but does not
+publish quality benchmarks, so this is a language-specific choice, not a claim that the
+output has been independently evaluated.
 
 **A third engine was removed, and why.** `TTS_ENGINE=chatterbox` used to speak through
 `gabar-tech/chatterbox-amharic` and then convert the take to the character's voice with
@@ -196,11 +199,31 @@ dependency and its tests are gone. If a future evaluation shows OmniVoice's unme
 Amharic is not good enough, that adapter is the obvious thing to bring back - and the
 `git` history still has it.
 
-`african-low-resource/omnivoice-amharic` (identical weights to `Lab-et/omnivoice-amharic`)
-is trained on far more Amharic - ~331 h against the base model's 12.8 h - but its model
-card reports **every** metric as "TBD", ships no samples, names no datasets, and its
-training corpus has been described as synthetic. It is a lead worth a listen, not an
-engine to trust; which is why it is not the default in either direction.
+`african-low-resource/omnivoice-amharic` (also published as
+`Lab-et/omnivoice-amharic`) is the Amharic-tuned checkpoint used by default. Its model
+card documents Amharic voice cloning; the inference example passes the language name
+`"Amharic"`. The card's objective and human-evaluation metrics remain **TBD**,
+so this is the best documented Amharic-specific option, not a claim of measured
+quality. Each character uses a clean, transcript-matched reference from the film; the
+reference must contain at least four seconds of speech, with ten seconds as the target.
+The pipeline reports a tentative pitch-based vocal-presentation estimate, but preserves
+the actor's voice by cloning the reference rather than treating that estimate as a
+gender label or synthesizer control.
+
+There is an important cross-language trade-off: OmniVoice's own guidance recommends
+recording the reference in the target language for standard pronunciation, and warns
+that cross-language cloning can carry the reference language's accent into generated
+speech. Since film actors usually speak English while the dub is Amharic, a carefully
+selected 4-10 second English reference can preserve actor identity but cannot guarantee
+native-sounding Amharic. Avoiding that accent while retaining the actor's identity
+would require a separately validated voice-conversion approach or an Amharic reference
+of that same actor; the latter usually is not available. The attached `movie_dub.py`
+uses the same English-reference strategy, so matching it does not remove this model
+limitation. One candidate for a future short A/B is
+[Seed-VC v2](https://github.com/Plachtaa/seed-vc): its documentation separates
+voice-conversion source speech from a target-voice reference and describes a timbre-only
+mode. It does not establish Amharic dubbing quality, so it is not added as an unverified
+extra model or processing stage.
 
 `mms` is retained for a single-narrator dub. It is a single-speaker VITS model, so every
 character comes out in the same voice; with it the voice-profile stage is skipped, the
@@ -338,7 +361,7 @@ environment, so values configured on the RunPod pod always win.
 | `DIARIZATION_MODEL` | Hugging Face pipeline id for diarization            | `pyannote/speaker-diarization-community-1` |
 | `DIARIZATION_MIN_SPEAKERS` | Fewest speakers diarization may report; unset lets it decide | *(unset)* |
 | `DIARIZATION_MAX_SPEAKERS` | Most speakers diarization may report; unset lets it decide | *(unset)* |
-| `SEPARATION_INFERENCE_BATCH_SIZE` | BandIt chunks per forward pass in the separation stage. The library defaults to **1**, which left a measured run spending 354 s of 590 s here; the chunks are independent, so batching is the same arithmetic with more of the GPU used. Sized for the 48 GB A40, and an out-of-memory pass halves the batch instead of failing the run | `32` |
+| `SEPARATION_INFERENCE_BATCH_SIZE` | BandIt chunks per forward pass in the separation stage. The library defaults to **1**, which left a measured run spending 354 s of 590 s here; the chunks are independent, so batching is the same arithmetic with more of the GPU used. **8** is the tested setting for a 48 GB A40; 16 and 32 ran out of memory and had to retry at smaller sizes. Higher values may suit larger GPUs; OOM recovery halves the batch rather than failing the run | `8` |
 | `TRANSCRIPTION_MODEL` | faster-whisper model for transcription            | `large-v3`         |
 | `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
 | `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |
@@ -348,11 +371,11 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSLATION_NUM_BEAMS` | NLLB beam width; `1` is greedy and deterministic | `1` |
 | `TRANSLATION_MAX_NEW_TOKENS` | Longest NLLB output per chunk, in tokens | `512` |
 | `TRANSLATION_LENGTH_PENALTY` | NLLB's preference over output length; `<1` favours brevity | `1.0` |
-| `TRANSLATION_SHORTEN_PENALTY` | The penalty a line that will not fit is re-translated with | `0.6` |
+| `TRANSLATION_SHORTEN_PENALTY` | Legacy compatibility setting; NLLB translation is single-pass | `0.6` |
 | `TRANSLATION_SYLLABLES_PER_SECOND` | Amharic delivery rate used to turn time into a syllable budget | `4.0` |
-| `TRANSLATION_MAX_REDUCTION_ATTEMPTS` | How many times a line may be sent back to be shortened | `3` |
+| `TRANSLATION_MAX_REDUCTION_ATTEMPTS` | Legacy compatibility setting; hosted translation always makes one request per batch | `0` |
 | `TTS_ENGINE`        | `omnivoice` (cloned, per character) or `mms` (single voice) | `omnivoice` |
-| `OMNIVOICE_MODEL`   | OmniVoice checkpoint used when `TTS_ENGINE=omnivoice` | `k2-fsa/OmniVoice` |
+| `OMNIVOICE_MODEL`   | OmniVoice checkpoint used when `TTS_ENGINE=omnivoice` | `african-low-resource/omnivoice-amharic` |
 | `OMNIVOICE_STEPS`   | Diffusion steps; `16` is the faster documented setting | `32` |
 | `OMNIVOICE_GUIDANCE_SCALE` | Classifier-free guidance scale         | `2.0` |
 | `OMNIVOICE_TORCH_DTYPE` | Precision of the OmniVoice weights          | `float16` |
@@ -360,14 +383,14 @@ environment, so values configured on the RunPod pod always win.
 | `MMS_SPEAKING_RATE` | Delivery speed for the whole film, asked of the MMS duration predictor before synthesis (`1.2` is ~16% faster; measured, not assumed) | `1.0` |
 | `TRANSLATION_BASE_URL` | OpenAI-compatible endpoint (only for `TRANSLATION_BACKEND=openai`). Unset, it follows `TRANSLATION_PROVIDER`; required for `other` | per provider |
 | `TRANSLATION_BATCH_SIZE` | Dialogue lines adapted per request           | `10`               |
-| `TRANSLATION_THINKING` | How much the model may reason before answering: `off`, `low`, `medium`, `high`, or `default` to send no thinking field at all. Mapped onto whatever the provider understands; the run reports what it actually sent | `medium` |
-| `TRANSLATION_FALLBACK_PROVIDER` | Provider to move to when the configured one fails, so a rate limit or an outage cannot end a film's translation. Sticky once it triggers, and announced; needs that provider's key. Not used for 400/422, which the second provider would refuse too | `deepseek` |
+| `TRANSLATION_THINKING` | How much the model may reason before answering: `off`, `low`, `medium`, `high`, or `default` to send no thinking field at all. `off` minimizes latency/cost where supported | `off` |
+| `TRANSLATION_FALLBACK_PROVIDER` | Legacy compatibility setting; failures are surfaced and never retried against another provider. Missing Gemini credentials select DeepSeek before the first request | `deepseek` |
 | `TRANSLATION_ENFORCE_BUDGET` | Send a line that is over its syllable budget back once to be shortened | `true` |
 | `TRANSLATION_ENFORCE_FIDEL_LOANWORDS` | Send a line that still carries Roman-script text back once to be written in Fidel | `true` |
 | `VOICE_PROFILE_DIR` | Per-speaker voice profiles directory                | `$WORK_DIR/voices` |
-| `VOICE_REFERENCE_MIN_DURATION` | Shortest usable voice-cloning reference  | `3.0`              |
+| `VOICE_REFERENCE_MIN_DURATION` | Shortest usable voice-cloning reference  | `4.0`              |
 | `VOICE_REFERENCE_TARGET_DURATION` | Preferred reference length            | `10.0`             |
-| `VOICE_REFERENCE_MAX_DURATION` | Longest reference kept (a longer continuous turn is scanned with a sliding window) | `15.0` |
+| `VOICE_REFERENCE_MAX_DURATION` | Longest reference kept (a longer continuous turn is scanned with a sliding window) | `10.0` |
 | `DIALOGUE_BIBLE_PATH` | Persistent character/consistency state for adaptation (see [Cinematic dialogue adaptation](#cinematic-dialogue-adaptation-dialogue_contextpy)) | `$WORK_DIR/dialogue_bible.json` |
 | `TTS_MODEL` | The single-voice engine's checkpoint, used when `TTS_ENGINE=mms` | `facebook/mms-tts-amh` |
 | `TTS_MAX_PAUSE_SECONDS` | Longest pause rendered around a synthesized line | `2.0` |
@@ -479,7 +502,7 @@ HUGGINGFACE_TOKEN=hf_...             # required - gated pyannote Community-1 wei
 GEMINI_API_KEY=...                   # required - the default backend is an LLM
 HF_HOME=/workspace/models_cache      # required on a Pod - see below
 MODEL_CACHE_DIR=/workspace/models_cache    # optional; defaults under the repo
-OMNIVOICE_MODEL=k2-fsa/OmniVoice     # optional - which speech checkpoint to clone with
+OMNIVOICE_MODEL=african-low-resource/omnivoice-amharic  # optional checkpoint override
 TTS_ENGINE=omnivoice                 # optional - omnivoice | mms
 ```
 
@@ -534,7 +557,7 @@ because the translation is an API call:
 
 | Model | Download | Note |
 | --- | --- | --- |
-| OmniVoice (default speech) | 3.0 GiB | plus the Amharic fine-tune, 2.4 GiB, only if you A/B it |
+| OmniVoice Amharic (default speech) | ~2.4 GiB | `african-low-resource/omnivoice-amharic`; the multilingual base is not downloaded |
 | faster-whisper `large-v3` | ~3 GiB | transcription |
 | BandIt v2 Multi | ~1 GiB | separation |
 | pyannote Community-1 | ~1 GiB | gated; needs the token |
@@ -954,9 +977,8 @@ states this explicitly (it previously said to keep the borrowed word without say
 in which script, which is precisely how `Walt` could come back unpronounceable), and
 because a rule in a prompt is not a guarantee it is **verified rather than trusted**:
 
-* Lines whose Amharic still contains Roman-script text are **sent back once** to have
-  those words written in Fidel, sharing the same pass as the syllable-budget check so
-  a batch is never re-asked twice.
+* Roman-script text is detected and reported, but never causes a second hosted request:
+  each batch is translated once to keep latency and API spend predictable.
 * The words themselves are listed in the run report and the manifest, because the
   *same word has to be spelled the same way everywhere it appears* - otherwise a
   character sounds like they are saying a different name each time. Pinning them in
@@ -1126,8 +1148,9 @@ pytest tests/test_config.py
       speak over the next one (28 overlapping lines -> 0 on the real test clip)
 - [x] Re-ask NLLB for a shorter rendering when a line cannot fit its available time
 - [x] Instruction-following adaptation as the default backend, so length and the
-      Fidel-script rule can actually be enforced; the rewrite is iterated and
-      bounded, and a line that still will not fit is reported rather than cut
+      Fidel-script rule can actually be checked in the first pass; targeted rewrites
+      are opt-in and bounded, and a line that still will not fit is reported rather
+      than cut
 - [x] `mms`: MMS-TTS Amharic single-voice engine
 - [ ] Removed engines: `chatterbox` + Seed-VC V2 were dropped as unused; restore only
       if a measured comparison shows OmniVoice's Amharic is not good enough
@@ -1177,8 +1200,8 @@ merit. What is currently in use, so the obligations are known rather than assume
 | pyannote Community-1 | **CC-BY-4.0**, gated | requires accepting the model card; the HF token must have read access |
 | faster-whisper `large-v3` | MIT | not gated |
 | NLLB-200 (`3.3B`) | **CC-BY-NC-4.0** | non-commercial weights; the code is MIT |
-| `k2-fsa/OmniVoice` | code Apache-2.0, weights **CC-BY-NC-4.0** | non-commercial because of its training data (Emilia) |
-| `african-low-resource/omnivoice-amharic` | card claims Apache-2.0, **unverifiable** | trained on the OmniVoice recipe, whose released weights are CC-BY-NC; no datasets named |
+| `african-low-resource/omnivoice-amharic` (also `Lab-et/omnivoice-amharic`) | card claims Apache-2.0, **unverifiable** | current default; trained on the OmniVoice recipe, whose released weights are CC-BY-NC; no datasets named |
+| `k2-fsa/OmniVoice` | code Apache-2.0, weights **CC-BY-NC-4.0** | available as an explicit checkpoint override; non-commercial because of its training data (Emilia) |
 | Gemini API | proprietary service | the default adaptation provider; swappable by configuration |
 | DeepSeek API | proprietary service | the alternative adaptation provider; swappable for a local OpenAI-compatible server |
 

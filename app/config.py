@@ -201,21 +201,16 @@ DEFAULT_TRANSLATION_GEMINI_BASE_URL = (
 #: How hard the served model is asked to think, one of ``off``, ``low``, ``medium``,
 #: ``high``. The adaptation stage is the one place in this pipeline where reasoning
 #: pays: it must read a scene, keep a character consistent, and hit a syllable count
-#: that is often far below a literal rendering. ``medium`` is the models' own default
-#: and is the safe resting point; ``high`` is worth trying on a film whose dialogue is
-#: dense with overlapping speech.
+#: that is often far below a literal rendering. ``off`` minimizes latency and cost;
+#: ``medium`` or ``high`` may help with difficult dialogue.
 #:
 #: ``off`` is honest about being a request rather than a guarantee: Gemini 3 models
 #: cannot disable reasoning, so on that provider it selects the lowest level available.
-DEFAULT_TRANSLATION_THINKING = "medium"
+DEFAULT_TRANSLATION_THINKING = "off"
 
-#: The provider a run moves to when the configured one fails, or ``""`` to disable.
-#:
-#: Adaptation is a hosted call, which makes it a single point of failure for a long run:
-#: a rate limit, an outage or an expired key would otherwise end a film's translation
-#: after hours of earlier work. The fallback is only used when its own key is present,
-#: and a switch is sticky - the failed provider is not asked again for each remaining
-#: batch - so one failure costs one retry rather than one per line.
+#: Retained for compatibility with existing environment files. Requests do not fail
+#: over: a missing Gemini key selects DeepSeek before the first request, while any
+#: request failure is surfaced immediately.
 DEFAULT_TRANSLATION_FALLBACK_PROVIDER = "deepseek"
 
 #: The model the other instruction-following provider asks for by default. Measured
@@ -253,15 +248,11 @@ DEFAULT_TRANSLATION_MAX_NEW_TOKENS = 512
 #: real run, the delivered speech came to 117s against 63s of original window. A dub can
 #: recover about a third of that from the silence between lines, and the rest has to come
 #: out of the text. NLLB cannot be *told* to be brief, but it can be *searched* for
-#: brevity, and this is that control. Left at the model's own default; see
-#: :data:`DEFAULT_TRANSLATION_SHORTEN_PENALTY` for the second pass.
+#: brevity. Left at the model's own default.
 DEFAULT_TRANSLATION_LENGTH_PENALTY = 1.0
 
-#: The length penalty a line is re-translated with when it will not fit the time it has.
-#: Below 1.0, because the only thing wrong with the first attempt is that it is too long.
-#: The shorter rendering is used only if it is actually shorter and still non-empty, and
-#: the choice is reported, so this trades a little literalness for a line that can be
-#: spoken in the time available.
+#: Legacy setting retained for compatibility. NLLB translation is single-pass and does
+#: not perform a second inference to shorten an over-budget line.
 DEFAULT_TRANSLATION_SHORTEN_PENALTY = 0.6
 
 #: Syllables per second an Amharic performer delivers, used to turn a span of time into a
@@ -273,9 +264,9 @@ DEFAULT_TRANSLATION_SHORTEN_PENALTY = 0.6
 DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND = 4.0
 
 #: Maximum number of rewrite requests for lines that miss the syllable budget or
-#: contain Roman-script text. One rewrite keeps the result self-correcting without
-#: multiplying the latency and cost of every batch; zero skips rewrites entirely.
-DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS = 1
+#: contain Roman-script text. Zero keeps each batch to one hosted model call, avoiding
+#: a second billable request; set to one to re-ask for targeted quality corrections.
+DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS = 0
 
 #: The endpoint the *served* instruction-following backend talks to by default.
 #: Kept under its original name for callers that already read it; the value follows the
@@ -310,25 +301,16 @@ DEFAULT_DIALOGUE_BIBLE_PATH = DEFAULT_WORK_DIR / DEFAULT_DIALOGUE_BIBLE_FILENAME
 #: Preferred length of a voice-cloning reference, in seconds. The target is the
 #: window the selector aims for, the minimum rejects snippets too short to clone
 #: from, and the maximum caps how much audio a single profile keeps around.
-DEFAULT_VOICE_REFERENCE_MIN_DURATION = 3.0
+DEFAULT_VOICE_REFERENCE_MIN_DURATION = 4.0
 DEFAULT_VOICE_REFERENCE_TARGET_DURATION = 10.0
-DEFAULT_VOICE_REFERENCE_MAX_DURATION = 15.0
+DEFAULT_VOICE_REFERENCE_MAX_DURATION = 10.0
 
-#: Directory of recordings of native Amharic voices, one file per character voice.
-#:
-#: A reference cut from the film is the original actor speaking **English**, and the
-#: cloning engine conditions on its reference: the delivered Amharic then carries that
-#: performance's phonetics, which is heard as a heavy English accent. A reference
-#: recorded by a native Amharic speaker removes that, because the audio *and* its
-#: transcript are then Amharic. Empty disables the mechanism, falling back to the film's
-#: own audio as before.
+#: Legacy sample-voice configuration retained so existing environment files continue
+#: to parse. The production pipeline no longer loads sample recordings; OmniVoice uses
+#: each character's own clean, transcript-matched actor reference instead.
 DEFAULT_VOICE_SAMPLE_DIR = PROJECT_ROOT / "data" / "voice-samples"
 
-#: Which sample each speaker uses, as ``SPEAKER_00=meseret.mp3,SPEAKER_01=eleni.mp3``.
-#:
-#: Speakers left out take the remaining files in sorted order, so two samples and two
-#: speakers need no configuration at all. The samples may be any length: each is trimmed
-#: to a cloning reference and transcribed before use.
+#: Legacy sample mapping, currently unused by the production pipeline.
 DEFAULT_VOICE_SAMPLE_MAP = ""
 
 #: Amharic speech engine consumed by :mod:`app.pipeline.tts`.
@@ -350,19 +332,11 @@ DEFAULT_TTS_MODEL = "facebook/mms-tts-amh"
 
 #: The OmniVoice checkpoint used when ``TTS_ENGINE=omnivoice``.
 #:
-#: ``k2-fsa/OmniVoice`` is the base model: hundreds of languages, Amharic among them,
-#: zero-shot cloning from a short reference. It is the safer default of the two
-#: OmniVoice options because it is a maintained release with a paper and a package
-#: behind it. What is *not* established is how well its Amharic performs: its language
-#: list gives Amharic about 12.8 hours of the data it was trained on, and no Amharic
-#: evaluation has been published for it. Treat any Amharic claim here as unmeasured.
-#:
-#: ``african-low-resource/omnivoice-amharic`` (also published as
-#: ``Lab-et/omnivoice-amharic``, same weights) is Amharic-only and trained on far more
-#: Amharic audio, so it is worth an A/B - but its model card reports every evaluation
-#: metric as "TBD", ships no samples, and names no datasets, so its quality is
-#: unverified in both directions. It is not the default for that reason.
-DEFAULT_OMNIVOICE_MODEL = "k2-fsa/OmniVoice"
+#: Amharic-tuned OmniVoice. The Lab-et page documents Amharic voice cloning; its
+#: example loads the same weights through the canonical african-low-resource id.
+#: Its published objective and human-evaluation metrics are still TBD, so quality
+#: must be judged from generated output rather than assumed from the fine-tuning.
+DEFAULT_OMNIVOICE_MODEL = "african-low-resource/omnivoice-amharic"
 
 #: Diffusion steps for OmniVoice. The model's own default is 32; 16 is the documented
 #: faster setting. Quality is traded for speed here, so the default is left alone.
@@ -471,10 +445,9 @@ DEFAULT_TIMING_MIN_LINE_GAP = 0.12
 #: **Off by default, deliberately.** Cutting is the one thing that damages the
 #: performance: the listener hears a word clipped off the end, and on a real run where
 #: the text was too long it happened to 31 of 38 lines, which sounds broken rather than
-#: fast. The pipeline's answer to a line that runs long is to make the *text* fit, and
-#: that is settled at the adaptation stage - see
-#: :data:`DEFAULT_TRANSLATION_SHORTEN_PENALTY`. When the text fits, this never fires and
-#: the setting is irrelevant. When it does not, the run says so instead: a line that
+#: fast. The pipeline asks for concise text in its first translation pass. When the text
+#: fits, this never fires and the setting is irrelevant. When it does not, the run says
+#: so instead: a line that
 #: overruns is reported, and is heard as a brief overlap rather than as a missing word.
 #: Set it true to trade a clipped word for a guaranteed gap between lines.
 DEFAULT_TIMING_TRIM_TO_FIT = False
@@ -800,8 +773,8 @@ class Settings:
     translation_batch_size: int = DEFAULT_TRANSLATION_BATCH_SIZE
     #: ``off``/``low``/``medium``/``high``. See :data:`DEFAULT_TRANSLATION_THINKING`.
     translation_thinking: str = DEFAULT_TRANSLATION_THINKING
-    #: Provider to move to when the configured one fails. See
-    #: :data:`DEFAULT_TRANSLATION_FALLBACK_PROVIDER`.
+    #: Legacy setting retained for environment compatibility; request failures never
+    #: trigger provider failover.
     translation_fallback_provider: str = DEFAULT_TRANSLATION_FALLBACK_PROVIDER
     translation_num_beams: int = DEFAULT_TRANSLATION_NUM_BEAMS
     translation_max_new_tokens: int = DEFAULT_TRANSLATION_MAX_NEW_TOKENS

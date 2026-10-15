@@ -28,7 +28,6 @@ from app.config import (
     Settings,
 )
 from app.pipeline import translation
-from app.pipeline.translation import MAXIMUM_REDUCTION_ATTEMPTS
 from app.pipeline.transcription import TranscriptSegment
 from app.pipeline.translation import (
     AdaptedDialogue,
@@ -97,8 +96,14 @@ class FakeOpenAI:
     transform: object = None
     response: object = None
 
-    def __init__(self, api_key=None, base_url=None) -> None:
-        FakeOpenAI.init_kwargs.append({"api_key": api_key, "base_url": base_url})
+    def __init__(self, api_key=None, base_url=None, max_retries=None) -> None:
+        FakeOpenAI.init_kwargs.append(
+            {
+                "api_key": api_key,
+                "base_url": base_url,
+                "max_retries": max_retries,
+            }
+        )
         self.chat = types.SimpleNamespace(completions=FakeCompletions())
 
     @staticmethod
@@ -397,7 +402,11 @@ def test_client_uses_the_configured_base_url_and_key(monkeypatch):
     )
 
     assert FakeOpenAI.init_kwargs == [
-        {"api_key": "sk-test", "base_url": "https://api.deepseek.com"}
+        {
+            "api_key": "sk-test",
+            "base_url": "https://api.deepseek.com",
+            "max_retries": 0,
+        }
     ]
 
 
@@ -422,8 +431,8 @@ def test_the_provider_decides_which_key_reaches_the_client(monkeypatch):
     assert primary["base_url"] == "https://example.test/v1"
 
 
-def test_the_fallback_gets_its_own_endpoint_not_the_primary_one(monkeypatch):
-    """Carrying the configured endpoint across is how a key reaches the wrong host."""
+def test_a_configured_provider_is_the_only_client_built(monkeypatch):
+    """A request failure must never construct a second provider client."""
 
     _patch(monkeypatch)
 
@@ -437,10 +446,13 @@ def test_the_fallback_gets_its_own_endpoint_not_the_primary_one(monkeypatch):
         ),
     )
 
-    (_, fallback) = FakeOpenAI.init_kwargs
-    assert fallback["api_key"] == "deepseek-key"
-    assert fallback["base_url"] == DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL
-    assert fallback["base_url"] != "https://example.test/v1"
+    assert FakeOpenAI.init_kwargs == [
+        {
+            "api_key": "gemini-key",
+            "base_url": "https://example.test/v1",
+            "max_retries": 0,
+        }
+    ]
 
 
 def test_no_fallback_client_is_built_without_a_key_for_it(monkeypatch):
@@ -843,42 +855,33 @@ def _fallback_settings(**overrides) -> Settings:
 
 
 def test_an_unavailable_provider_is_survived_by_the_fallback(monkeypatch):
-    """The whole point: a rate limit or an outage must not end a film's translation."""
+    """A rate limit is surfaced after one request instead of spending on a fallback."""
 
     _patch(monkeypatch)
-    # The first request fails with a rate limit; the fallback then answers normally.
     FakeOpenAI.error = _StatusError(429)
-    FakeOpenAI.fail_on = 1
 
-    with pytest.warns(RuntimeWarning, match="rest of this run will use deepseek"):
-        lines = adapt_dialogue([_segment()], settings=_fallback_settings())
+    with pytest.raises(ApiRequestError):
+        adapt_dialogue([_segment()], settings=_fallback_settings())
 
-    assert [line.amharic for line in lines] == ["የአማርኛ መስመር dialogue_000001"]
-    # The retry went to the second client, and the first was asked exactly once.
+    assert len(FakeOpenAI.requests) == 1
+    assert len(FakeOpenAI.init_kwargs) == 1
     assert FakeOpenAI.requests[0]["model"] == DEFAULT_TRANSLATION_GEMINI_MODEL
-    assert FakeOpenAI.requests[1]["model"] == DEFAULT_TRANSLATION_DEEPSEEK_MODEL
-    assert len(FakeOpenAI.requests) >= 2
-    # The thinking field is provider-specific, so it must be rebuilt for the fallback.
-    assert "reasoning_effort" not in FakeOpenAI.requests[1]
 
 
-def test_the_fallback_is_sticky_across_batches(monkeypatch):
-    """One failure must cost one retry, not one per batch for the rest of the film."""
+def test_a_request_failure_stops_before_the_next_batch(monkeypatch):
+    """Do not spend more requests after the current batch has failed."""
 
     _patch(monkeypatch)
     FakeOpenAI.error = _StatusError(429)
     FakeOpenAI.fail_on = 1
 
-    with pytest.warns(RuntimeWarning):
+    with pytest.raises(ApiRequestError):
         adapt_dialogue(
             [_segment(), _segment(start=20.0, end=24.0)],
             settings=_fallback_settings(translation_batch_size=1),
         )
 
-    models = [request["model"] for request in FakeOpenAI.requests]
-    # gemini(429) -> deepseek, then deepseek straight away for the second batch.
-    assert models[0] == DEFAULT_TRANSLATION_GEMINI_MODEL
-    assert set(models[1:]) == {DEFAULT_TRANSLATION_DEEPSEEK_MODEL}
+    assert len(FakeOpenAI.requests) == 1
 
 
 def test_a_bad_request_is_not_retried_on_the_other_provider(monkeypatch):
@@ -893,30 +896,26 @@ def test_a_bad_request_is_not_retried_on_the_other_provider(monkeypatch):
     assert len(FakeOpenAI.requests) == 1
 
 
-def test_a_rejected_key_falls_back(monkeypatch):
-    """An expired key is exactly the failure a second provider exists to survive."""
+def test_a_rejected_key_is_reported_without_fallback(monkeypatch):
 
     _patch(monkeypatch)
     FakeOpenAI.error = _StatusError(401)
-    FakeOpenAI.fail_on = 1
 
-    with pytest.warns(RuntimeWarning):
-        lines = adapt_dialogue([_segment()], settings=_fallback_settings())
+    with pytest.raises(ApiAuthenticationError):
+        adapt_dialogue([_segment()], settings=_fallback_settings())
 
-    assert len(lines) == 1
+    assert len(FakeOpenAI.requests) == 1
 
 
-def test_a_network_failure_falls_back(monkeypatch):
-    """No status means the request never arrived, which is the clearest case of all."""
+def test_a_network_failure_is_reported_without_fallback(monkeypatch):
 
     _patch(monkeypatch)
     FakeOpenAI.error = ConnectionError("connection reset")
-    FakeOpenAI.fail_on = 1
 
-    with pytest.warns(RuntimeWarning):
-        lines = adapt_dialogue([_segment()], settings=_fallback_settings())
+    with pytest.raises(ApiRequestError):
+        adapt_dialogue([_segment()], settings=_fallback_settings())
 
-    assert len(lines) == 1
+    assert len(FakeOpenAI.requests) == 1
 
 
 def test_missing_gemini_key_starts_with_deepseek(monkeypatch):
@@ -937,6 +936,7 @@ def test_missing_gemini_key_starts_with_deepseek(monkeypatch):
         {
             "api_key": "deepseek-key",
             "base_url": DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL,
+            "max_retries": 0,
         }
     ]
     resolved = settings.with_available_translation_provider()
@@ -970,25 +970,13 @@ def test_without_a_fallback_key_a_failure_is_still_reported(monkeypatch):
 
 
 def test_the_report_says_whether_a_fallback_is_actually_available():
-    """A run that learned it had no fallback only on failure learned too late."""
-
-    assert "no fallback" in translation.describe_fallback(
-        _settings(translation_fallback_provider="")
-    )
-    assert "DEEPSEEK_API_KEY" in translation.describe_fallback(
-        _fallback_settings(deepseek_api_key=None)
-    )
-    assert "falls back to deepseek" in translation.describe_fallback(_fallback_settings())
+    assert "one request" in translation.describe_fallback(_fallback_settings())
+    assert "failures stop" in translation.describe_fallback(_fallback_settings())
 
 
 def test_a_provider_cannot_fall_back_to_itself():
-    """Otherwise a failure would pointlessly rebuild the same request."""
-
-    assert (
-        translation._fallback_settings(
-            _fallback_settings(translation_fallback_provider="gemini")
-        )
-        is None
+    assert "disabled" in translation.describe_fallback(
+        _fallback_settings(translation_fallback_provider="gemini")
     )
 
 
@@ -1011,11 +999,9 @@ def test_system_prompt_demands_spoken_amharic_adaptation():
     prompt = translation.SYSTEM_PROMPT.lower()
 
     assert "amharic" in prompt
-    assert "translate literally" in prompt
+    assert "natural" in prompt
     assert "subtext" in prompt
-    assert "humor" in prompt
-    assert "sarcasm" in prompt
-    assert "profanity" in prompt
+    assert "tone" in prompt
     assert "emotion" in prompt
     assert "intensity" in prompt
     assert "delivery" in prompt
@@ -1033,23 +1019,19 @@ def test_system_prompt_treats_brevity_as_the_hardest_constraint():
     prompt = translation.SYSTEM_PROMPT.lower()
 
     assert "syllable_budget" in prompt
-    assert "hard ceiling" in prompt
-    assert "most important constraint" in prompt
-    assert "in fewer words" in prompt
+    assert "hard requirement" in prompt
+    assert "within" in prompt
+    assert "compact amharic grammar" in prompt
     # The concrete Amharic-specific levers, not just "be brief".
-    assert "drop pronouns" in prompt
-    assert "copula" in prompt
+    assert "recoverable pronouns" in prompt
 
 
 def test_system_prompt_covers_borrowed_english_vocabulary():
     prompt = translation.SYSTEM_PROMPT.lower()
 
-    assert "borrowed" in prompt
-    assert "english-derived" in prompt
-    assert "linguistic purity is not a goal" in prompt
-    assert "brand name" in prompt
-    # ...and that this must not be applied mechanically.
-    assert "judgement, not a mechanical rule" in prompt
+    assert "loanwords" in prompt
+    assert "fidel" in prompt
+    assert "latin script" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -1202,43 +1184,29 @@ def test_the_character_bible_is_sent_only_for_the_speakers_present(monkeypatch):
     assert "Absent" not in context
 
 
-def test_an_overshooting_line_is_sent_back_once(monkeypatch):
-    """Amharic needs more syllables than English, so the text is shortened, not stretched."""
+def test_an_overshooting_line_is_reported_after_one_request(monkeypatch):
+    """A long result is kept and reported rather than triggering another charge."""
 
     _patch(monkeypatch)
-    # ``transform`` sees the response body, so the request count is what says
-    # whether this is the first pass or the rewrite.
-    calls: list[int] = []
-
     def transform(body):
-        calls.append(1)
-        amharic = "ሰላም" if len(calls) > 1 else "ሰላም እንደምን ነህ"
         for line in body["lines"]:
-            line["amharic"] = amharic
+            line["amharic"] = "ሰላም እንደምን ነህ"
         return body
 
     FakeOpenAI.transform = transform
 
-    adapted = adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
+    adapted = adapt_dialogue(
+        [_segment(start=0.0, end=1.0)],
+        settings=_settings(),
+        maximum_reduction_attempts=1,
+    )
 
-    assert len(FakeOpenAI.requests) == 2
-    rewrite = _payload(FakeOpenAI.requests[1])["rewrite"]
-    assert "fix the problem described" in rewrite
-    assert "cut at least 6 syllable(s)" in rewrite
-    # Only the offending line is resent, under the id it was first given.
-    assert [line["id"] for line in _sent_lines(FakeOpenAI.requests[1])] == [
-        "dialogue_000001"
-    ]
-    assert adapted[0].amharic == "ሰላም"
+    assert len(FakeOpenAI.requests) == 1
+    assert adapted[0].amharic == "ሰላም እንደምን ነህ"
 
 
 def test_a_rewrite_that_is_not_shorter_is_refused(monkeypatch):
-    """A model asked for something shorter sometimes returns something longer.
-
-    The rewrite used to overwrite the line unconditionally, so three attempts could
-    leave a line *worse* than one attempt did. Whatever comes back has to earn its
-    place by being closer to speakable than what it would replace.
-    """
+    """The only response is the initial adaptation, even if it is over budget."""
 
     _patch(monkeypatch)
     calls: list[int] = []
@@ -1252,8 +1220,13 @@ def test_a_rewrite_that_is_not_shorter_is_refused(monkeypatch):
 
     FakeOpenAI.transform = transform
 
-    adapted = adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
+    adapted = adapt_dialogue(
+        [_segment(start=0.0, end=1.0)],
+        settings=_settings(),
+        maximum_reduction_attempts=1,
+    )
 
+    assert len(FakeOpenAI.requests) == 1
     assert adapted[0].amharic == "ሰላም እንደምን ነህ"
 
 
@@ -1271,8 +1244,13 @@ def test_a_rewrite_with_nothing_to_pronounce_is_refused(monkeypatch):
 
     FakeOpenAI.transform = transform
 
-    adapted = adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
+    adapted = adapt_dialogue(
+        [_segment(start=0.0, end=1.0)],
+        settings=_settings(),
+        maximum_reduction_attempts=1,
+    )
 
+    assert len(FakeOpenAI.requests) == 1
     assert adapted[0].amharic == "ሰላም እንደምን ነህ"
 
 
@@ -1306,10 +1284,7 @@ def test_each_rewrite_asks_for_a_different_kind_of_cut(monkeypatch):
         maximum_reduction_attempts=3,
     )
 
-    assert len(FakeOpenAI.requests) >= 3
-    rewrites = [_payload(request)["rewrite"] for request in FakeOpenAI.requests[1:]]
-    assert len({rewrite[rewrite.index("Cut"):] if "Cut" in rewrite else rewrite
-                for rewrite in rewrites}) > 1
+    assert len(FakeOpenAI.requests) == 1
 
 
 def test_the_reduction_tactics_escalate_and_then_hold():
@@ -1337,10 +1312,10 @@ def test_only_the_overshooting_lines_are_resent(monkeypatch):
     adapt_dialogue(
         [_segment(start=0.0, end=2.0), _segment(start=2.0, end=4.0)],
         settings=_settings(),
+        maximum_reduction_attempts=1,
     )
 
-    resent = _sent_lines(FakeOpenAI.requests[1])
-    assert [line["id"] for line in resent] == ["dialogue_000002"]
+    assert len(FakeOpenAI.requests) == 1
 
 
 def test_a_line_inside_its_budget_is_not_resent(monkeypatch):
@@ -1374,7 +1349,7 @@ def test_budget_enforcement_can_be_turned_off(monkeypatch):
 
 
 def test_a_retry_that_is_still_too_long_is_reported_not_retried_forever(monkeypatch):
-    """A rewrite that makes no progress must not be sent back to the model repeatedly."""
+    """Configured legacy rewrite counts cannot cause another hosted request."""
 
     _patch(monkeypatch)
 
@@ -1391,13 +1366,11 @@ def test_a_retry_that_is_still_too_long_is_reported_not_retried_forever(monkeypa
         maximum_reduction_attempts=3,
     )
 
-    # One initial request and one unsuccessful rewrite; the unchanged line is not retried.
-    assert len(FakeOpenAI.requests) == 2
+    assert len(FakeOpenAI.requests) == 1
     assert adapted[0].amharic == "ሰላም እንደምን ነህ"
 
 
-def test_the_rewrite_attempts_are_configurable(monkeypatch):
-    """A run can trade API calls against how hard it pushes a line to fit."""
+def test_the_legacy_rewrite_setting_cannot_enable_more_requests(monkeypatch):
 
     _patch(monkeypatch)
 
@@ -1414,7 +1387,7 @@ def test_the_rewrite_attempts_are_configurable(monkeypatch):
         maximum_reduction_attempts=1,
     )
 
-    assert len(FakeOpenAI.requests) == 2
+    assert len(FakeOpenAI.requests) == 1
 
 
 def test_zero_rewrite_attempts_use_only_the_initial_batch_request(monkeypatch):
@@ -1436,14 +1409,52 @@ def test_batch_progress_reports_elapsed_time(monkeypatch):
     adapt_dialogue(
         [_segment(), _segment(start=20.0, end=24.0)],
         settings=_settings(translation_batch_size=1),
+        enforce_budget=False,
+        enforce_fidel_loanwords=False,
         on_progress=updates.append,
     )
 
-    assert len(updates) == 4
+    assert len(updates) == 6
     assert "batch 1/2" in updates[0]
     assert "started" in updates[0]
-    assert "completed in" in updates[1]
-    assert "batch 2/2" in updates[2]
+    assert "initial request" in updates[1]
+    assert "via deepseek completed in" in updates[1]
+    assert "completed in" in updates[2]
+    assert "batch 2/2" in updates[3]
+
+
+def test_legacy_rewrite_setting_is_reported_as_ignored(monkeypatch):
+    _patch(monkeypatch)
+    updates: list[str] = []
+
+    adapt_dialogue(
+        [_segment(start=0.0, end=1.0)],
+        settings=_settings(),
+        maximum_reduction_attempts=1,
+        on_progress=updates.append,
+    )
+
+    assert any("initial request" in update for update in updates)
+    assert any("rewrites disabled" in update for update in updates)
+    assert len(FakeOpenAI.requests) == 1
+
+
+def test_default_reduction_limit_uses_one_request_and_reports_misses(monkeypatch):
+    _patch(monkeypatch)
+    updates: list[str] = []
+
+    adapt_dialogue(
+        [_segment(start=0.0, end=1.0)],
+        settings=_settings(),
+        on_progress=updates.append,
+    )
+
+    assert len(FakeOpenAI.requests) == 1
+    assert any(
+        "translation rewrites disabled" in update
+        and "over syllable budget" in update
+        for update in updates
+    )
 
 
 def test_the_scene_is_derived_when_none_is_supplied(monkeypatch):
@@ -1462,20 +1473,20 @@ def test_the_scene_is_derived_when_none_is_supplied(monkeypatch):
 
 
 def _fidel_responder(amharic: str):
-    """Answer with ``amharic`` on the first pass and a Fidel form on the rewrite."""
+    """Return a sample response with Roman-script text for validation tests."""
 
     calls: list[int] = []
 
     def transform(body):
         calls.append(1)
         for line in body["lines"]:
-            line["amharic"] = "ዋልት ኮምፒውተር" if len(calls) > 1 else amharic
+            line["amharic"] = amharic
         return body
 
     return transform
 
 
-def test_a_roman_script_word_is_sent_back_to_be_written_in_fidel(monkeypatch):
+def test_a_roman_script_word_is_reported_without_a_second_request(monkeypatch):
     """The voice reads Fidel, so a word left in Latin cannot be pronounced.
 
     Borrowed words are meant to survive - that is the whole point - but the *word*
@@ -1486,14 +1497,14 @@ def test_a_roman_script_word_is_sent_back_to_be_written_in_fidel(monkeypatch):
     FakeOpenAI.transform = _fidel_responder("Walt ኮምፒውተር ገዛ")
 
     adapted = adapt_dialogue(
-        [_segment(start=0.0, end=2.0)], settings=_settings(), enforce_budget=False
+        [_segment(start=0.0, end=2.0)],
+        settings=_settings(),
+        enforce_budget=False,
+        maximum_reduction_attempts=1,
     )
 
-    assert len(FakeOpenAI.requests) == 2
-    rewrite = _payload(FakeOpenAI.requests[1])["rewrite"]
-    assert "Walt" in rewrite
-    assert "Fidel" in rewrite
-    assert adapted[0].amharic == "ዋልት ኮምፒውተር"
+    assert len(FakeOpenAI.requests) == 1
+    assert adapted[0].amharic == "Walt ኮምፒውተር ገዛ"
 
 
 def test_a_line_with_no_roman_text_is_not_resent(monkeypatch):
@@ -1510,12 +1521,13 @@ def test_a_line_with_no_roman_text_is_not_resent(monkeypatch):
         [_segment(start=0.0, end=4.0)],
         settings=_settings(),
         enforce_budget=False,
+        maximum_reduction_attempts=1,
     )
 
     assert len(FakeOpenAI.requests) == 1
 
 
-def test_only_the_lines_with_roman_text_are_resent(monkeypatch):
+def test_roman_script_results_are_returned_from_the_initial_batch(monkeypatch):
     _patch(monkeypatch)
     calls: list[int] = []
 
@@ -1528,24 +1540,22 @@ def test_only_the_lines_with_roman_text_are_resent(monkeypatch):
 
     FakeOpenAI.transform = transform
 
-    adapt_dialogue(
+    adapted = adapt_dialogue(
         [_segment(start=0.0, end=4.0), _segment(start=4.0, end=8.0)],
         settings=_settings(),
         enforce_budget=False,
+        maximum_reduction_attempts=1,
     )
 
-    resent = _sent_lines(FakeOpenAI.requests[1])
-    assert [line["id"] for line in resent] == ["dialogue_000002"]
+    assert len(FakeOpenAI.requests) == 1
+    assert [line.amharic for line in adapted] == ["ኮምፒውተር ገዛ", "Walt መጣ"]
 
 
-def test_the_two_rewrite_reasons_share_one_pass(monkeypatch):
-    """A batch is never re-asked twice *per attempt*: both problems go back together."""
+def test_budget_and_script_issues_do_not_trigger_a_second_request(monkeypatch):
 
     _patch(monkeypatch)
-    calls: list[int] = []
 
     def transform(body):
-        calls.append(1)
         for line in body["lines"]:
             # Over budget for a 1s window, and carrying Roman script.
             line["amharic"] = "Walt ኮምፒውተር ገዛ እና ተመለሰ"
@@ -1553,19 +1563,14 @@ def test_the_two_rewrite_reasons_share_one_pass(monkeypatch):
 
     FakeOpenAI.transform = transform
 
-    adapt_dialogue([_segment(start=0.0, end=1.0)], settings=_settings())
+    adapt_dialogue(
+        [_segment(start=0.0, end=1.0)],
+        settings=_settings(),
+        maximum_reduction_attempts=1,
+    )
 
-    # One initial request plus one per bounded attempt, and both problems are stated in
-    # each rewrite rather than each needing its own call.
-    assert len(FakeOpenAI.requests) == 1 + MAXIMUM_REDUCTION_ATTEMPTS
-    rewrite = _payload(FakeOpenAI.requests[1])["rewrite"]
-    assert "cut at least" in rewrite  # the budget problem
-    assert "Walt" in rewrite  # and the script problem
-    # Every later attempt carries the same two problems.
-    for request in FakeOpenAI.requests[1:]:
-        payload = _payload(request)["rewrite"]
-        assert "cut at least" in payload
-        assert "Walt" in payload
+    assert len(FakeOpenAI.requests) == 1
+    assert "rewrite" not in _payload(FakeOpenAI.requests[0])
 
 
 def test_roman_script_enforcement_can_be_turned_off(monkeypatch):
@@ -2007,7 +2012,7 @@ def test_a_failing_batch_fails_the_whole_call(monkeypatch):
 
 
 class _ScriptedTranslator:
-    """Returns a chosen rendering per length penalty, so a retry can be observed."""
+    """Returns chosen renderings so single-pass behaviour can be observed."""
 
     def __init__(self, plain: str, shorter: str | None) -> None:
         self.plain = plain
@@ -2050,8 +2055,8 @@ def test_a_line_that_fits_is_translated_once() -> None:
     assert engine.calls == [None]
 
 
-def test_a_line_that_cannot_fit_is_re_asked_for_a_shorter_rendering() -> None:
-    """A shorter rendering of the same sentence is the cheapest place to find time."""
+def test_a_line_that_cannot_fit_is_not_translated_a_second_time() -> None:
+    """An over-budget result is preserved instead of paying for a second inference."""
 
     # A 1.0s window: 4 syllables is the budget, so 12 will not fit.
     over = "ሰላም ሰላም ሰላም ሰላም ሰላም ሰላም።"
@@ -2061,12 +2066,11 @@ def test_a_line_that_cannot_fit_is_re_asked_for_a_shorter_rendering() -> None:
         _transcript(0.0, 1.0), settings=_nllb_settings(), translator=engine
     )
 
-    assert engine.calls == [None, 0.6]
-    assert dialogue[0].amharic == "ሰላም።"
+    assert engine.calls == [None]
+    assert dialogue[0].amharic == over
 
 
-def test_a_retry_that_is_not_shorter_is_discarded() -> None:
-    """The first rendering stays unless the second really improves the length."""
+def test_the_legacy_nllb_shortening_setting_does_not_trigger_a_second_call() -> None:
 
     over = "ሰላም ሰላም ሰላም ሰላም ሰላም ሰላም።"
     engine = _ScriptedTranslator(over, "ጣፋጭ ጣፋጭ ጣፋጭ ጣፋጭ ጣፋጭ ጣፋጭ።")
@@ -2075,11 +2079,12 @@ def test_a_retry_that_is_not_shorter_is_discarded() -> None:
         _transcript(0.0, 1.0), settings=_nllb_settings(), translator=engine
     )
 
+    assert engine.calls == [None]
     assert dialogue[0].amharic == over
 
 
-def test_a_failed_retry_leaves_the_usable_rendering_in_place() -> None:
-    """A best-effort improvement must never lose a line that already translated."""
+def test_nllb_does_not_attempt_a_second_translation() -> None:
+    """One successful translation is sufficient, even when it exceeds its budget."""
 
     class _Failing(_ScriptedTranslator):
         def translate(self, text, *, length_penalty=None):
@@ -2095,4 +2100,5 @@ def test_a_failed_retry_leaves_the_usable_rendering_in_place() -> None:
         _transcript(0.0, 1.0), settings=_nllb_settings(), translator=engine
     )
 
+    assert engine.calls == [None]
     assert dialogue[0].amharic == over

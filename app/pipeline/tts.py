@@ -12,10 +12,10 @@ Engines
 Two engines are supported, and which one is in use decides whether the
 voice-profile stage has anything to do:
 
-* :class:`OmniVoiceEngine` (the default) - ``k2-fsa/OmniVoice`` clones the
-  character's voice from their reference recording and speaks the Amharic as it,
-  honouring a per-line pacing request. It reads a per-speaker reference, so
-  :func:`engine_needs_profiles` is true for it.
+* :class:`OmniVoiceEngine` (the default) - ``african-low-resource/omnivoice-amharic``
+  clones the character's voice from their reference recording and speaks the
+  Amharic as it, honouring a per-line pacing request. It reads a per-speaker
+  reference, so :func:`engine_needs_profiles` is true for it.
 * :class:`MmsAmharicEngine` - MMS-TTS Amharic speaks one voice for the whole
   film. It has no reference to follow and no identity to convert to, so a run
   using it builds no voice profiles at all.
@@ -933,9 +933,8 @@ class MmsAmharicEngine(TextToSpeechEngine):
 #: The OmniVoice engine name recorded in clip metadata.
 OMNIVOICE_ENGINE_NAME = "omnivoice"
 
-#: OmniVoice's own code for Amharic. Its language map is keyed by name
-#: (``"amharic": "am"``), so the ISO 639-3 code ``amh`` is *not* what it accepts.
-OMNIVOICE_AMHARIC = "am"
+#: The Amharic-tuned checkpoint's documented API takes the language name.
+OMNIVOICE_AMHARIC = "Amharic"
 
 #: The rate OmniVoice generates at.
 OMNIVOICE_SAMPLE_RATE = 24_000
@@ -1027,10 +1026,9 @@ class OmniVoiceEngine(VoiceCloningEngine):
       pinned to zero so the same line, reference and rate give the same audio twice.
       Without that, a re-run could not be compared with the run it is meant to improve.
 
-    The voice design mode (``instruct=``) is *not* used: the model was trained for it
-    on English and Chinese only, so asking it for "whispering" in Amharic would be a
-    request it cannot reliably honour. Emotion is left to the pacing and mixing stages
-    rather than faked here.
+    This project's configured Amharic-tuned checkpoint documents voice cloning, not
+    voice design. Per-character actor references are therefore used to keep voices
+    distinct and preserve their vocal presentation.
     """
 
     name = OMNIVOICE_ENGINE_NAME
@@ -1424,7 +1422,9 @@ def resolve_tts_directory(
     return Path(resolved.work_dir) / TTS_DIRECTORY_NAME
 
 
-def _line_digest(dialogue: AdaptedDialogue, *, model: str) -> str:
+def _line_digest(
+    dialogue: AdaptedDialogue, *, model: str, voice_identity: str | None = None
+) -> str:
     """Return a stable digest of everything that shapes one line's audio."""
 
     payload = {
@@ -1441,15 +1441,39 @@ def _line_digest(dialogue: AdaptedDialogue, *, model: str) -> str:
         "pause_before": dialogue.pause_before,
         "pause_after": dialogue.pause_after,
     }
+    if voice_identity is not None:
+        payload["voice_identity"] = voice_identity
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _line_artifact_name(dialogue: AdaptedDialogue, *, model: str) -> str:
+def _line_artifact_name(
+    dialogue: AdaptedDialogue, *, model: str, voice_identity: str | None = None
+) -> str:
     """Return the deterministic, order-independent stem shared by a line's files."""
 
-    digest = _line_digest(dialogue, model=model)[:16]
+    digest = _line_digest(
+        dialogue, model=model, voice_identity=voice_identity
+    )[:16]
     return f"{speaker_directory_name(dialogue.speaker_id)}_{digest}"
+
+
+def _voice_profile_identity(profile: VoiceProfile) -> str:
+    """Hash the reference audio and transcript that shape cloned speech."""
+
+    reference = profile.resolve_reference_audio()
+    digest = hashlib.sha256()
+    try:
+        with reference.open("rb") as audio:
+            for chunk in iter(lambda: audio.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise InvalidInputError(
+            f"could not read voice reference for speaker {profile.speaker_id!r} "
+            f"at {reference}: {exc}"
+        ) from exc
+    digest.update((profile.reference_text or "").encode("utf-8"))
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1944,6 +1968,7 @@ def synthesize_dialogue_detailed(
         # A single-voice engine has no use for voice profiles, and requiring them
         # would mean building identities the engine cannot honour.
         profiles: Mapping[str, VoiceProfile] = {}
+        voice_identities: Mapping[str, str] = {}
     else:
         profiles = _validate_profiles(
             voice_profiles, speakers=[line.speaker_id for line in lines]
@@ -1952,11 +1977,15 @@ def synthesize_dialogue_detailed(
         # Validate the reference audio of every speaker that is about to be used
         # before any model runs: a missing reference should fail the run the same way
         # whether or not earlier lines could already be synthesized.
+        identities: dict[str, str] = {}
         for speaker_id in dict.fromkeys(line.speaker_id for line in lines):
-            reference = profiles[speaker_id].resolve_reference_audio()
+            profile = profiles[speaker_id]
+            reference = profile.resolve_reference_audio()
             _validate_audio_file(
                 reference, label=f"the voice reference of speaker {speaker_id!r}"
             )
+            identities[speaker_id] = _voice_profile_identity(profile)
+        voice_identities = identities
 
     _positive("TTS_MAX_PAUSE_SECONDS", resolved.tts_max_pause_seconds)
     min_line_seconds = _positive(
@@ -2032,7 +2061,11 @@ def synthesize_dialogue_detailed(
                 _synthesize_line_cloned(
                     index,
                     line,
-                    name=_line_artifact_name(line, model=artifact_model),
+                    name=_line_artifact_name(
+                        line,
+                        model=artifact_model,
+                        voice_identity=voice_identities[line.speaker_id],
+                    ),
                     directories=directories,
                     engine=cloning_engine,
                     profile=profiles[line.speaker_id],

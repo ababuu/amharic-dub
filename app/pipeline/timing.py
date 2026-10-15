@@ -716,8 +716,9 @@ def _cascade(
     A line whose Amharic needs more time than the film left it cannot be fitted without
     either rushing it past intelligibility or cutting a word off the end. Both were
     tried; both were audible. So the overrun is paid for in position instead: the next
-    line waits until this one has finished, and only the lines that were genuinely
-    simultaneous in the original are allowed to stay simultaneous here.
+    line waits until this one has finished, except for the configured short handover
+    allowance between different speakers. Originally simultaneous lines are subject to
+    the same cap as any other handover.
 
     ``overlap`` is the concession that keeps the picture: up to this many seconds of the
     previous line may still be sounding when the next one starts, which is what a
@@ -740,26 +741,12 @@ def _cascade(
     previous: AlignedClip | None = None
     previous_speech_end = 0.0
     for clip in aligned:
-        # A line keeps its original position unless the line in front of it is still
-        # speaking. When the two performances overlapped in the source, the overlap is the
-        # scene - two people talking over each other - and it is preserved rather than
-        # tidied away.
-        simultaneous = (
-            previous is not None and clip.clip.start < previous.clip.end - 1e-9
-        )
-        if simultaneous:
-            start = clip.start
-        else:
-            same_speaker = previous is not None and previous.speaker_id == clip.speaker_id
-            allowed = 0.0 if same_speaker else overlap
-            # The constraint is on *speech*, not on the files. A clip carries its
-            # rendered pauses, and silence laid over silence is inaudible, so bounding
-            # the files would move a line for no audible reason. What may never happen
-            # is one line's speech sounding under the next line's - and least of all
-            # under the same character's, where the ear has nothing to separate the two
-            # copies with and hears a stutter.
-            floor = previous_speech_end + guard - clip.rendered_pause_before - allowed
-            start = max(clip.start, floor)
+        same_speaker = previous is not None and previous.speaker_id == clip.speaker_id
+        allowed = 0.0 if same_speaker else overlap
+        # The constraint is on speech, not the files: pauses are inaudible over silence.
+        # Even genuine source crosstalk is capped so translated dialogue stays clear.
+        floor = previous_speech_end + guard - clip.rendered_pause_before - allowed
+        start = max(clip.start, floor)
         drift = start - clip.start
         if drift > 1e-6:
             same_speaker = previous is not None and previous.speaker_id == clip.speaker_id

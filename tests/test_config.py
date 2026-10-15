@@ -13,11 +13,13 @@ from app.config import (
     DEFAULT_DIARIZATION_MODEL,
     DEFAULT_MIX_DIALOGUE_GAIN_DB,
     DEFAULT_MIX_DUCK_DB,
+    DEFAULT_OMNIVOICE_MODEL,
     DEFAULT_TIMING_MAX_TEMPO,
     DEFAULT_TIMING_MIN_LINE_GAP,
     DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL,
     DEFAULT_TRANSLATION_DEEPSEEK_MODEL,
     DEFAULT_TRANSLATION_LENGTH_PENALTY,
+    DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS,
     DEFAULT_TRANSLATION_SHORTEN_PENALTY,
     DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND,
     DEFAULT_TIMING_MIN_TEMPO,
@@ -51,6 +53,11 @@ def test_defaults_are_project_relative(_clean_env: None) -> None:
     assert settings.model_cache_dir.name == "models_cache"
     assert settings.device == "cuda"
     assert settings.log_level == "INFO"
+    assert (
+        settings.omnivoice_model
+        == DEFAULT_OMNIVOICE_MODEL
+        == "african-low-resource/omnivoice-amharic"
+    )
 
 
 def test_missing_credentials_do_not_break_construction(_clean_env: None) -> None:
@@ -304,6 +311,11 @@ def test_translation_settings_are_configurable(
     assert defaults.translation_base_url == DEFAULT_TRANSLATION_GEMINI_BASE_URL
     assert defaults.translation_batch_size == DEFAULT_TRANSLATION_BATCH_SIZE
     assert defaults.translation_thinking == DEFAULT_TRANSLATION_THINKING
+    assert (
+        defaults.translation_max_reduction_attempts
+        == DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS
+        == 0
+    )
 
     monkeypatch.setenv("TRANSLATION_MODEL", "gemini-3.6-flash")
     monkeypatch.setenv("TRANSLATION_BASE_URL", "https://example.test/v1")
@@ -360,6 +372,9 @@ def test_voice_profile_settings_are_configurable(
         defaults.voice_reference_target_duration == DEFAULT_VOICE_REFERENCE_TARGET_DURATION
     )
     assert defaults.voice_reference_max_duration == DEFAULT_VOICE_REFERENCE_MAX_DURATION
+    assert defaults.voice_reference_min_duration == 4.0
+    assert defaults.voice_reference_target_duration == 10.0
+    assert defaults.voice_reference_max_duration == 10.0
 
     monkeypatch.setenv("VOICE_PROFILE_DIR", "custom/voices")
     monkeypatch.setenv("VOICE_REFERENCE_MIN_DURATION", "2.5")
