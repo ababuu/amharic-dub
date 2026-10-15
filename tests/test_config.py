@@ -327,6 +327,17 @@ def test_translation_settings_are_configurable(
     assert payload["translation_api_key_env"] == "GEMINI_API_KEY"
 
 
+def test_translation_reduction_attempts_allow_zero(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    monkeypatch.setenv("TRANSLATION_MAX_REDUCTION_ATTEMPTS", "0")
+    assert Settings.from_env().translation_max_reduction_attempts == 0
+
+    monkeypatch.setenv("TRANSLATION_MAX_REDUCTION_ATTEMPTS", "-1")
+    with pytest.raises(ValueError, match="must not be negative"):
+        Settings.from_env()
+
+
 def test_malformed_integer_setting_is_rejected(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:

@@ -657,8 +657,8 @@ def _read_int(name: str, default: int) -> int:
 def _read_nonnegative_int(name: str, default: int) -> int:
     """Return an environment value as a non-negative integer, or ``default``.
 
-    Zero is a legitimate value here where :func:`_read_int` would reject it: a seed
-    of zero is an ordinary seed.
+    Zero is a legitimate value for settings that use it to disable an operation,
+    such as translation rewrites, and for ordinary random seeds.
     """
 
     raw = _read_env(name)
@@ -948,7 +948,7 @@ class Settings:
                 "TRANSLATION_SYLLABLES_PER_SECOND",
                 DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND,
             ),
-            translation_max_reduction_attempts=_read_int(
+            translation_max_reduction_attempts=_read_nonnegative_int(
                 "TRANSLATION_MAX_REDUCTION_ATTEMPTS",
                 DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS,
             ),
