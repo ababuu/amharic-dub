@@ -536,24 +536,15 @@ def _speaker_centroids(result: Any) -> dict[str, tuple[float, ...]]:
     return centroids
 
 
-def _clean_turn_spans(
+def _is_crosstalk_turn(
     segment: SpeakerSegment, crosstalk: tuple[CrosstalkRegion, ...]
-) -> list[tuple[float, float]]:
-    """Return continuous parts of a turn that do not overlap another speaker."""
+) -> bool:
+    """Return whether any part of this turn overlaps another speaker."""
 
-    spans = [(segment.start, segment.end)]
-    for region in crosstalk:
-        remaining: list[tuple[float, float]] = []
-        for start, end in spans:
-            if region.end <= start or region.start >= end:
-                remaining.append((start, end))
-                continue
-            if start < region.start:
-                remaining.append((start, region.start))
-            if region.end < end:
-                remaining.append((region.end, end))
-        spans = remaining
-    return spans
+    return any(
+        segment.start < region.end and segment.end > region.start
+        for region in crosstalk
+    )
 
 
 def _verify_speaker_attributions(
@@ -586,19 +577,17 @@ def _verify_speaker_attributions(
     verified: list[SpeakerSegment] = []
     audio_file = {"audio": str(audio_path)}
     for index, segment in enumerate(segments):
-        clean_spans = _clean_turn_spans(segment, crosstalk)
-        if not clean_spans:
-            verified.append(segment)
-            continue
-        clean_start, clean_end = max(clean_spans, key=lambda span: span[1] - span[0])
-        if clean_end - clean_start < _MIN_VERIFICATION_TURN_SECONDS:
+        if (
+            segment.duration < _MIN_VERIFICATION_TURN_SECONDS
+            or _is_crosstalk_turn(segment, crosstalk)
+        ):
             verified.append(segment)
             continue
 
         try:
             waveform, _ = audio.crop(
                 audio_file,
-                Segment(clean_start, clean_end),
+                Segment(segment.start, segment.end),
                 mode="pad",
             )
             with torch.inference_mode():

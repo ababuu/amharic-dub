@@ -90,11 +90,7 @@ from app.config import (
     Settings,
     get_settings,
 )
-from app.pipeline.amharic_text import (
-    count_syllables,
-    is_syllable,
-    has_pronounceable_text,
-)
+from app.pipeline.amharic_text import count_syllables, has_pronounceable_text
 from app.pipeline.dialogue_context import (
     PacingPlan,
     plan_pacing,
@@ -122,7 +118,7 @@ CLIP_DIRECTORY_NAME = "clips"
 #: Bump when a change here would make an existing take or clip wrong; it is part
 #: of every generated file name, so old artifacts can never be mistaken for new
 #: ones.
-SYNTHESIS_RECIPE_VERSION = 3
+SYNTHESIS_RECIPE_VERSION = 2
 
 #: Shortest original window a line is *reported* for, in seconds. It is not a reason to
 #: leave a line unsaid: a brief English line is normal, and the Amharic that replaces it
@@ -1140,11 +1136,6 @@ class OmniVoiceEngine(VoiceCloningEngine):
         OmniVoice preprocessing is enabled for both known and unknown transcripts.
         With a known transcript, its long-reference trimming is skipped to preserve
         transcript alignment; silence removal does not change the spoken words.
-
-        Non-Amharic text is cleared from the finished prompt. OmniVoice otherwise
-        concatenates the source transcript and Amharic target as one text stream;
-        retaining only the reference audio tokens preserves speaker conditioning
-        without supplying source-language words as generation text.
         """
 
         key = (str(reference), (reference_text or "").strip())
@@ -1165,13 +1156,6 @@ class OmniVoiceEngine(VoiceCloningEngine):
                 f"OmniVoice could not build a voice from {reference}: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
-
-        prompt_text = getattr(prompt, "ref_text", None)
-        if isinstance(prompt_text, str) and any(
-            character.isalpha() and not is_syllable(character)
-            for character in prompt_text
-        ):
-            prompt.ref_text = ""
 
         self._prompts[key] = prompt
         return prompt
