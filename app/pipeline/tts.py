@@ -118,7 +118,7 @@ CLIP_DIRECTORY_NAME = "clips"
 #: Bump when a change here would make an existing take or clip wrong; it is part
 #: of every generated file name, so old artifacts can never be mistaken for new
 #: ones.
-SYNTHESIS_RECIPE_VERSION = 1
+SYNTHESIS_RECIPE_VERSION = 2
 
 #: Shortest original window a line is *reported* for, in seconds. It is not a reason to
 #: leave a line unsaid: a brief English line is normal, and the Amharic that replaces it
@@ -1133,13 +1133,9 @@ class OmniVoiceEngine(VoiceCloningEngine):
         describes the reference exactly: without it the model transcribes the reference
         with an ASR model of its own, which is both slower and one more download.
 
-        ``preprocess_prompt`` is turned off whenever a transcript is supplied. Its
-        purpose is to strip silence from a reference nobody transcribed, and it does
-        that by *editing the audio* - which is fine when the model then transcribes
-        the edited audio itself, and wrong when we have already said what the audio
-        contains. The library guards its long-reference trim for exactly this reason,
-        but not its silence removal. Sending audio that no longer matches the
-        transcript we sent is what lets a model speak the difference.
+        OmniVoice preprocessing is enabled for both known and unknown transcripts.
+        With a known transcript, its long-reference trimming is skipped to preserve
+        transcript alignment; silence removal does not change the spoken words.
         """
 
         key = (str(reference), (reference_text or "").strip())
@@ -1153,7 +1149,7 @@ class OmniVoiceEngine(VoiceCloningEngine):
             prompt = network.create_voice_clone_prompt(
                 ref_audio=str(reference),
                 ref_text=text,
-                preprocess_prompt=text is None,
+                preprocess_prompt=True,
             )
         except Exception as exc:
             raise SynthesisError(
@@ -1195,13 +1191,13 @@ class OmniVoiceEngine(VoiceCloningEngine):
         _torch, network, config_class = self._load()
         prompt = self._prompt_for(reference, reference_text)
 
-        # Both temperatures at zero is what makes the result reproducible: `generate`
-        # samples by default, and an unseeded run could not be compared with the run it
-        # is meant to improve.
+        # Keep token selection greedy, but leave position selection at OmniVoice's
+        # recommended default. Greedy position selection can produce unnatural,
+        # repeated openings in cloned speech.
         config = config_class(
             num_step=self._steps,
             guidance_scale=self._guidance_scale,
-            position_temperature=0.0,
+            position_temperature=5.0,
             class_temperature=0.0,
         )
         request: dict[str, Any] = {

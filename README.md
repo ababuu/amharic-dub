@@ -177,7 +177,7 @@ against the `qc` block, rather than as a model swap that can be assumed to work.
 | Per-line length control | **yes** (`speed`) | film-wide only (`MMS_SPEAKING_RATE`) |
 | Output rate | 24 kHz | 16 kHz |
 | Voice profiles needed | yes | no |
-| Deterministic | **yes** (temperatures pinned) | seeded duration predictor |
+| Deterministic | no (OmniVoice position sampling uses its recommended default) | seeded duration predictor |
 | Amharic quality evidence | **none published** | none published |
 
 **Why OmniVoice is the default, and what that costs.** It is the only supported option
@@ -206,6 +206,8 @@ card documents Amharic voice cloning; the inference example passes the language 
 so this is the best documented Amharic-specific option, not a claim of measured
 quality. Each character uses a clean, transcript-matched reference from the film; the
 reference must contain at least four seconds of speech, with ten seconds as the target.
+Its known transcript is passed directly to OmniVoice to avoid loading ASR, while the
+model's standard reference preprocessing remains enabled to remove silence.
 The pipeline reports a tentative pitch-based vocal-presentation estimate, but preserves
 the actor's voice by cloning the reference rather than treating that estimate as a
 gender label or synthesizer control.

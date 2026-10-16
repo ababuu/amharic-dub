@@ -2,9 +2,9 @@
 
 The model is replaced by a fake, so nothing is downloaded and torch is never needed
 for real. What is exercised is this adapter's own behaviour: naming Amharic the way
-OmniVoice spells it, asking for a requested rate, pinning the sampling temperatures so
-a run is reproducible, building one cloning prompt per character rather than per line,
-and writing a playable clip.
+OmniVoice spells it, asking for a requested rate, preserving the model's position
+sampling while keeping token selection greedy, building one cloning prompt per
+character rather than per line, and writing a playable clip.
 """
 
 from __future__ import annotations
@@ -51,9 +51,15 @@ class FakeConfig:
 class FakePrompt:
     """Stand-in for a ``VoiceClonePrompt``."""
 
-    def __init__(self, ref_audio: str, ref_text: str | None) -> None:
+    def __init__(
+        self,
+        ref_audio: str,
+        ref_text: str | None,
+        preprocess_prompt: bool,
+    ) -> None:
         self.ref_audio = ref_audio
         self.ref_text = ref_text
+        self.preprocess_prompt = preprocess_prompt
 
 
 class FakeOmniVoice:
@@ -80,7 +86,7 @@ class FakeOmniVoice:
     def create_voice_clone_prompt(
         self, ref_audio=None, ref_text=None, preprocess_prompt=True
     ) -> FakePrompt:
-        prompt = FakePrompt(ref_audio, ref_text)
+        prompt = FakePrompt(ref_audio, ref_text, preprocess_prompt)
         self.prompts.append(prompt)
         return prompt
 
@@ -229,10 +235,10 @@ def test_amharic_is_named_the_way_omnivoice_spells_it(
     assert call["language"] == tts.OMNIVOICE_AMHARIC == "Amharic"
 
 
-def test_sampling_is_pinned_so_a_run_can_be_reproduced(
+def test_position_sampling_uses_omnivoice_default_but_tokens_remain_greedy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The model samples by default, which would make two runs incomparable."""
+    """Avoid greedy position artifacts while keeping token choices deterministic."""
 
     _patch(monkeypatch)
 
@@ -241,7 +247,7 @@ def test_sampling_is_pinned_so_a_run_can_be_reproduced(
     )
 
     config = FakeOmniVoice.instances[0].calls[0]["generation_config"]
-    assert config.position_temperature == 0.0
+    assert config.position_temperature == 5.0
     assert config.class_temperature == 0.0
     assert config.num_step == 16
     assert config.guidance_scale == 2.0
@@ -378,6 +384,7 @@ def test_the_reference_transcript_is_passed_when_it_is_known(
     )
 
     assert FakeOmniVoice.instances[0].prompts[0].ref_text == "hello world"
+    assert FakeOmniVoice.instances[0].prompts[0].preprocess_prompt is True
 
 
 def test_the_transcript_is_left_to_the_model_when_unknown(
@@ -395,6 +402,7 @@ def test_the_transcript_is_left_to_the_model_when_unknown(
     )
 
     assert FakeOmniVoice.instances[0].prompts[0].ref_text is None
+    assert FakeOmniVoice.instances[0].prompts[0].preprocess_prompt is True
 
 
 # ---------------------------------------------------------------------------
