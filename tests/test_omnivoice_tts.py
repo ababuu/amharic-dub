@@ -369,10 +369,13 @@ def test_two_characters_get_two_prompts(
     assert prompts[0].ref_audio != prompts[1].ref_audio
 
 
-def test_the_reference_transcript_is_passed_when_it_is_known(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("reference_text", ("hello world", "مرحبا"))
+def test_non_amharic_reference_transcript_is_not_used_as_generation_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    reference_text: str,
 ) -> None:
-    """Supplying it is what stops a run loading an ASR model it does not need."""
+    """Keep the audio prompt without prepending source-language dialogue."""
 
     _patch(monkeypatch)
 
@@ -380,11 +383,28 @@ def test_the_reference_transcript_is_passed_when_it_is_known(
         text="ሰላም",
         voice_reference=_reference(tmp_path),
         destination=tmp_path / "o.wav",
-        reference_text="  hello world  ",
+        reference_text=f"  {reference_text}  ",
     )
 
-    assert FakeOmniVoice.instances[0].prompts[0].ref_text == "hello world"
-    assert FakeOmniVoice.instances[0].prompts[0].preprocess_prompt is True
+    prompt = FakeOmniVoice.instances[0].prompts[0]
+    assert prompt.ref_text == ""
+    assert prompt.ref_audio == str(_reference(tmp_path))
+    assert prompt.preprocess_prompt is True
+
+
+def test_amharic_reference_transcript_remains_in_the_generation_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch(monkeypatch)
+
+    _engine().synthesize(
+        text="ሰላም",
+        voice_reference=_reference(tmp_path),
+        destination=tmp_path / "o.wav",
+        reference_text="  እንዴት ነህ  ",
+    )
+
+    assert FakeOmniVoice.instances[0].prompts[0].ref_text == "እንዴት ነህ"
 
 
 def test_the_transcript_is_left_to_the_model_when_unknown(

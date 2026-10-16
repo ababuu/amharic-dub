@@ -209,8 +209,12 @@ reference must contain at least four seconds of speech. The selector targets fiv
 seconds and prefers a reference no longer than six seconds when one is available,
 because longer reference dialogue was being echoed at the start of generated lines.
 It can use up to ten seconds when a speaker has no suitable shorter interval. The
-known transcript is passed directly to OmniVoice to avoid loading ASR, while the
-model's standard reference preprocessing remains enabled to remove silence.
+known transcript is supplied when constructing OmniVoice's prompt to avoid loading
+ASR, while standard reference preprocessing remains enabled to remove silence. Before
+generation, non-Amharic reference text is cleared from the prompt: OmniVoice otherwise
+joins the reference transcript and Amharic target as one text stream, which can carry
+source words into the dub. The reference audio tokens remain in place for speaker
+identity; Amharic-script reference text is retained.
 The pipeline reports a tentative pitch-based vocal-presentation estimate, but preserves
 the actor's voice by cloning the reference rather than treating that estimate as a
 gender label or synthesizer control.
@@ -704,14 +708,12 @@ measurements the selection used:
   made rather than failing the run.
 * *An exact transcript.* The same window began 2.6s before the first line it
   recorded and ended 1.9s after the last, so about 4.5s of the prompt audio had no
-  transcript. Cloning engines are handed the reference transcript and the line to
-  speak as **one text stream** - OmniVoice concatenates them under a single language
-  tag - so a transcript covering part of its own audio is an invitation to speak the
-  difference. Windows are therefore cut on the speaker's own line boundaries, and a
-  transcript is sent only when it describes the window exactly; otherwise none is
-  sent and the engine transcribes the reference itself. `preprocess_prompt` is
-  switched off whenever a transcript is supplied, because its silence-stripping edits
-  the audio after the transcript was taken from it.
+  transcript. Windows are therefore cut on the speaker's own line boundaries, and a
+  transcript is supplied only when it describes the window exactly; otherwise the
+  engine transcribes the reference itself. OmniVoice's prompt preprocessing remains
+  enabled to remove silence. Non-Amharic transcripts are removed after prompt
+  construction and before synthesis because OmniVoice concatenates them with the
+  Amharic target text; the reference audio tokens are retained for speaker identity.
 
 Candidate windows are ranked on duration, speech presence, dynamic range,
 loudness, overlap with other speakers and clipping, and the best window of the

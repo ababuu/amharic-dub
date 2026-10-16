@@ -671,7 +671,12 @@ def test_confident_clean_turns_are_reassigned_but_short_and_overlapping_turns_ar
     FakePipeline.embedding = lambda _waveform: [[0.1, 1.0]]
     FakePipeline.result = FakeDiarizeOutput(
         speaker_diarization=FakeAnnotation(
-            [(0.0, 2.0, "SPEAKER_00"), (2.0, 5.0, "SPEAKER_00"), (4.0, 4.5, "SPEAKER_01")]
+            [
+                (0.0, 2.0, "SPEAKER_00"),
+                (1.75, 2.0, "SPEAKER_01"),
+                (2.0, 5.0, "SPEAKER_00"),
+                (4.0, 4.5, "SPEAKER_01"),
+            ]
         ),
         exclusive_speaker_diarization=FakeAnnotation(
             [
@@ -701,7 +706,7 @@ def test_confident_clean_turns_are_reassigned_but_short_and_overlapping_turns_ar
     assert correction.similarity_margin == pytest.approx(
         1.0 / (1.01**0.5) - 0.1 / (1.01**0.5)
     )
-    assert FakePipeline.audio.crops == [(0.0, 2.0)]
+    assert FakePipeline.audio.crops == [(0.0, 1.75)]
 
 
 def test_diarize_returns_only_the_turns(monkeypatch, tmp_path):
