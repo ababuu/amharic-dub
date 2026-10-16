@@ -1728,6 +1728,31 @@ def build_voice_profiles(
             chosen_tier = min(tier(item) for item in usable)
             pool = [item for item in usable if tier(item) == chosen_tier]
 
+            # Prefer the shortest clean prompt that still provides enough voice
+            # identity. Longer reference transcripts give the generator more source
+            # dialogue to echo; keep a one-fifth margin for natural line boundaries,
+            # but retain longer references as a fallback for sparse speakers.
+            preferred_maximum = min(maximum, target * 1.2)
+            shorter = [item for item in pool if item.duration <= preferred_maximum]
+            if shorter:
+                pool = shorter
+
+            # A tiny final utterance can become a salient prompt ending (and be
+            # repeated at the start of generated lines). Avoid it when another
+            # transcript-matched window is available.
+            without_short_ending = [
+                item
+                for item in pool
+                if not any(
+                    line.speaker_id == item.speaker_id
+                    and abs(line.end - item.end) <= TIMESTAMP_TOLERANCE
+                    and line.duration < 1.0
+                    for line in lines
+                )
+            ]
+            if without_short_ending:
+                pool = without_short_ending
+
             # Earliest window wins an exact tie, so the same input always selects
             # the same reference.
             best = max(

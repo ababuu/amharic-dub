@@ -373,7 +373,7 @@ def test_voice_profile_settings_are_configurable(
     )
     assert defaults.voice_reference_max_duration == DEFAULT_VOICE_REFERENCE_MAX_DURATION
     assert defaults.voice_reference_min_duration == 4.0
-    assert defaults.voice_reference_target_duration == 10.0
+    assert defaults.voice_reference_target_duration == 5.0
     assert defaults.voice_reference_max_duration == 10.0
 
     monkeypatch.setenv("VOICE_PROFILE_DIR", "custom/voices")

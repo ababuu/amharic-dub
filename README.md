@@ -205,8 +205,11 @@ card documents Amharic voice cloning; the inference example passes the language 
 `"Amharic"`. The card's objective and human-evaluation metrics remain **TBD**,
 so this is the best documented Amharic-specific option, not a claim of measured
 quality. Each character uses a clean, transcript-matched reference from the film; the
-reference must contain at least four seconds of speech, with ten seconds as the target.
-Its known transcript is passed directly to OmniVoice to avoid loading ASR, while the
+reference must contain at least four seconds of speech. The selector targets five
+seconds and prefers a reference no longer than six seconds when one is available,
+because longer reference dialogue was being echoed at the start of generated lines.
+It can use up to ten seconds when a speaker has no suitable shorter interval. The
+known transcript is passed directly to OmniVoice to avoid loading ASR, while the
 model's standard reference preprocessing remains enabled to remove silence.
 The pipeline reports a tentative pitch-based vocal-presentation estimate, but preserves
 the actor's voice by cloning the reference rather than treating that estimate as a
@@ -391,7 +394,7 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSLATION_ENFORCE_FIDEL_LOANWORDS` | Send a line that still carries Roman-script text back once to be written in Fidel | `true` |
 | `VOICE_PROFILE_DIR` | Per-speaker voice profiles directory                | `$WORK_DIR/voices` |
 | `VOICE_REFERENCE_MIN_DURATION` | Shortest usable voice-cloning reference  | `4.0`              |
-| `VOICE_REFERENCE_TARGET_DURATION` | Preferred reference length            | `10.0`             |
+| `VOICE_REFERENCE_TARGET_DURATION` | Preferred reference length            | `5.0`              |
 | `VOICE_REFERENCE_MAX_DURATION` | Longest reference kept (a longer continuous turn is scanned with a sliding window) | `10.0` |
 | `DIALOGUE_BIBLE_PATH` | Persistent character/consistency state for adaptation (see [Cinematic dialogue adaptation](#cinematic-dialogue-adaptation-dialogue_contextpy)) | `$WORK_DIR/dialogue_bible.json` |
 | `TTS_MODEL` | The single-voice engine's checkpoint, used when `TTS_ENGINE=mms` | `facebook/mms-tts-amh` |
@@ -1041,10 +1044,12 @@ What it reports, and why each figure is there:
   uncertainty - and now the *lines* it affects are named too
   (`qc.attribution_uncertain`). Attribution is temporal: each diarized turn is
   transcribed on its own and everything it contains is credited to that turn's
-  speaker, so where two turns overlap the exclusive view has already arbitrated and
-  nothing compares that decision with the actual voice. The lines are reported
-  rather than acted on - a hole in the dialogue is worse than a doubtful voice - and
-  they are the first place to listen when a character sounds like the wrong one. The
+  speaker. Clean turns of at least 1.5 seconds are also checked against Community-1's
+  own speaker embeddings; a label changes only when another speaker's cosine score
+  is at least 0.55 and beats the current label by at least 0.15. Short and overlapping
+  turns remain untouched because the audio is not reliable enough to justify a
+  correction. Corrections are recorded in `manifest.json`. Overlap-affected lines
+  remain the first place to listen when a character sounds like the wrong one. The
   pipeline never infers a speaker from a character's *name*, so a character saying
   another character's name cannot affect who is credited.
 * **Pronunciation, when a transcriber is supplied.** A round trip through an

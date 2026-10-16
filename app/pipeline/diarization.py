@@ -6,18 +6,19 @@ returns the speaker turns every later stage needs::
 
     speech.wav -> diarize() -> [SpeakerSegment(speaker_id, start, end), ...]
 
-Two views of the same pyannote result are used, for two different purposes:
+Two views of the same pyannote result are used for different purposes:
 
-* the **exclusive** annotation is authoritative for *attribution* - it carries no
+* the **exclusive** annotation provides the starting attribution - it carries no
   overlapping turns, so every instant of speech belongs to exactly one speaker and
-  a transcribed line can never be attributed to two people. This is what
-  :func:`diarize` returns.
+  a transcribed line can never be attributed to two people. Clean, sufficiently
+  long turns are then checked against Community-1's speaker embeddings, and only a
+  strong disagreement can change the label.
 * the **overlapping** annotation is used only to *flag* crosstalk, because the
   exclusive view necessarily hides one of the two speakers when they talk at once.
   A film is full of simultaneous speech, so :func:`diarize_detailed` reports those
-  regions alongside the turns; nothing downstream re-attributes a line with them.
+  regions alongside the turns; overlapping turns are excluded from verification.
 
-Transcript text, emotions, character names, and voice embeddings belong
+Transcript text, emotions, character names, and voice-cloning embeddings belong
 to :mod:`app.pipeline.transcription`, :mod:`app.pipeline.voice_profiles`, and
 :mod:`app.pipeline.tts`; they must not be added here.
 
@@ -29,11 +30,10 @@ Contract with the ``pyannote.audio`` package (checked against 4.0.7)
 * ``pipeline.to(torch.device(...))`` selects the compute device.
 * ``pipeline(audio_path, num_speakers=..., min_speakers=..., max_speakers=...)``
   runs diarization and returns a ``DiarizeOutput``. Its
-  ``exclusive_speaker_diarization`` annotation is the authoritative result: it
-  carries no overlapping turns, so every instant of speech is attributed to
-  exactly one speaker. The overlapping ``speaker_diarization`` variant is
-  deliberately ignored, and a bare ``Annotation`` (what ``legacy=True`` pipelines
-  return) is rejected rather than accepted as an overlap-free result.
+  ``exclusive_speaker_diarization`` annotation provides non-overlapping turns.
+  Speaker embeddings are aligned to the labels in ``speaker_diarization`` and are
+  used to verify clean, long turns. A bare ``Annotation`` (what ``legacy=True``
+  pipelines return) is rejected rather than accepted as an overlap-free result.
 * ``Annotation.itertracks(yield_label=True)`` yields ``(turn, track, label)``.
 
 Deliberate non-goals
@@ -50,6 +50,7 @@ Deliberate non-goals
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,6 +79,13 @@ _EXCLUSIVE_ANNOTATION_ATTRIBUTE = "exclusive_speaker_diarization"
 #: Unlike the exclusive field this one is optional: a pyannote result without it
 #: simply means "no crosstalk could be reported", not an error.
 _OVERLAPPING_ANNOTATION_ATTRIBUTE = "speaker_diarization"
+
+# A turn this short is not reliable material for speaker verification. In
+# particular, pyannote's own embedding backends require at least 0.5 seconds.
+_MIN_VERIFICATION_TURN_SECONDS = 1.5
+_MIN_REASSIGNMENT_SIMILARITY = 0.55
+_MIN_REASSIGNMENT_MARGIN = 0.15
+_LOGGER = logging.getLogger(__name__)
 
 
 class DiarizationError(RuntimeError):
@@ -218,13 +226,15 @@ class CrosstalkRegion:
 class DiarizationResult:
     """Everything diarization found: attributed turns plus reported crosstalk.
 
-    ``turns`` is the authoritative, exclusive, non-overlapping attribution every
-    later stage consumes. ``crosstalk`` is additive information about where
-    speakers overlapped, and is never used to attribute a line.
+    ``turns`` is the exclusive, non-overlapping attribution with high-confidence
+    speaker-embedding corrections applied. ``crosstalk`` is additive information
+    about where speakers overlapped, and is never used to attribute a line.
+    ``corrections`` records every changed turn and the scores that justified it.
     """
 
     turns: tuple[SpeakerSegment, ...]
     crosstalk: tuple[CrosstalkRegion, ...] = ()
+    corrections: tuple["SpeakerAttributionCorrection", ...] = ()
 
     @property
     def speaker_ids(self) -> tuple[str, ...]:
@@ -237,6 +247,18 @@ class DiarizationResult:
         """Total time covered by reported crosstalk."""
 
         return sum(region.duration for region in self.crosstalk)
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerAttributionCorrection:
+    """A diarized turn reassigned after a high-confidence embedding comparison."""
+
+    start: float
+    end: float
+    original_speaker_id: str
+    corrected_speaker_id: str
+    corrected_similarity: float
+    similarity_margin: float
 
 
 def _validate_audio_path(path: str | Path) -> Path:
@@ -460,6 +482,180 @@ def _to_segments(result: Any) -> list[SpeakerSegment]:
     return segments
 
 
+def _as_embedding(value: Any) -> tuple[float, ...] | None:
+    """Convert a model embedding to a finite, non-zero Python vector."""
+
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    try:
+        vector = tuple(float(component) for component in value)
+    except (TypeError, ValueError):
+        return None
+    if not vector or not all(math.isfinite(component) for component in vector):
+        return None
+    if sum(component * component for component in vector) <= 0:
+        return None
+    return vector
+
+
+def _cosine_similarity(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    """Return cosine similarity, or -1 for incompatible embedding dimensions."""
+
+    if len(left) != len(right):
+        return -1.0
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0 or right_norm == 0:
+        return -1.0
+    return sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
+
+
+def _speaker_centroids(result: Any) -> dict[str, tuple[float, ...]]:
+    """Read Community-1's documented label-ordered speaker embeddings."""
+
+    annotation = getattr(result, _OVERLAPPING_ANNOTATION_ATTRIBUTE, None)
+    embeddings = getattr(result, "speaker_embeddings", None)
+    if annotation is None or not hasattr(annotation, "labels") or embeddings is None:
+        return {}
+
+    labels = list(annotation.labels())
+    if hasattr(embeddings, "tolist"):
+        embeddings = embeddings.tolist()
+    try:
+        rows = list(embeddings)
+    except TypeError:
+        return {}
+    if len(labels) != len(rows):
+        return {}
+
+    centroids: dict[str, tuple[float, ...]] = {}
+    for label, row in zip(labels, rows):
+        vector = _as_embedding(row)
+        if isinstance(label, str) and label.strip() and vector is not None:
+            centroids[label.strip()] = vector
+    return centroids
+
+
+def _is_crosstalk_turn(
+    segment: SpeakerSegment, crosstalk: tuple[CrosstalkRegion, ...]
+) -> bool:
+    """Return whether any part of this turn overlaps another speaker."""
+
+    return any(
+        segment.start < region.end and segment.end > region.start
+        for region in crosstalk
+    )
+
+
+def _verify_speaker_attributions(
+    pipeline: Any,
+    result: Any,
+    audio_path: Path,
+    segments: list[SpeakerSegment],
+    crosstalk: tuple[CrosstalkRegion, ...],
+) -> tuple[list[SpeakerSegment], tuple[SpeakerAttributionCorrection, ...]]:
+    """Correct only long, clean turns with strong agreement from speaker embeddings.
+
+    Community-1's speaker embeddings are the same model-space prototypes used by
+    its clustering. Comparing clean turn embeddings against those prototypes
+    avoids a fixed SPEAKER_00/SPEAKER_01 assumption and requires no extra model.
+    """
+
+    centroids = _speaker_centroids(result)
+    audio = getattr(pipeline, "_audio", None)
+    embedder = getattr(pipeline, "_embedding", None)
+    if len(centroids) < 2 or audio is None or embedder is None or torch is None:
+        return segments, ()
+
+    try:
+        from pyannote.core import Segment
+    except ImportError:
+        _LOGGER.warning("pyannote.core is unavailable; preserving diarization labels")
+        return segments, ()
+
+    corrections: list[SpeakerAttributionCorrection] = []
+    verified: list[SpeakerSegment] = []
+    audio_file = {"audio": str(audio_path)}
+    for index, segment in enumerate(segments):
+        if (
+            segment.duration < _MIN_VERIFICATION_TURN_SECONDS
+            or _is_crosstalk_turn(segment, crosstalk)
+        ):
+            verified.append(segment)
+            continue
+
+        try:
+            waveform, _ = audio.crop(
+                audio_file,
+                Segment(segment.start, segment.end),
+                mode="pad",
+            )
+            with torch.inference_mode():
+                raw_embedding = embedder(waveform.unsqueeze(0))
+        except Exception as exc:
+            _LOGGER.warning(
+                "Speaker verification failed for %.3f-%.3fs; preserving %s: %s: %s",
+                segment.start,
+                segment.end,
+                segment.speaker_id,
+                type(exc).__name__,
+                exc,
+            )
+            verified.extend(segments[index:])
+            return verified, tuple(corrections)
+
+        embedding_rows = (
+            raw_embedding.tolist()
+            if hasattr(raw_embedding, "tolist")
+            else raw_embedding
+        )
+        try:
+            turn_embedding = _as_embedding(embedding_rows[0])
+        except (IndexError, TypeError):
+            turn_embedding = None
+        if turn_embedding is None:
+            verified.append(segment)
+            continue
+
+        scores = {
+            speaker_id: _cosine_similarity(turn_embedding, centroid)
+            for speaker_id, centroid in centroids.items()
+        }
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if len(ranked) < 2:
+            verified.append(segment)
+            continue
+
+        best_speaker, best_score = ranked[0]
+        if segment.speaker_id not in scores:
+            verified.append(segment)
+            continue
+        current_score = scores[segment.speaker_id]
+        margin = best_score - current_score
+        if (
+            best_speaker != segment.speaker_id
+            and best_score >= _MIN_REASSIGNMENT_SIMILARITY
+            and margin >= _MIN_REASSIGNMENT_MARGIN
+        ):
+            verified.append(
+                SpeakerSegment(best_speaker, segment.start, segment.end)
+            )
+            corrections.append(
+                SpeakerAttributionCorrection(
+                    start=segment.start,
+                    end=segment.end,
+                    original_speaker_id=segment.speaker_id,
+                    corrected_speaker_id=best_speaker,
+                    corrected_similarity=best_score,
+                    similarity_margin=margin,
+                )
+            )
+        else:
+            verified.append(segment)
+
+    return verified, tuple(corrections)
+
+
 def _resolve_speaker_counts(
     settings: Settings,
     num_speakers: int | None,
@@ -491,10 +687,10 @@ def diarize_detailed(
 ) -> DiarizationResult:
     """Diarize ``audio_path`` into turns **and** the crosstalk between them.
 
-    Same inputs and the same exclusive attribution as :func:`diarize`; the
-    difference is that the overlap-aware view pyannote also returns is read as
-    well, so simultaneous speech can be reported instead of silently collapsing
-    onto whichever speaker the exclusive view kept.
+    Clean, sufficiently long exclusive turns are verified against Community-1's
+    speaker embeddings before being returned. The overlap-aware view is also read
+    so simultaneous speech can be reported instead of silently collapsing onto
+    whichever speaker the exclusive view kept.
 
     Speaker-count hints that are left unset fall back to
     ``DIARIZATION_MIN_SPEAKERS`` / ``DIARIZATION_MAX_SPEAKERS``; an explicit
@@ -521,7 +717,18 @@ def diarize_detailed(
 
     overlap_annotation = _extract_overlap_annotation(result)
     crosstalk = () if overlap_annotation is None else tuple(_to_crosstalk(overlap_annotation))
-    return DiarizationResult(turns=tuple(_to_segments(result)), crosstalk=crosstalk)
+    turns, corrections = _verify_speaker_attributions(
+        pipeline,
+        result,
+        source,
+        _to_segments(result),
+        crosstalk,
+    )
+    return DiarizationResult(
+        turns=tuple(turns),
+        crosstalk=crosstalk,
+        corrections=corrections,
+    )
 
 
 def diarize(
@@ -552,9 +759,10 @@ def diarize(
     Returns
     -------
     list[SpeakerSegment]
-        One immutable segment per speaker turn, sorted by ``start``. An empty
-        list means pyannote found no speech. Call :func:`diarize_detailed` instead
-        when the crosstalk reported by the overlap-aware view is also wanted.
+        One immutable segment per speaker turn, sorted by ``start``, after
+        high-confidence speaker-embedding corrections. An empty list means
+        pyannote found no speech. Call :func:`diarize_detailed` instead to also
+        retrieve crosstalk and correction details.
 
     Raises
     ------
@@ -592,6 +800,7 @@ __all__ = [
     "MissingHuggingFaceTokenError",
     "MissingInputError",
     "ModelInitializationError",
+    "SpeakerAttributionCorrection",
     "SpeakerSegment",
     "UnsupportedOutputError",
     "diarize",

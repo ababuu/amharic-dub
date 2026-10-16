@@ -298,11 +298,11 @@ DEFAULT_VOICE_PROFILE_DIR = DEFAULT_WORK_DIR / "voices"
 DEFAULT_DIALOGUE_BIBLE_FILENAME = "dialogue_bible.json"
 DEFAULT_DIALOGUE_BIBLE_PATH = DEFAULT_WORK_DIR / DEFAULT_DIALOGUE_BIBLE_FILENAME
 
-#: Preferred length of a voice-cloning reference, in seconds. The target is the
-#: window the selector aims for, the minimum rejects snippets too short to clone
-#: from, and the maximum caps how much audio a single profile keeps around.
+#: Preferred length of a voice-cloning reference, in seconds. A short, clean
+#: prompt limits the amount of reference dialogue OmniVoice can echo; longer
+#: references remain available when no suitable shorter interval exists.
 DEFAULT_VOICE_REFERENCE_MIN_DURATION = 4.0
-DEFAULT_VOICE_REFERENCE_TARGET_DURATION = 10.0
+DEFAULT_VOICE_REFERENCE_TARGET_DURATION = 5.0
 DEFAULT_VOICE_REFERENCE_MAX_DURATION = 10.0
 
 #: Legacy sample-voice configuration retained so existing environment files continue

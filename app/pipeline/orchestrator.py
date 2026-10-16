@@ -140,6 +140,7 @@ class PipelineResult:
     dub_bleed: separation.BleedReport | None = None
     #: Anything the TTS stage wanted the run to know without treating it as a failure.
     notes: tuple[str, ...] = ()
+    speaker_corrections: tuple[diarization.SpeakerAttributionCorrection, ...] = ()
 
     @property
     def final_video(self) -> Path:
@@ -179,6 +180,17 @@ class PipelineResult:
             "diarization": {
                 "turns": len(self.turns),
                 "speakers": sorted({turn.speaker_id for turn in self.turns}),
+                "speaker_corrections": [
+                    {
+                        "start": correction.start,
+                        "end": correction.end,
+                        "from": correction.original_speaker_id,
+                        "to": correction.corrected_speaker_id,
+                        "similarity": round(correction.corrected_similarity, 4),
+                        "margin": round(correction.similarity_margin, 4),
+                    }
+                    for correction in self.speaker_corrections
+                ],
                 # Simultaneous speech the exclusive attribution could not carry.
                 # Reported so a run can be audited for it without re-listening.
                 "crosstalk": {
@@ -495,6 +507,12 @@ def run_pipeline(
             f"diarization found no speech in {stems.speech}; nothing downstream can run"
         )
     crosstalk = tuple(diarized.crosstalk)
+    speaker_corrections = tuple(diarized.corrections)
+    if speaker_corrections:
+        report(
+            f"  speaker verification: corrected {len(speaker_corrections)} "
+            "high-confidence turn attribution(s)"
+        )
     if crosstalk:
         report(
             f"  crosstalk: {len(crosstalk)} region(s), "
@@ -740,6 +758,7 @@ def run_pipeline(
         turns=turns,
         lines=lines,
         crosstalk=crosstalk,
+        speaker_corrections=speaker_corrections,
         dialogue=dialogue,
         profiles=dict(profiles),
         clips=clips,

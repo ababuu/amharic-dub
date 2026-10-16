@@ -1672,6 +1672,43 @@ def test_production_builds_one_continuous_reference_from_multiple_lines(
     )
 
 
+def test_short_clean_prompt_avoids_reference_tail_and_short_final_utterance(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    stem = _write_stem(
+        tmp_path / "speech.wav",
+        [
+            (10.0, 12.5, QUIET),
+            (12.6, 15.1, QUIET),
+            (16.0, 20.2, LOUD),
+            (20.3, 20.75, LOUD),
+        ],
+    )
+    lines = [
+        TranscriptSegment("SPEAKER_00", 10.0, 12.5, "first clean phrase"),
+        TranscriptSegment("SPEAKER_00", 12.6, 15.1, "second clean phrase"),
+        TranscriptSegment("SPEAKER_00", 16.0, 20.2, "a longer clean phrase"),
+        TranscriptSegment("SPEAKER_00", 20.3, 20.75, "business."),
+    ]
+
+    profile = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", line.start, line.end) for line in lines],
+        stem,
+        transcript=lines,
+        settings=_settings(
+            tmp_path,
+            voice_reference_target_duration=5.0,
+            voice_reference_max_duration=10.0,
+        ),
+        require_reference_transcript=True,
+    )["SPEAKER_00"]
+
+    assert profile.reference_text == "a longer clean phrase"
+    assert profile.reference_text is not None
+    assert profile.reference_end == pytest.approx(20.2)
+    assert "business" not in profile.reference_text
+
+
 def test_production_reference_rejects_missing_matching_transcript(
     tmp_path: Path, ffmpeg: FakeFfmpeg
 ) -> None:

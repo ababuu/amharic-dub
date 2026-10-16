@@ -9,7 +9,10 @@ because pyannote itself is mocked and never opens it.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -54,6 +57,9 @@ class FakeAnnotation:
         for start, end, speaker_id in self.turns:
             yield FakeTurn(start, end), "track", speaker_id
 
+    def labels(self):
+        return sorted({speaker_id for _, _, speaker_id in self.turns})
+
 
 class FakeDiarizeOutput:
     """Stand-in for pyannote's ``DiarizeOutput``.
@@ -66,11 +72,14 @@ class FakeDiarizeOutput:
         self,
         speaker_diarization: object | None = None,
         exclusive_speaker_diarization: object | None = None,
+        speaker_embeddings: object | None = None,
     ) -> None:
         if speaker_diarization is not None:
             self.speaker_diarization = speaker_diarization
         if exclusive_speaker_diarization is not None:
             self.exclusive_speaker_diarization = exclusive_speaker_diarization
+        if speaker_embeddings is not None:
+            self.speaker_embeddings = speaker_embeddings
 
 
 class FakePipeline:
@@ -88,12 +97,16 @@ class FakePipeline:
     infer_error: Exception | None = None
     returns_none: bool = False
     result: object = None
+    audio: object = None
+    embedding: object = None
 
     def __init__(self, model: str, *, token: str | None = None, cache_dir=None) -> None:
         self.model = model
         self.token = token
         self.cache_dir = cache_dir
         self.device: object = None
+        self._audio = FakePipeline.audio
+        self._embedding = FakePipeline.embedding
         FakePipeline.instances.append(self)
 
     @classmethod
@@ -129,6 +142,10 @@ class FakeTorch:
         FakeTorch.requested.append(name)
         return f"torch.device({name})"
 
+    @staticmethod
+    def inference_mode():
+        return contextlib.nullcontext()
+
 
 def _patch(monkeypatch: pytest.MonkeyPatch) -> None:
     """Install the fakes and reset all recorded state."""
@@ -142,6 +159,8 @@ def _patch(monkeypatch: pytest.MonkeyPatch) -> None:
     FakePipeline.infer_error = None
     FakePipeline.returns_none = False
     FakePipeline.result = None
+    FakePipeline.audio = None
+    FakePipeline.embedding = None
     FakeTorch.requested = []
 
     monkeypatch.setattr(diarization, "Pipeline", FakePipeline)
@@ -628,6 +647,61 @@ def test_diarize_detailed_reports_both_turns_and_crosstalk(monkeypatch, tmp_path
     )
     assert result.speaker_ids == ("SPEAKER_00", "SPEAKER_01")
     assert result.crosstalk_seconds == 1.0
+
+
+def test_confident_clean_turns_are_reassigned_but_short_and_overlapping_turns_are_not(
+    monkeypatch, tmp_path
+):
+    _patch(monkeypatch)
+
+    class FakeWaveform:
+        def unsqueeze(self, _dimension):
+            return self
+
+    class FakeAudio:
+        def __init__(self):
+            self.crops = []
+
+        def crop(self, _audio_file, segment, *, mode):
+            assert mode == "pad"
+            self.crops.append((segment.start, segment.end))
+            return FakeWaveform(), 16000
+
+    FakePipeline.audio = FakeAudio()
+    FakePipeline.embedding = lambda _waveform: [[0.1, 1.0]]
+    FakePipeline.result = FakeDiarizeOutput(
+        speaker_diarization=FakeAnnotation(
+            [(0.0, 2.0, "SPEAKER_00"), (2.0, 5.0, "SPEAKER_00"), (4.0, 4.5, "SPEAKER_01")]
+        ),
+        exclusive_speaker_diarization=FakeAnnotation(
+            [
+                (0.0, 2.0, "SPEAKER_00"),
+                (2.1, 2.3, "SPEAKER_00"),
+                (3.0, 5.0, "SPEAKER_00"),
+            ]
+        ),
+        speaker_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    core_module = types.ModuleType("pyannote.core")
+    core_module.Segment = FakeTurn
+    monkeypatch.setitem(sys.modules, "pyannote.core", core_module)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.turns == (
+        SpeakerSegment("SPEAKER_01", 0.0, 2.0),
+        SpeakerSegment("SPEAKER_00", 2.1, 2.3),
+        SpeakerSegment("SPEAKER_00", 3.0, 5.0),
+    )
+    assert len(result.corrections) == 1
+    correction = result.corrections[0]
+    assert correction.original_speaker_id == "SPEAKER_00"
+    assert correction.corrected_speaker_id == "SPEAKER_01"
+    assert correction.corrected_similarity == pytest.approx(1.0 / (1.01**0.5))
+    assert correction.similarity_margin == pytest.approx(
+        1.0 / (1.01**0.5) - 0.1 / (1.01**0.5)
+    )
+    assert FakePipeline.audio.crops == [(0.0, 2.0)]
 
 
 def test_diarize_returns_only_the_turns(monkeypatch, tmp_path):
