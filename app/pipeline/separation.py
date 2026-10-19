@@ -148,7 +148,8 @@ def _run_audio_separator(
         from audio_separator.separator import Separator
     except ImportError as exc:  # pragma: no cover - dependency install failure
         raise SeparationInferenceError(
-            "audio-separator is not installed; install the project requirements"
+            "could not import audio-separator or one of its dependencies "
+            f"({exc}); install or update the project requirements"
         ) from exc
 
     cache_dir = Path(settings.model_cache_dir) / "audio-separator"

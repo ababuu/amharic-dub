@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import gc
 import sys
 import types
@@ -203,6 +204,30 @@ def test_missing_cuda_fails_before_loading_separator(
             settings=_settings(root),
         )
     assert FakeSeparator.instances == []
+
+
+def test_nested_import_error_is_reported_instead_of_claiming_package_absent(
+    fake_separator: tuple[FakeCuda, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, root = fake_separator
+    original_import = builtins.__import__
+
+    def import_without_audioread(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "audio_separator.separator":
+            raise ModuleNotFoundError("No module named 'audioread'", name="audioread")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_audioread)
+
+    with pytest.raises(
+        SeparationInferenceError,
+        match=r"audio-separator or one of its dependencies.*audioread",
+    ):
+        separate_stems(
+            _write_audio(root / "clip.wav"),
+            root / "out",
+            settings=_settings(root),
+        )
 
 
 def test_non_48khz_input_is_rejected_without_resampling(

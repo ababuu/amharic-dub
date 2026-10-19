@@ -59,6 +59,7 @@ RUNTIME_MODULES: dict[str, str] = {
     "pyannote.audio": "diarization",
     "torchcodec": "pyannote.audio",
     "audio_separator": "separation",
+    "audioread": "audio-separator audio helpers",
     "yaml": "configuration",
     "scipy": "audio analysis",
     "transformers": "model loading",

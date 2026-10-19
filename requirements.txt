@@ -20,6 +20,8 @@ torchaudio==2.8.0
 # --- Pipeline models -------------------------------------------------------
 # GPU-enabled audio-separator provides BS-Roformer vocal/instrumental separation.
 audio-separator[gpu]>=0.47,<0.48
+# Imported internally by audio-separator's UVR audio helpers.
+audioread
 # pyannote Community-1 - speaker diarization.
 pyannote.audio==4.0.7
 # faster-whisper large-v3 - transcription (CTranslate2 backend).
