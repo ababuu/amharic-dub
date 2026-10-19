@@ -14,8 +14,6 @@ from app.config import (
     DEFAULT_MIX_DIALOGUE_GAIN_DB,
     DEFAULT_MIX_DUCK_DB,
     DEFAULT_OMNIVOICE_MODEL,
-    DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE,
-    DEFAULT_SEPARATION_HOP_SECONDS,
     DEFAULT_TIMING_MAX_TEMPO,
     DEFAULT_TIMING_MIN_LINE_GAP,
     DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL,
@@ -55,12 +53,6 @@ def test_defaults_are_project_relative(_clean_env: None) -> None:
     assert settings.model_cache_dir.name == "models_cache"
     assert settings.device == "cuda"
     assert settings.log_level == "INFO"
-    assert (
-        settings.separation_inference_batch_size
-        == DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE
-        == 64
-    )
-    assert settings.separation_hop_seconds == DEFAULT_SEPARATION_HOP_SECONDS == 6.0
     assert (
         settings.omnivoice_model
         == DEFAULT_OMNIVOICE_MODEL
@@ -199,8 +191,6 @@ def test_environment_variables_override_defaults(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf_test_token")
     monkeypatch.setenv("DEVICE", "cpu")
     monkeypatch.setenv("LOG_LEVEL", "debug")
-    monkeypatch.setenv("SEPARATION_INFERENCE_BATCH_SIZE", "12")
-    monkeypatch.setenv("SEPARATION_HOP_SECONDS", "1.0")
 
     settings = Settings.from_env()
 
@@ -210,19 +200,7 @@ def test_environment_variables_override_defaults(monkeypatch: pytest.MonkeyPatch
     assert settings.model_cache_dir == tmp_path / "models"
     assert settings.device == "cpu"
     assert settings.log_level == "DEBUG"
-    assert settings.separation_inference_batch_size == 12
-    assert settings.separation_hop_seconds == 1.0
     assert settings.missing_credentials() == []
-
-
-@pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
-def test_separation_hop_must_be_positive(
-    monkeypatch: pytest.MonkeyPatch, _clean_env: None, value: str
-) -> None:
-    monkeypatch.setenv("SEPARATION_HOP_SECONDS", value)
-
-    with pytest.raises(ValueError, match="SEPARATION_HOP_SECONDS"):
-        Settings.from_env()
 
 
 def test_ensure_directories_creates_all_paths(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

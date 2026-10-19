@@ -58,7 +58,7 @@ RUNTIME_MODULES: dict[str, str] = {
     "faster_whisper": "transcription",
     "pyannote.audio": "diarization",
     "torchcodec": "pyannote.audio",
-    "bandit_infer": "separation",
+    "audio_separator": "separation",
     "yaml": "configuration",
     "scipy": "audio analysis",
     "transformers": "model loading",

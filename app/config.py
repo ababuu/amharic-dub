@@ -99,25 +99,6 @@ DEFAULT_MODEL_CACHE_DIR = PROJECT_ROOT / "models_cache"
 #: pyannote Community-1 speaker diarization pipeline on the Hugging Face Hub.
 DEFAULT_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
 
-#: How many of BandIt's 8-second chunks are pushed through the model per forward pass.
-#:
-#: The chunk handler defaults to one, which leaves an A40 almost entirely idle: a
-#: measured run spent **354 s of 590 s** in separation on a 135 s clip, because the
-#: 8 s / 1 s chunk geometry needs 8 forwards per second of audio and each one was sent
-#: alone. The chunks are independent - the handler flattens them into the batch
-#: dimension and the model reads each as its own sequence - so batching them is the same
-#: arithmetic with more of the card in use.
-#:
-#: Start with a large batch on the 48 GB A40 target; on out-of-memory, inference
-#: halves the batch and retries rather than failing the run. A previous measurement
-#: completed at 8 while 16 and 32 ran out of memory, so confirm the settled size in
-#: RunPod logs and override this value if the A40 cannot sustain 64.
-DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE = 64
-
-# A 6-second BandIt hop leaves 2 seconds of overlap between its 8-second windows,
-# reducing redundant chunk computation. The upstream default is a 1-second hop.
-DEFAULT_SEPARATION_HOP_SECONDS = 6.0
-
 #: Optional bounds on the number of speakers diarization may report, or ``None``
 #: to let the model decide. Supplying them is the strongest single guard against
 #: a character splitting into several clusters or merging with another, so a cast
@@ -753,10 +734,6 @@ class Settings:
     #: Optional speaker-count bounds for diarization; ``None`` lets it decide.
     diarization_min_speakers: Optional[int] = DEFAULT_DIARIZATION_MIN_SPEAKERS
     diarization_max_speakers: Optional[int] = DEFAULT_DIARIZATION_MAX_SPEAKERS
-    #: BandIt chunks pushed through the model per forward pass.
-    separation_inference_batch_size: int = DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE
-    #: BandIt chunk advance in seconds; smaller values use more overlap and compute.
-    separation_hop_seconds: float = DEFAULT_SEPARATION_HOP_SECONDS
     #: faster-whisper model and CTranslate2 compute type for transcription.
     transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL
     transcription_compute_type: str = DEFAULT_TRANSCRIPTION_COMPUTE_TYPE
@@ -863,13 +840,6 @@ class Settings:
             ),
             diarization_max_speakers=_read_optional_int(
                 "DIARIZATION_MAX_SPEAKERS", DEFAULT_DIARIZATION_MAX_SPEAKERS
-            ),
-            separation_inference_batch_size=_read_int(
-                "SEPARATION_INFERENCE_BATCH_SIZE",
-                DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE,
-            ),
-            separation_hop_seconds=_read_float(
-                "SEPARATION_HOP_SECONDS", DEFAULT_SEPARATION_HOP_SECONDS
             ),
             transcription_model=(
                 _read_env("TRANSCRIPTION_MODEL", DEFAULT_TRANSCRIPTION_MODEL)
@@ -1120,8 +1090,6 @@ class Settings:
             "diarization_model": self.diarization_model,
             "diarization_min_speakers": self.diarization_min_speakers,
             "diarization_max_speakers": self.diarization_max_speakers,
-            "separation_inference_batch_size": self.separation_inference_batch_size,
-            "separation_hop_seconds": self.separation_hop_seconds,
             "transcription_model": self.transcription_model,
             "transcription_compute_type": self.transcription_compute_type,
             "qc_pronunciation": self.qc_pronunciation,
@@ -1193,8 +1161,6 @@ __all__ = [
     "DEFAULT_DIARIZATION_MAX_SPEAKERS",
     "DEFAULT_DIARIZATION_MIN_SPEAKERS",
     "DEFAULT_DIARIZATION_MODEL",
-    "DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE",
-    "DEFAULT_SEPARATION_HOP_SECONDS",
     "DEFAULT_MIX_DIALOGUE_GAIN_DB",
     "DEFAULT_MIX_DUCK_DB",
     "DEFAULT_MMS_SAMPLE_RATE",

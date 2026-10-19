@@ -39,14 +39,13 @@ import soundfile as sf
 from app.config import Settings, get_settings
 from app.pipeline.voice_profiles import portable_path
 
-#: BandIt v2 Multi is a 48 kHz model, and the whole pipeline runs at that rate so
-#: no stem ever has to be resampled.
+#: The whole pipeline runs at 48 kHz so no stem ever has to be resampled.
 #: :func:`app.pipeline.separation.separate_stems` rejects anything else, so the
 #: extractor must produce exactly this. ``tests/test_video.py`` keeps the two
 #: definitions in step.
 PIPELINE_SAMPLE_RATE = 48_000
 
-#: Stereo PCM WAV, the layout BandIt expects and mixing will keep.
+#: Stereo PCM WAV, the layout used by separation and mixing.
 PIPELINE_CHANNELS = 2
 
 #: Codec of the extracted intermediate. PCM keeps the stage lossless and avoids

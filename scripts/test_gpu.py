@@ -31,7 +31,7 @@ Notes
   skips the voice-profile stage entirely rather than building references nothing
   reads.
 * The audio track is extracted by ``app.pipeline.video.extract_audio``, at the
-  48 kHz that BandIt v2 Multi requires, so the runner and the orchestrator share
+  pipeline's 48 kHz sample rate, so the runner and the orchestrator share
   one extractor instead of each keeping its own copy.
 * The run stops after speech synthesis **by design**: this runner reports what
   each GPU stage produced, and the stages after it need no GPU. To produce the
@@ -143,7 +143,7 @@ def report_settings(settings: Settings) -> None:
 def report_stems(stems: separation.StemPaths) -> None:
     """Print the separated stems with their duration, rate and channel count."""
 
-    _rule("1. Separation - BandIt v2 Multi")
+    _rule("1. Separation - audio-separator BS-Roformer (CUDA)")
     for name, path in stems.as_dict().items():
         _info(f"{name} stem", f"{path}")
         _info("", _audio_summary(path))

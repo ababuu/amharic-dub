@@ -24,10 +24,8 @@ dependencies = [
   "torchaudio==2.8.0",
 
   # --- Pipeline models -------------------------------------------------------
-  # BandIt v2 Multi - cinematic audio source separation.
-  # Not published on PyPI, so it is referenced by its repository, exactly as in
-  # requirements.txt; pip installs it from there.
-  "bandit-infer @ git+https://github.com/openmirlab/bandit-infer@main",
+  # GPU-enabled vocal/instrumental separation using ONNX Runtime GPU.
+  "audio-separator[gpu]>=0.47,<0.48",
   # pyannote Community-1 - speaker diarization.
   "pyannote.audio==4.0.7",
   # faster-whisper large-v3 - transcription (CTranslate2 backend).

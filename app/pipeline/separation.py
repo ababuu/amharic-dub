@@ -1,37 +1,17 @@
-"""Cinematic audio source separation with **BandIt v2 Multi**.
+"""GPU-accelerated two-stem separation using audio-separator.
 
-This module is the only place in the pipeline that talks to BandIt. It splits a
-movie's soundtrack into three stems - ``speech``, ``music`` and ``effects`` -
-and writes each one as a PCM WAV. The ``speech`` stem feeds diarization and
-transcription; ``music`` and ``effects`` are re-mixed untouched at the end.
-
-Contract with the ``bandit_infer`` package
-------------------------------------------
-* ``BanditSession("v2-multi", device=..., weights_dir=...)`` then ``load()``.
-* ``session.infer(audio, sample_rate=48000)`` where ``audio`` is a float32 NumPy
-  array shaped ``(channels, samples)``.
-* The result maps ``"speech"``, ``"music"`` and ``"effects"`` to arrays in the
-  same ``(channels, samples)`` layout.
-
-Deliberate non-goals
---------------------
-* **No resampling.** v2 Multi is a 48 kHz model, so any other rate is rejected.
-* **No manual chunking.** BandIt's v2 runtime already runs its own chunked,
-  overlap-add inference handler. What this module does is *configure* that handler
-  and bound how much audio is handed to it at once - see :data:`MAX_CHUNK_TENSOR_BYTES`.
-* **No CUDA->CPU fallback.** The device comes from the project settings, and an
-  explicit ``cuda`` request that is unavailable must fail loudly.
-* **No weight downloads at import time** (and none in the test suite).
+The separator writes isolated vocals and the combined instrumental bed. The latter
+feeds the existing music input; a silent effects stem preserves the downstream
+three-path contract without mixing the instrumental twice.
 """
 
 from __future__ import annotations
 
+import gc
+import logging
 import math
-import os
 import time
-import warnings
-from collections.abc import Callable, Iterable, Mapping
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,46 +19,13 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 
-from app.config import DEFAULT_SEPARATION_HOP_SECONDS, Settings, get_settings
+from app.config import Settings, get_settings
 
-try:  # ``bandit_infer`` pulls in torch/CUDA; it is a runtime-only dependency.
-    from bandit_infer import BanditSession
-except ImportError:  # pragma: no cover - keeps the module importable for tests
-    BanditSession = None  # type: ignore[assignment]
+logger = logging.getLogger(__name__)
 
-
-#: BandIt v2 Multi - the cinematic separation model verified by the package.
-MODEL_NAME = "v2-multi"
-
-#: v2 Multi is trained for 48 kHz audio; BandIt rejects every other rate.
+MODEL_FILENAME = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 REQUIRED_SAMPLE_RATE = 48_000
-
-#: Stem names returned by the v2 Multi model, in output order.
 STEM_NAMES: tuple[str, ...] = ("speech", "music", "effects")
-
-#: Environment variable shared with ``bandit_infer`` to relocate its weight
-#: cache. The GPU worker points it at a persistent path (e.g. ``/models/bandit``).
-WEIGHTS_DIR_ENV_VAR = "BANDIT_INFER_WEIGHTS"
-
-#: Chunk geometry of BandIt's v2 inference handler, which decides both the cost and the
-#: peak memory of a run: the handler slides an 8-second window and cross-fades outputs.
-BANDIT_CHUNK_SECONDS = 8.0
-BANDIT_UPSTREAM_HOP_SECONDS = 1.0
-BANDIT_HOP_SECONDS = DEFAULT_SEPARATION_HOP_SECONDS
-
-#: Ceiling on the ``(channels, chunks, chunk_samples)`` tensor BandIt's handler builds
-#: from its whole input and holds for the entire call. It grows linearly with duration, so
-#: an unsegmented two-hour stereo film would ask for terabytes and fail the run here.
-#: Above this, the audio is separated in overlapping segments and cross-faded.
-MAX_CHUNK_TENSOR_BYTES = 1 << 30
-
-#: How much neighbouring segments overlap when the input has to be split. The handler
-#: front-pads its own input by ``2 * (chunk - hop)`` so its output is already correct at
-#: the edges of a call, which is what makes a cross-fade in the overlap safe; this is that
-#: margin plus one chunk, using the configured default hop.
-BANDIT_STITCH_SECONDS = (
-    2 * (BANDIT_CHUNK_SECONDS - BANDIT_HOP_SECONDS) + BANDIT_CHUNK_SECONDS
-)
 
 
 class SeparationError(RuntimeError):
@@ -90,7 +37,7 @@ class MissingInputError(SeparationError):
 
 
 class UnsupportedSampleRateError(SeparationError):
-    """The input is not the 48 kHz audio BandIt v2 Multi requires."""
+    """The input is not the 48 kHz audio required by this pipeline."""
 
 
 class InvalidAudioError(SeparationError):
@@ -98,50 +45,29 @@ class InvalidAudioError(SeparationError):
 
 
 class SeparationInferenceError(SeparationError):
-    """BandIt failed to load or run during separation."""
+    """The separator failed to load or run on the requested CUDA device."""
 
 
 class MissingStemError(SeparationError):
-    """BandIt returned a result without one of the expected stems."""
+    """The separator did not produce one of the expected stems."""
 
 
 @dataclass(frozen=True)
 class StemPaths:
-    """Filesystem paths of the three stems produced by :func:`separate_stems`."""
+    """Filesystem paths of the three stems produced by separate_stems."""
 
     speech: Path
     music: Path
     effects: Path
 
     def as_dict(self) -> dict[str, Path]:
-        """Return the stems as a ``{stem_name: path}`` mapping."""
+        """Return the stems as a mapping keyed by stem name."""
 
         return {"speech": self.speech, "music": self.music, "effects": self.effects}
 
 
-def resolve_weights_dir(settings: Settings | None = None) -> Path:
-    """Return the BandIt weight-cache directory.
-
-    The existing ``BANDIT_INFER_WEIGHTS`` configuration wins when it is set (the
-    GPU worker points it at a persistent model directory); otherwise the
-    project's ``MODEL_CACHE_DIR`` is used so weights stay inside the model cache.
-    """
-
-    settings = settings if settings is not None else get_settings()
-
-    configured = os.environ.get(WEIGHTS_DIR_ENV_VAR)
-    if configured and configured.strip():
-        return Path(configured.strip()).expanduser()
-
-    return Path(settings.model_cache_dir) / "bandit"
-
-
 def read_audio(path: str | Path) -> tuple[np.ndarray, int]:
-    """Read an audio file into a float32 ``(channels, samples)`` array.
-
-    The sample rate is returned untouched; deciding whether it is acceptable is
-    the caller's responsibility, so no implicit resampling ever happens here.
-    """
+    """Read an audio file into a float32 (channels, samples) array."""
 
     audio_path = Path(path)
     if not audio_path.is_file():
@@ -149,393 +75,189 @@ def read_audio(path: str | Path) -> tuple[np.ndarray, int]:
 
     try:
         data, sample_rate = sf.read(str(audio_path), dtype="float32", always_2d=True)
-    except (OSError, RuntimeError) as exc:  # soundfile errors subclass RuntimeError
+    except (OSError, RuntimeError) as exc:
         raise InvalidAudioError(f"could not read audio file {audio_path}: {exc}") from exc
 
     audio = np.ascontiguousarray(np.asarray(data, dtype=np.float32).T)
     if audio.ndim != 2 or audio.shape[0] == 0 or audio.shape[1] == 0:
         raise InvalidAudioError(f"audio file {audio_path} contains no usable samples")
-
     return audio, int(sample_rate)
 
 
 def _validate_sample_rate(sample_rate: int) -> None:
     if sample_rate != REQUIRED_SAMPLE_RATE:
         raise UnsupportedSampleRateError(
-            f"BandIt {MODEL_NAME} requires {REQUIRED_SAMPLE_RATE} Hz audio, got "
-            f"{sample_rate} Hz; resample the input before calling separate_stems()"
+            f"separation requires {REQUIRED_SAMPLE_RATE} Hz audio, got {sample_rate} Hz; "
+            "resample the input before calling separate_stems()"
         )
 
 
-def _configure_chunking(
-    session: Any, batch_size: int, hop_seconds: float
-) -> float:
-    """Configure chunk batching and overlap; return the hop actually in use.
-
-    The handler defaults to one chunk per forward, which leaves a large GPU mostly
-    idle: its chunks are independent - it flattens them into the batch dimension and the
-    model reads each as its own sequence - so batching them is the same arithmetic with
-    more of the card in use.
-
-    BandIt's 8-second windows use an upstream 1-second hop. A 2-second hop still
-    leaves 6 seconds of overlap while roughly halving the number of independent
-    forwards. The handler internals are private, so only apply the hop when all
-    required state is present; otherwise retain and return the library's current
-    hop so memory sizing and stitching remain correct.
-    """
-
-    handler = getattr(getattr(session, "_runtime", None), "handler", None)
-    if handler is None:
-        return BANDIT_UPSTREAM_HOP_SECONDS
-
-    if hasattr(handler, "inference_batch_size"):
-        handler.inference_batch_size = max(1, int(batch_size))
-
-    chunk_samples = getattr(handler, "chunk_size_samples", None)
-    previous_hop_samples = getattr(handler, "hop_size_samples", None)
-    scaled_window = getattr(handler, "scaled_window", None)
-    if (
-        not isinstance(chunk_samples, int)
-        or not isinstance(previous_hop_samples, int)
-        or previous_hop_samples <= 0
-        or scaled_window is None
-    ):
-        if isinstance(previous_hop_samples, int) and previous_hop_samples > 0:
-            return previous_hop_samples / REQUIRED_SAMPLE_RATE
-        return BANDIT_UPSTREAM_HOP_SECONDS
-
-    if not math.isfinite(hop_seconds) or hop_seconds <= 0:
-        raise ValueError(f"SEPARATION_HOP_SECONDS must be positive, got {hop_seconds!r}")
-
-    requested_hop_samples = int(round(hop_seconds * REQUIRED_SAMPLE_RATE))
-    if requested_hop_samples > chunk_samples:
-        raise ValueError(
-            f"SEPARATION_HOP_SECONDS ({hop_seconds}) must not exceed the "
-            f"{BANDIT_CHUNK_SECONDS}-second chunk size"
-        )
-    if requested_hop_samples == previous_hop_samples:
-        return requested_hop_samples / REQUIRED_SAMPLE_RATE
-
-    previous_scaler = chunk_samples / (2 * previous_hop_samples)
-    requested_scaler = chunk_samples / (2 * requested_hop_samples)
-    try:
-        updated_window = scaled_window * (previous_scaler / requested_scaler)
-    except (TypeError, RuntimeError):
-        return previous_hop_samples / REQUIRED_SAMPLE_RATE
-
-    handler.hop_size_samples = requested_hop_samples
-    handler.overlap_samples = chunk_samples - requested_hop_samples
-    handler.scaler = requested_scaler
-    handler.front_pad_samples = 2 * handler.overlap_samples
-    handler.scaled_window = updated_window
-    return requested_hop_samples / REQUIRED_SAMPLE_RATE
-
-
-def _max_segment_seconds(
-    channels: int, sample_rate: int, hop_seconds: float
-) -> float:
-    """Return the longest input, in seconds, whose chunk tensor stays within budget.
-
-    The bound has to be on the *unfolded* tensor rather than on the audio, because that
-    is what the handler materialises and holds: ``channels * chunks * chunk_samples``
-    floats, with ``chunks`` growing by one per hop.
-    """
-
-    chunk_samples = int(BANDIT_CHUNK_SECONDS * sample_rate)
-    bytes_per_second = (
-        channels
-        * chunk_samples
-        * np.dtype(np.float32).itemsize
-        / hop_seconds
-    )
-    return MAX_CHUNK_TENSOR_BYTES / bytes_per_second
-
-
-def _infer_segmented(
-    session: Any,
-    audio: np.ndarray,
-    sample_rate: int,
-    *,
-    hop_seconds: float,
-    on_progress: Callable[[str], None] | None = None,
-) -> dict[str, np.ndarray]:
-    """Separate ``audio``, splitting it only when one call would not fit in memory.
-
-    A short input takes exactly the same path it always did - one call, no cross-fade -
-    so this changes nothing about the audio of a clip that already fits. A long one is
-    separated in overlapping segments and the overlaps blended linearly, which is safe
-    because each call's output is already correct at its own edges.
-    """
-
-    channels, samples = audio.shape
-    longest = _max_segment_seconds(channels, sample_rate, hop_seconds)
-    if samples / sample_rate <= longest:
-        started = time.perf_counter()
-        if on_progress is not None:
-            on_progress(
-                f"  separation inference segment 1/1 started "
-                f"({samples / sample_rate:.1f}s of audio)"
-            )
-        raw_stems = session.infer(audio, sample_rate=sample_rate)
-        stems = _collect_stems(raw_stems)
-        del raw_stems
-        _release_cuda_cache()
-        if on_progress is not None:
-            on_progress(
-                f"  separation inference segment 1/1 completed in "
-                f"{time.perf_counter() - started:.1f}s"
-            )
-        return stems
-
-    segment = int(round(longest * sample_rate))
-    stitch_seconds = (
-        2 * (BANDIT_CHUNK_SECONDS - hop_seconds) + BANDIT_CHUNK_SECONDS
-    )
-    overlap = min(int(round(stitch_seconds * sample_rate)), segment // 2)
-    step = segment - overlap
-    if step <= 0:  # pragma: no cover - only if the budget is set absurdly low
-        raise SeparationInferenceError(
-            f"a {segment}-sample segment leaves no room to advance; raise "
-            f"MAX_CHUNK_TENSOR_BYTES"
-        )
-
-    blended = {name: np.zeros((channels, samples), dtype=np.float32) for name in STEM_NAMES}
-    weight = np.zeros(samples, dtype=np.float32)
-
-    segment_count = (samples - 1) // step + 1
-    for segment_number, start in enumerate(range(0, samples, step), start=1):
-        stop = min(start + segment, samples)
-        segment_started = time.perf_counter()
-        if on_progress is not None:
-            on_progress(
-                f"  separation inference segment {segment_number}/{segment_count} "
-                f"started ({(stop - start) / sample_rate:.1f}s of audio)"
-            )
-        segment_audio = audio[:, start:stop]
-        raw_stems = session.infer(segment_audio, sample_rate=sample_rate)
-        stems = _collect_stems(raw_stems)
-        del raw_stems, segment_audio
-        _release_cuda_cache()
-        if on_progress is not None:
-            on_progress(
-                f"  separation inference segment {segment_number}/{segment_count} "
-                f"completed in {time.perf_counter() - segment_started:.1f}s"
-            )
-
-        # Ramp a segment in at its head and out at its tail, but only where another
-        # segment actually overlaps it, so the first and last segments keep their edges.
-        ramp = np.ones(stop - start, dtype=np.float32)
-        head = overlap if start > 0 else 0
-        if head:
-            ramp[:head] = np.linspace(0.0, 1.0, head, dtype=np.float32)
-        tail = overlap if stop < samples else 0
-        if tail:
-            ramp[-tail:] *= np.linspace(1.0, 0.0, tail, dtype=np.float32)
-
-        for name in STEM_NAMES:
-            blended[name][:, start:stop] += stems[name] * ramp
-        weight[start:stop] += ramp
-        del stems
-
-    # Every sample is covered by at least one segment, so this cannot divide by zero;
-    # the guard is here because a silent failure would be a loud artefact.
-    weight[weight <= 0.0] = 1.0
-    for name in STEM_NAMES:
-        blended[name] /= weight
-
-    return blended
-
-
-def _is_out_of_memory(exc: BaseException) -> bool:
-    """``True`` when ``exc`` is the GPU saying the request was too large.
-
-    Matched on the message rather than on ``torch.cuda.OutOfMemoryError`` so this module
-    keeps working without importing torch, and so a cuDNN or allocator variant that
-    raises a plain ``RuntimeError`` is recognised too.
-    """
-
-    return "out of memory" in str(exc).lower()
-
-
-def _release_cuda_cache() -> None:
-    """Give the freed blocks back before retrying with a smaller batch."""
+def _require_cuda() -> Any:
+    """Import the runtime lazily and fail before model loading when CUDA is absent."""
 
     try:
         import torch
-    except ImportError:  # pragma: no cover - torch is a runtime dependency
-        return
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:  # pragma: no cover - a cache hint must never raise
-        pass
-
-
-def _inference_context() -> AbstractContextManager[None]:
-    """Disable gradient tracking during inference when PyTorch is available."""
-
-    try:
-        import torch
-    except ImportError:  # pragma: no cover - supports importable lightweight tests
-        return nullcontext()
-    return torch.no_grad()
-
-
-def _infer_adaptively(
-    session: Any,
-    audio: np.ndarray,
-    sample_rate: int,
-    batch_size: int,
-    hop_seconds: float,
-    *,
-    on_progress: Callable[[str], None] | None = None,
-) -> dict[str, np.ndarray]:
-    """Separate in the largest chunk batch that fits, halving it when it does not.
-
-    A batch that is too large for the card should cost a slower stage, not a failed run,
-    so an out-of-memory error halves the batch and tries again down to one - which is
-    where the library itself started, so a size that works always exists.
-
-    It warns once, at the end, naming the size it settled on: a run that retried should
-    say so, but a warning per step would bury that under three lines of noise about a
-    recovery that worked.
-
-    The audio is identical at every batch size; only the time taken changes.
-    """
-
-    current = max(1, int(batch_size))
-    asked = current
-
-    while True:
-        actual_hop_seconds = _configure_chunking(session, current, hop_seconds)
-        attempt_started = time.perf_counter()
-        if on_progress is not None:
-            on_progress(
-                f"  separation inference started "
-                f"(batch size {current}, hop {actual_hop_seconds:g}s)"
-            )
-        try:
-            with _inference_context():
-                stems = _infer_segmented(
-                    session,
-                    audio,
-                    sample_rate,
-                    hop_seconds=actual_hop_seconds,
-                    on_progress=on_progress,
-                )
-        except Exception as exc:
-            if current == 1 or not _is_out_of_memory(exc):
-                raise
-            _release_cuda_cache()
-            next_size = max(1, current // 2)
-            if on_progress is not None:
-                on_progress(
-                    f"  separation inference ran out of memory at batch size "
-                    f"{current} after {time.perf_counter() - attempt_started:.1f}s; "
-                    f"retrying at {next_size}"
-                )
-            current = next_size
-            continue
-
-        if current != asked:
-            warnings.warn(
-                f"BandIt ran out of memory with {asked} chunks per forward pass and "
-                f"settled on {current}. Set SEPARATION_INFERENCE_BATCH_SIZE={current} "
-                "to start there and skip the retries.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        if on_progress is not None:
-            on_progress(
-                f"  separation inference completed in "
-                f"{time.perf_counter() - attempt_started:.1f}s "
-                f"(batch size {current})"
-            )
-        return stems
-
-
-def _run_bandit(
-    audio: np.ndarray,
-    settings: Settings,
-    weights_dir: Path,
-    *,
-    on_progress: Callable[[str], None] | None = None,
-) -> Mapping[str, np.ndarray]:
-    """Load a BandIt session, run inference, and always close the session."""
-
-    if BanditSession is None:  # pragma: no cover - only when the dep is missing
+    except ImportError as exc:  # pragma: no cover - required on a deployed worker
         raise SeparationInferenceError(
-            "bandit-infer is not installed; install the runtime dependencies "
-            "(torch, torchaudio, bandit-infer) before running separation"
-        )
-
-    try:
-        session = BanditSession(MODEL_NAME, device=settings.device, weights_dir=weights_dir)
-    except Exception as exc:
-        raise SeparationInferenceError(
-            f"could not create BandIt session (model={MODEL_NAME!r}, "
-            f"device={settings.device!r}): {exc}"
+            "PyTorch is required for CUDA audio separation"
         ) from exc
 
+    if not torch.cuda.is_available():
+        raise SeparationInferenceError(
+            "audio-separator is configured for CUDA, but torch.cuda.is_available() is false"
+        )
+    return torch
+
+
+def _write_silence(path: Path, info: Any) -> None:
+    """Create the effects stem without allocating a full-duration audio array."""
+
     try:
-        load_started = time.perf_counter()
+        with sf.SoundFile(
+            str(path),
+            mode="w",
+            samplerate=info.samplerate,
+            channels=info.channels,
+            format="WAV",
+            subtype="PCM_16",
+        ) as output:
+            block = np.zeros(
+                (min(info.samplerate * 10, info.frames), info.channels),
+                dtype=np.float32,
+            )
+            frames_written = 0
+            while frames_written < info.frames:
+                frames = min(len(block), info.frames - frames_written)
+                output.write(block[:frames])
+                frames_written += frames
+    except (OSError, RuntimeError) as exc:
+        raise InvalidAudioError(f"could not write silent effects stem {path}: {exc}") from exc
+
+
+def _run_audio_separator(
+    source: Path,
+    destination: Path,
+    settings: Settings,
+    *,
+    on_progress: Callable[[str], None] | None,
+) -> tuple[Path, Path]:
+    """Run one native-chunked BS-Roformer inference and return vocals/background."""
+
+    torch = _require_cuda()
+    try:
+        from audio_separator.separator import Separator
+    except ImportError as exc:  # pragma: no cover - dependency install failure
+        raise SeparationInferenceError(
+            "audio-separator is not installed; install the project requirements"
+        ) from exc
+
+    cache_dir = Path(settings.model_cache_dir) / "audio-separator"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    separator: Any | None = None
+    try:
         if on_progress is not None:
-            on_progress("  separation model loading started")
-        session.load()
+            on_progress("  separation CUDA available; loading BS-Roformer model")
+        separator = Separator(
+            model_file_dir=str(cache_dir),
+            output_dir=str(destination),
+            output_format="WAV",
+            sample_rate=REQUIRED_SAMPLE_RATE,
+            use_soundfile=True,
+            # Keep file-level chunking disabled: the BS-Roformer MDXC implementation
+            # already uses overlapping model segments, while the wrapper's optional
+            # file chunker rejoins chunks with simple concatenation.
+            chunk_duration=None,
+        )
+        device = str(getattr(separator, "torch_device", ""))
+        if not device.lower().startswith("cuda"):
+            raise SeparationInferenceError(
+                f"audio-separator selected {device or 'an unknown device'} instead of CUDA"
+            )
+
+        if on_progress is not None:
+            on_progress(f"  separation loading model {MODEL_FILENAME}")
+        separator.load_model(model_filename=MODEL_FILENAME)
         if on_progress is not None:
             on_progress(
-                f"  separation model loading completed in "
-                f"{time.perf_counter() - load_started:.1f}s"
+                "  separation inference started (CUDA, model-managed overlap-add)"
             )
-        return _infer_adaptively(
-            session,
-            audio,
-            REQUIRED_SAMPLE_RATE,
-            settings.separation_inference_batch_size,
-            settings.separation_hop_seconds,
-            on_progress=on_progress,
+
+        model_device = str(
+            getattr(
+                getattr(separator, "model_instance", None),
+                "torch_device",
+                device,
+            )
         )
+        if not model_device.lower().startswith("cuda"):
+            raise SeparationInferenceError(
+                f"loaded separator model selected {model_device} instead of CUDA"
+            )
+
+        generated = separator.separate(
+            str(source),
+            custom_output_names={
+                "Vocals": f"{source.stem}_speech",
+                "Instrumental": f"{source.stem}_music",
+            },
+        )
+        if not isinstance(generated, Sequence) or isinstance(generated, (str, bytes)):
+            raise MissingStemError(
+                "audio-separator did not return the expected sequence of output paths"
+            )
+
+        speech: Path | None = None
+        music: Path | None = None
+        for item in generated:
+            output = Path(item)
+            label = output.stem.casefold()
+            if "speech" in label or "vocal" in label:
+                speech = output
+            elif "music" in label or "instrumental" in label:
+                music = output
+
+        if speech is None or music is None:
+            missing = [
+                name
+                for name, output in (
+                    ("speech/vocals", speech),
+                    ("music/instrumental", music),
+                )
+                if output is None
+            ]
+            raise MissingStemError(
+                "audio-separator output is missing expected stem(s): " + ", ".join(missing)
+            )
+        for name, output in (("speech/vocals", speech), ("music/instrumental", music)):
+            if not output.is_file() or output.stat().st_size == 0:
+                raise InvalidAudioError(f"audio-separator produced no usable {name} file")
+            try:
+                output_info = sf.info(str(output))
+            except (OSError, RuntimeError) as exc:
+                raise InvalidAudioError(
+                    f"could not read audio-separator {name} output {output}: {exc}"
+                ) from exc
+            if output_info.frames <= 0 or output_info.channels <= 0:
+                raise InvalidAudioError(
+                    f"audio-separator produced an empty {name} output"
+                )
+            if output_info.samplerate != REQUIRED_SAMPLE_RATE:
+                raise InvalidAudioError(
+                    f"audio-separator {name} output is {output_info.samplerate} Hz, "
+                    f"expected {REQUIRED_SAMPLE_RATE} Hz"
+                )
+        return speech, music
     except SeparationError:
         raise
     except Exception as exc:
-        raise SeparationInferenceError(f"BandIt inference failed: {exc}") from exc
+        raise SeparationInferenceError(f"audio-separator inference failed: {exc}") from exc
     finally:
-        close = getattr(session, "close", None)
-        if callable(close):
-            close()
-
-
-def _collect_stems(stems: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    if not isinstance(stems, Mapping):
-        raise MissingStemError(
-            f"BandIt returned {type(stems).__name__}, expected a mapping of stems"
-        )
-
-    missing = [name for name in STEM_NAMES if name not in stems]
-    if missing:
-        raise MissingStemError("BandIt result is missing expected stem(s): " + ", ".join(missing))
-
-    collected: dict[str, np.ndarray] = {}
-    for name in STEM_NAMES:
-        array = np.asarray(stems[name], dtype=np.float32)
-        if array.size == 0:
-            raise InvalidAudioError(f"BandIt returned an empty '{name}' stem")
-        collected[name] = array
-    return collected
-
-
-def _write_stem(path: Path, audio: np.ndarray, sample_rate: int) -> None:
-    if audio.ndim == 1:
-        data = audio
-    elif audio.ndim == 2:
-        data = audio.T  # (channels, samples) -> (samples, channels)
-    else:
-        raise InvalidAudioError(f"cannot write a {audio.ndim}-dimensional stem array")
-
-    try:
-        sf.write(str(path), data, sample_rate, format="WAV", subtype="PCM_16")
-    except (OSError, RuntimeError) as exc:
-        raise InvalidAudioError(f"could not write stem {path}: {exc}") from exc
+        separator = None
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except RuntimeError as exc:  # cleanup must not conceal the inference error
+            logger.warning("Could not empty the CUDA cache after separation: %s", exc)
 
 
 def separate_stems(
@@ -545,72 +267,44 @@ def separate_stems(
     settings: Settings | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> StemPaths:
-    """Split ``input_path`` into speech/music/effects stems with BandIt v2 Multi.
+    """Separate 48 kHz audio into vocals and the combined instrumental bed.
 
-    Parameters
-    ----------
-    input_path:
-        A 48 kHz WAV/audio file. It is never resampled; other rates are rejected.
-    output_dir:
-        Directory for the produced ``<name>_speech.wav`` etc. Defaults to the
-        project ``WORK_DIR``. Created when missing.
-    settings:
-        Project settings override; defaults to :func:`app.config.get_settings`.
-    on_progress:
-        Optional callback for audio I/O, model loading and inference timing updates.
-
-    Returns
-    -------
-    StemPaths
-        Paths of the three written PCM-16 WAV stems at the original 48 kHz rate.
+    CUDA is required. The model library chunks long inputs internally; this adapter
+    avoids loading a full waveform or intermediate stem arrays. The instrumental bed
+    is returned as music and effects is silent for compatibility with the mixer.
     """
 
-    settings = settings if settings is not None else get_settings()
-    if (
-        not math.isfinite(settings.separation_hop_seconds)
-        or settings.separation_hop_seconds <= 0
-        or settings.separation_hop_seconds > BANDIT_CHUNK_SECONDS
-    ):
-        raise SeparationInferenceError(
-            f"SEPARATION_HOP_SECONDS must be > 0 and <= "
-            f"{BANDIT_CHUNK_SECONDS}, got {settings.separation_hop_seconds!r}"
-        )
+    resolved = settings if settings is not None else get_settings()
     source = Path(input_path)
+    if not source.is_file():
+        raise MissingInputError(f"input audio file not found: {source}")
 
-    read_started = time.perf_counter()
-    audio, sample_rate = read_audio(source)
-    _validate_sample_rate(sample_rate)
-    if on_progress is not None:
-        on_progress(
-            f"  separation audio read in {time.perf_counter() - read_started:.1f}s "
-            f"({audio.shape[1] / sample_rate:.1f}s, {audio.shape[0]} channel(s))"
-        )
+    try:
+        info = sf.info(str(source))
+    except (OSError, RuntimeError) as exc:
+        raise InvalidAudioError(f"could not read audio metadata for {source}: {exc}") from exc
+    if info.frames <= 0 or info.channels <= 0:
+        raise InvalidAudioError(f"audio file {source} contains no usable samples")
+    _validate_sample_rate(info.samplerate)
 
-    weights_dir = resolve_weights_dir(settings)
-    stems = _run_bandit(audio, settings, weights_dir, on_progress=on_progress)
-    collected = _collect_stems(stems)
-
-    destination = Path(output_dir) if output_dir is not None else Path(settings.work_dir)
+    destination = Path(output_dir) if output_dir is not None else Path(resolved.work_dir)
     destination.mkdir(parents=True, exist_ok=True)
-
-    prefix = source.stem
-    written: dict[str, Path] = {}
-    write_started = time.perf_counter()
-    for name in STEM_NAMES:
-        stem_path = destination / f"{prefix}_{name}.wav"
-        _write_stem(stem_path, collected[name], sample_rate)
-        written[name] = stem_path
     if on_progress is not None:
         on_progress(
-            f"  separation stem writes completed in "
-            f"{time.perf_counter() - write_started:.1f}s"
+            f"  separation audio ready ({info.frames / info.samplerate:.1f}s, "
+            f"{info.channels} channel(s))"
         )
 
-    return StemPaths(
-        speech=written["speech"],
-        music=written["music"],
-        effects=written["effects"],
+    started = time.perf_counter()
+    speech, music = _run_audio_separator(
+        source, destination, resolved, on_progress=on_progress
     )
+    effects = destination / f"{source.stem}_effects.wav"
+    _write_silence(effects, info)
+    if on_progress is not None:
+        on_progress(f"  separation completed in {time.perf_counter() - started:.1f}s")
+
+    return StemPaths(speech=speech, music=music, effects=effects)
 
 
 #: How far below the original performance the bed has to sit for the English to be

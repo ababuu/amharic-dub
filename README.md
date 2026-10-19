@@ -19,7 +19,7 @@ cloned voices, re-timed, and mixed back with the untouched music and effects.
 
 ```mermaid
 flowchart LR
-    V["Source video"] --> SEP["Source separation<br/>BandIt v2 Multi"]
+    V["Source video"] --> SEP["Source separation<br/>BS-Roformer via audio-separator"]
     SEP -->|dialogue| DIA["Speaker diarization<br/>pyannote Community-1"]
     DIA --> ASR["Transcription<br/>faster-whisper large-v3"]
     ASR --> TR["Adapt + translate to Amharic<br/>NLLB-200 3.3B or an LLM with<br/>scene + character bible"]
@@ -40,7 +40,7 @@ flowchart LR
 | Runtime              | RunPod A40 worker, NVIDIA CUDA 12.8     |
 | Framework            | PyTorch 2.8 + torchaudio 2.8            |
 | Media                | FFmpeg                                  |
-| Source separation    | BandIt v2 Multi                         |
+| Source separation    | audio-separator BS-Roformer (CUDA; vocals + instrumental) |
 | Diarization          | pyannote Community-1                    |
 | Transcription        | faster-whisper large-v3                 |
 | Translation/adaptation | **NLLB-200 3.3B** (default, local) or any OpenAI-compatible endpoint (opt-in) |
@@ -312,7 +312,7 @@ amharic-dub/
     config.py                 # environment-driven configuration (implemented)
     pipeline/                 # one module per stage
       __init__.py
-      separation.py           # BandIt v2 Multi separation (implemented)
+      separation.py           # audio-separator BS-Roformer separation (implemented)
       diarization.py          # pyannote Community-1 diarization (implemented)
       transcription.py        # faster-whisper large-v3 transcription (implemented)
       translation.py          # Amharic dialogue adaptation (backend-selecting) (implemented)
@@ -369,8 +369,6 @@ environment, so values configured on the RunPod pod always win.
 | `DIARIZATION_MODEL` | Hugging Face pipeline id for diarization            | `pyannote/speaker-diarization-community-1` |
 | `DIARIZATION_MIN_SPEAKERS` | Fewest speakers diarization may report; unset lets it decide | *(unset)* |
 | `DIARIZATION_MAX_SPEAKERS` | Most speakers diarization may report; unset lets it decide | *(unset)* |
-| `SEPARATION_INFERENCE_BATCH_SIZE` | BandIt chunks per forward pass. The RunPod A40 starting default is **64**; OOM recovery halves the batch and retries. An earlier measurement completed at 8 but ran out of memory at 16 and 32, so check the reported settled size and lower this value if needed. | `64` |
-| `SEPARATION_HOP_SECONDS` | Advance between BandIt's 8-second inference windows. The default **6.0** leaves 2 seconds of overlap, reducing redundant model chunks; smaller hops increase overlap and compute. Reduce it if a source shows seam artefacts. | `6.0` |
 | `TRANSCRIPTION_MODEL` | faster-whisper model for transcription            | `large-v3`         |
 | `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
 | `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |
@@ -559,8 +557,9 @@ CUDA-matched PyTorch 2.8 the image provides was replaced:
 bash scripts/install_dependencies.sh
 ```
 
-**What the first run downloads** (measured from the repositories themselves, and why a
-network volume matters). Weights land in `HF_HOME`, not in the repository. With the
+**What the first run downloads** (and why a network volume matters). Hugging Face
+models are cached under `HF_HOME`; audio-separator stores its checkpoint under
+`MODEL_CACHE_DIR/audio-separator`. Neither is stored in the repository. With the
 defaults — an LLM backend and OmniVoice — there is **no translation download at all**,
 because the translation is an API call:
 
@@ -568,7 +567,7 @@ because the translation is an API call:
 | --- | --- | --- |
 | OmniVoice Amharic (default speech) | ~2.4 GiB | `african-low-resource/omnivoice-amharic`; the multilingual base is not downloaded |
 | faster-whisper `large-v3` | ~3 GiB | transcription |
-| BandIt v2 Multi | ~1 GiB | separation |
+| BS-Roformer (`model_bs_roformer_ep_317_sdr_12.9755.ckpt`) | downloaded on first run | vocals/instrumental separation |
 | pyannote Community-1 | ~1 GiB | gated; needs the token |
 | MMS-TTS Amharic | 0.3 GiB | only for `TTS_ENGINE=mms` |
 | NLLB-200 `3.3B` | 16.4 GiB | **only** for `TRANSLATION_BACKEND=nllb`; this is why the LLM backend is also the smaller setup |
@@ -599,17 +598,23 @@ configuration does not use is reported `[SKIP]` rather than `[FAIL]`. On RunPod,
 or `cuda:N`; without it, CUDA absence remains a non-blocking result for local
 development checks.
 
-The local model stages use that configured device: BandIt separation, pyannote
-diarization, faster-whisper transcription, OmniVoice synthesis, and local NLLB
-translation. GPU-oriented defaults are BandIt batch size 8 and a 2-second
-separation hop, faster-whisper `large-v3` in FP16, and OmniVoice in FP16. The
-default Gemini/DeepSeek translation backend is a remote API call, not a model
+The separation stage explicitly requires CUDA and verifies that audio-separator
+selected a CUDA device before loading its BS-Roformer checkpoint. BS-Roformer
+uses the model's native overlapping segment inference; the wrapper's optional
+file-level chunker is disabled because it rejoins chunks with simple concatenation.
+Vocals feed diarization and the instrumental output feeds the existing music bed.
+A silent effects stem keeps the downstream three-path interface without duplicating
+the instrumental.
+Other local model stages use the configured device: pyannote diarization,
+faster-whisper transcription, OmniVoice synthesis, and local NLLB translation.
+GPU-oriented defaults include faster-whisper `large-v3` in FP16 and OmniVoice in FP16.
+The default Gemini/DeepSeek translation backend is a remote API call, not a model
 running on the Pod GPU. FFmpeg audio/video extraction and final muxing also use
 the CPU. The installer checks the RunPod PyTorch 2.8 / CUDA 12.8 runtime and
 stops if the GPU is unavailable, before a model run begins.
 
-`scripts/validate_models.py` loads each model **on its own** - BandIt, pyannote,
-faster-whisper, the configured translation backend, the configured synthesis engine -
+`scripts/validate_models.py` loads each model **on its own** - BS-Roformer,
+pyannote, faster-whisper, the configured translation backend, the configured synthesis engine -
 reports the result for each, and releases it before the next one, so a failure
 names exactly one component instead of surfacing halfway through a run after other
 weights have already been downloaded. The translation and synthesis steps go one
@@ -673,7 +678,7 @@ Keeping the repository (and so the output) on the volume is what makes the resul
 survive a stop, and findable from a later session. Anything written to the
 container disk is lost when the Pod stops.
 
-Model weights (BandIt, pyannote, faster-whisper, NLLB, OmniVoice, MMS-TTS) are
+Model weights (BS-Roformer, pyannote, faster-whisper, NLLB, OmniVoice, MMS-TTS) are
 **not** part of this repository. They are downloaded at runtime into
 `MODEL_CACHE_DIR`; point that variable at the Pod's persistent volume so the weights
 survive restarts. OmniVoice and MMS-TTS fetch their own checkpoints through Hugging
@@ -1147,7 +1152,7 @@ pytest tests/test_config.py
 ## Roadmap
 
 - [x] Project scaffold, configuration, health check
-- [x] `separation`: BandIt v2 Multi integration
+- [x] `separation`: audio-separator BS-Roformer two-stem integration
 - [x] `diarization`: pyannote Community-1 integration
 - [x] `transcription`: faster-whisper large-v3 integration
 - [x] `translation`: instruction-following Amharic dialogue adaptation (Gemini by default, DeepSeek or self-hosted by configuration)
@@ -1220,7 +1225,7 @@ merit. What is currently in use, so the obligations are known rather than assume
 
 | Component | Licence | Note |
 | --- | --- | --- |
-| BandIt v2 (`v2-multi`) | code Apache-2.0, weights **CC-BY-SA-4.0** | share-alike on derivatives; the original BandIt's weights are CC-BY-NC-4.0 and are *not* used |
+| audio-separator / BS-Roformer | wrapper code MIT; verify the checkpoint's current model-card terms before redistribution | checkpoint is downloaded by audio-separator into `MODEL_CACHE_DIR` |
 | pyannote Community-1 | **CC-BY-4.0**, gated | requires accepting the model card; the HF token must have read access |
 | faster-whisper `large-v3` | MIT | not gated |
 | NLLB-200 (`3.3B`) | **CC-BY-NC-4.0** | non-commercial weights; the code is MIT |

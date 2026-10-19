@@ -44,8 +44,8 @@ from app.pipeline.timing import PIPELINE_SAMPLE_RATE as _TIMING_SAMPLE_RATE
 from app.pipeline.timing import AlignedClip
 from app.pipeline.voice_profiles import portable_path
 
-#: The mix, like every stage after separation, runs at BandIt's 48 kHz. The value
-#: is taken from the timing stage rather than redeclared so the two cannot drift;
+#: The mix, like every stage after separation, runs at the pipeline's 48 kHz. The
+#: value is taken from the timing stage rather than redeclared so the two cannot drift;
 #: ``tests/test_mixing.py`` checks it against the other stages' declarations.
 PIPELINE_SAMPLE_RATE = _TIMING_SAMPLE_RATE
 

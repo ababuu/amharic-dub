@@ -24,9 +24,9 @@ other configuration, set the environment variables::
 
     python scripts/validate_models.py
     python scripts/validate_models.py --only nllb
-    python scripts/validate_models.py --only bandit,mms
+    python scripts/validate_models.py --only separation,mms
 
-Each step drives the stage's *own* loader (``separation``'s session, ``diarization``'s
+Each step drives the stage's *own* loader (``separation``'s model, ``diarization``'s
 pipeline loader, ``transcription``'s model loader, ``translation``'s backend,
 ``tts``'s engines), so what is validated here is the same code path a real run
 takes. The translation and synthesis steps go one step further than loading and run
@@ -109,29 +109,43 @@ def load_torch() -> None:
         _report("cuda version", torch.version.cuda or "unknown")
 
 
-def load_bandit() -> None:
-    """Build the BandIt v2 Multi session and load its weights."""
+def load_separation() -> None:
+    """Load the configured BS-Roformer model and verify CUDA selection."""
 
     from app.pipeline import separation
 
-    if separation.BanditSession is None:  # pragma: no cover - missing dependency
-        raise RuntimeError("bandit-infer is not installed")
-
     settings = separation.get_settings()
-    weights_dir = separation.resolve_weights_dir(settings)
-    _report("model", separation.MODEL_NAME)
-    _report("weights dir", str(weights_dir))
+    torch = separation._require_cuda()  # noqa: SLF001
+    try:
+        from audio_separator.separator import Separator
+    except ImportError as exc:
+        raise RuntimeError("audio-separator is not installed") from exc
 
-    session = separation.BanditSession(
-        separation.MODEL_NAME, device=settings.device, weights_dir=weights_dir
+    cache_dir = settings.model_cache_dir / "audio-separator"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    separator = Separator(
+        model_file_dir=str(cache_dir),
+        output_dir=str(settings.work_dir),
+        output_format="WAV",
+        sample_rate=separation.REQUIRED_SAMPLE_RATE,
+        use_soundfile=True,
+        chunk_duration=None,
     )
     try:
-        session.load()
-        _report("stems", ", ".join(separation.STEM_NAMES))
+        device = str(getattr(separator, "torch_device", ""))
+        if not device.lower().startswith("cuda"):
+            raise RuntimeError(
+                f"audio-separator selected {device or 'an unknown device'} instead of CUDA"
+            )
+        _report("model", separation.MODEL_FILENAME)
+        _report("device", device)
+        _report("native chunking", "BS-Roformer overlap-add")
+        separator.load_model(model_filename=separation.MODEL_FILENAME)
     finally:
-        close = getattr(session, "close", None)
-        if callable(close):
-            close()
+        del separator
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def load_pyannote() -> None:
@@ -313,7 +327,7 @@ def load_served_model() -> None:
 #: Steps that every configuration needs, in pipeline order.
 STEPS: tuple[tuple[str, str, object], ...] = (
     ("torch", "compute runtime", load_torch),
-    ("bandit", "BandIt v2 Multi separation", load_bandit),
+    ("separation", "audio-separator BS-Roformer vocals/instrumental", load_separation),
     ("pyannote", "pyannote Community-1 diarization", load_pyannote),
     ("whisper", "faster-whisper transcription", load_whisper),
 )

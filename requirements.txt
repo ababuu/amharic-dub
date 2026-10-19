@@ -9,7 +9,7 @@
 # torchaudio 2.8, CUDA 12.8 and FFmpeg. The two torch entries below are kept so
 # the ABI matches the packages underneath and are normally already satisfied.
 #
-# Model weights (BandIt, pyannote, faster-whisper, OmniVoice) are downloaded at
+# Model weights (audio-separator, pyannote, faster-whisper, OmniVoice) are downloaded at
 # runtime into MODEL_CACHE_DIR; they are never listed here.
 # ---------------------------------------------------------------------------
 
@@ -18,8 +18,8 @@ torch==2.8.0
 torchaudio==2.8.0
 
 # --- Pipeline models -------------------------------------------------------
-# BandIt v2 Multi - cinematic audio source separation (not published on PyPI).
-bandit-infer @ git+https://github.com/openmirlab/bandit-infer@main
+# GPU-enabled audio-separator provides BS-Roformer vocal/instrumental separation.
+audio-separator[gpu]>=0.47,<0.48
 # pyannote Community-1 - speaker diarization.
 pyannote.audio==4.0.7
 # faster-whisper large-v3 - transcription (CTranslate2 backend).

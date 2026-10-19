@@ -46,7 +46,7 @@ from app.pipeline.dialogue_context import MINIMUM_PLACEMENT_WINDOW
 from app.pipeline.tts import TtsClip
 from app.pipeline.voice_profiles import portable_path
 
-#: Every stage after separation works at BandIt's 48 kHz, so no stage has to
+#: Every stage after separation works at the pipeline's 48 kHz, so no stage has to
 #: resample another stage's output. ``tests/test_timing.py`` keeps this in step
 #: with ``separation.REQUIRED_SAMPLE_RATE`` and ``video.PIPELINE_SAMPLE_RATE``.
 PIPELINE_SAMPLE_RATE = 48_000
