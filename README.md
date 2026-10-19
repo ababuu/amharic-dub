@@ -369,6 +369,8 @@ environment, so values configured on the RunPod pod always win.
 | `DIARIZATION_MODEL` | Hugging Face pipeline id for diarization            | `pyannote/speaker-diarization-community-1` |
 | `DIARIZATION_MIN_SPEAKERS` | Fewest speakers diarization may report; unset lets it decide | *(unset)* |
 | `DIARIZATION_MAX_SPEAKERS` | Most speakers diarization may report; unset lets it decide | *(unset)* |
+| `DEVICE` | Device for local model stages. Separation refuses anything but `cuda`/`cuda:N` | `cuda` |
+| `ALLOW_TORCH_COMPILE` | Set to `1` to re-enable TorchInductor. It is off by default because a pod whose PyTorch CUDA build predates its GPU aborts with `nvrtc: error: invalid value for --gpu-architecture`; no stage needs compilation | *(unset)* |
 | `TRANSCRIPTION_MODEL` | faster-whisper model for transcription            | `large-v3`         |
 | `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
 | `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |
@@ -609,6 +611,11 @@ instrumental output feeds the existing music bed. A silent effects stem keeps th
 downstream three-path interface without duplicating the instrumental.
 Other local model stages use the configured device: pyannote diarization,
 faster-whisper transcription, OmniVoice synthesis, and local NLLB translation.
+TorchInductor compilation is disabled by default (`TORCH_COMPILE_DISABLE=1`):
+a pod whose PyTorch CUDA build predates its GPU fails to compile kernels with
+`nvrtc: error: invalid value for --gpu-architecture (-arch)` even though eager
+inference works, and no stage here needs compilation. Set `ALLOW_TORCH_COMPILE=1`
+only when deliberately benchmarking a compiled path.
 GPU-oriented defaults include faster-whisper `large-v3` in FP16 and OmniVoice in FP16.
 The default Gemini/DeepSeek translation backend is a remote API call, not a model
 running on the Pod GPU. FFmpeg audio/video extraction and final muxing also use

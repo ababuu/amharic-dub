@@ -153,6 +153,8 @@ def check_torch(*, require_cuda: bool = False) -> bool:
         return not require_cuda
 
     print(f"PyTorch version: {torch.__version__}")
+    cuda_build = getattr(getattr(torch, "version", None), "cuda", None)
+    print(f"PyTorch CUDA build: {cuda_build or 'none (CPU-only build)'}")
 
     try:
         cuda_available = torch.cuda.is_available()
@@ -199,6 +201,12 @@ def check_torch(*, require_cuda: bool = False) -> bool:
 
         label = "GPU name" if index == 0 else f"GPU name [{index}]"
         print(f"{label}: {gpu_name}")
+
+        try:
+            major, minor = torch.cuda.get_device_capability(index)
+            print(f"Compute capability: sm_{major}{minor}  (torch must support it)")
+        except Exception:  # pragma: no cover - driver or torch quirks
+            print("Compute capability: unknown")
 
         if free_bytes is not None and total_bytes is not None:
             print(

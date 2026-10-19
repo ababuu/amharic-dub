@@ -70,6 +70,10 @@ Environment variables
                       Skip and report a line an engine *fails* on instead of ending
                       the run. Off by default, because a failure should be visible.
 ``DEVICE``            Compute device hint, ``cuda`` by default.
+``ALLOW_TORCH_COMPILE``
+                      Set to ``1`` to re-enable TorchInductor. Compilation is off
+                      by default because a pod whose PyTorch CUDA build predates
+                      its GPU aborts at NVRTC compile time.
 ``LOG_LEVEL``         Logging verbosity, ``INFO`` by default.
 """
 
@@ -462,6 +466,36 @@ def load_env_file(path: Optional[Path] = None) -> None:
         load_dotenv(env_path, override=False)
 
 
+#: Whether :func:`apply_torch_compile_policy` installed ``TORCH_COMPILE_DISABLE``
+#: itself, so a configuration that opts compilation back in can undo exactly that.
+_compile_guard_installed = False
+
+
+def apply_torch_compile_policy() -> None:
+    """Keep TorchInductor off unless ``ALLOW_TORCH_COMPILE=1``.
+
+    Inductor compiles kernels for the visible GPU's compute capability through
+    NVRTC. On a pod whose PyTorch CUDA build predates the GPU, that compilation
+    aborts with ``nvrtc: error: invalid value for --gpu-architecture (-arch)``
+    even though eager CUDA inference itself works. No stage of this pipeline
+    needs compilation, so it stays off; set ``ALLOW_TORCH_COMPILE=1`` to opt in.
+    """
+
+    global _compile_guard_installed
+
+    if _read_env("ALLOW_TORCH_COMPILE", "0") == "1":
+        if _compile_guard_installed:
+            os.environ.pop("TORCH_COMPILE_DISABLE", None)
+            _compile_guard_installed = False
+        return
+
+    if os.environ.get("TORCH_COMPILE_DISABLE") == "1":
+        return
+
+    os.environ["TORCH_COMPILE_DISABLE"] = "1"
+    _compile_guard_installed = True
+
+
 def _translation_model_default() -> str:
     """Return the model to use when ``TRANSLATION_MODEL`` is not set.
 
@@ -819,6 +853,7 @@ class Settings:
         """Build a :class:`Settings` instance from the environment."""
 
         load_env_file()
+        apply_torch_compile_policy()
         work_dir = _read_path("WORK_DIR", DEFAULT_WORK_DIR)
         model_cache_dir = _read_path("MODEL_CACHE_DIR", DEFAULT_MODEL_CACHE_DIR)
         return cls(
@@ -1211,6 +1246,12 @@ __all__ = [
     "DEFAULT_VOICE_REFERENCE_TARGET_DURATION",
     "PROJECT_ROOT",
     "Settings",
+    "apply_torch_compile_policy",
     "get_settings",
     "load_env_file",
 ]
+
+
+# Applied at import so the guard is in place before any stage imports torch,
+# which is what lets it cover a dependency that compiles during its own import.
+apply_torch_compile_policy()

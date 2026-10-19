@@ -6,6 +6,8 @@ model weights - the configuration layer must work on a bare machine.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from app.config import (
@@ -40,6 +42,7 @@ from app.config import (
     DEFAULT_VOICE_REFERENCE_TARGET_DURATION,
     TRANSLATION_PROVIDERS,
     Settings,
+    apply_torch_compile_policy,
     get_settings,
 )
 
@@ -201,6 +204,26 @@ def test_environment_variables_override_defaults(monkeypatch: pytest.MonkeyPatch
     assert settings.device == "cpu"
     assert settings.log_level == "DEBUG"
     assert settings.missing_credentials() == []
+
+
+def test_torch_compile_is_disabled_unless_opted_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inductor can abort when the pod's CUDA build predates the GPU."""
+
+    monkeypatch.delenv("ALLOW_TORCH_COMPILE", raising=False)
+    monkeypatch.delenv("TORCH_COMPILE_DISABLE", raising=False)
+
+    apply_torch_compile_policy()
+
+    assert os.environ["TORCH_COMPILE_DISABLE"] == "1"
+
+
+def test_torch_compile_can_be_opted_back_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TORCH_COMPILE_DISABLE", raising=False)
+    monkeypatch.setenv("ALLOW_TORCH_COMPILE", "1")
+
+    apply_torch_compile_policy()
+
+    assert "TORCH_COMPILE_DISABLE" not in os.environ
 
 
 def test_ensure_directories_creates_all_paths(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

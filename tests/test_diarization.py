@@ -613,6 +613,20 @@ def test_inference_failure_is_wrapped(monkeypatch, tmp_path):
     assert isinstance(excinfo.value.__cause__, RuntimeError)
 
 
+def test_a_cuda_architecture_compile_failure_explains_itself(monkeypatch, tmp_path):
+    """NVRTC rejecting the GPU arch is actionable, so say what to change."""
+
+    _patch(monkeypatch)
+    FakePipeline.infer_error = RuntimeError(
+        "nvrtc: error: invalid value for --gpu-architecture (-arch)"
+    )
+
+    with pytest.raises(DiarizationInferenceError, match="compute capability") as excinfo:
+        diarize(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert "ALLOW_TORCH_COMPILE" in str(excinfo.value)
+
+
 # ---------------------------------------------------------------------------
 # crosstalk from the overlap-aware view
 # ---------------------------------------------------------------------------

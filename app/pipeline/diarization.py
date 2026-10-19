@@ -313,6 +313,52 @@ def _validate_speaker_counts(
             )
 
 
+def _runtime_summary() -> str:
+    """Describe the compute stack, so a device or compiler failure is diagnosable.
+
+    Every lookup is defensive: this runs on an error path (and against the fakes
+    in the test suite), where raising would hide the failure it is meant to explain.
+    """
+
+    if torch is None:  # pragma: no cover - only without the AI runtime
+        return "torch is not installed"
+
+    parts: list[str] = []
+    try:
+        parts.append(f"torch {torch.__version__}")
+    except Exception:  # pragma: no cover - a stubbed runtime
+        parts.append("torch (version unknown)")
+    try:
+        cuda_build = torch.version.cuda
+        parts.append(f"built for CUDA {cuda_build or 'none (CPU build)'}")
+    except Exception:  # pragma: no cover - a stubbed runtime
+        pass
+    try:
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            parts.append(f"{torch.cuda.get_device_name(0)} (sm_{major}{minor})")
+    except Exception:  # pragma: no cover - diagnostics must never fail the stage
+        pass
+    try:
+        import pyannote.audio as pyannote_audio
+
+        parts.append(f"pyannote.audio {pyannote_audio.__version__}")
+    except Exception:  # pragma: no cover - version metadata may be absent
+        pass
+    return ", ".join(parts)
+
+
+#: NVRTC's own wording when it rejects the architecture Inductor asked for.
+_ARCH_MISMATCH_MARKERS = ("nvrtc", "gpu-architecture")
+
+
+def _is_compiler_arch_failure(exc: BaseException) -> bool:
+    """``True`` when a CUDA kernel could not be compiled for this GPU's arch."""
+
+    message = str(exc).lower()
+    return any(marker in message for marker in _ARCH_MISMATCH_MARKERS)
+
+
 def _load_pipeline(settings: Settings, token: str) -> Any:
     """Load the pyannote pipeline into memory on the configured device."""
 
@@ -350,6 +396,7 @@ def _load_pipeline(settings: Settings, token: str) -> Any:
             f"{settings.device!r}: {type(exc).__name__}: {exc}"
         ) from exc
 
+    _LOGGER.info("pyannote runtime: %s", _runtime_summary())
     return pipeline
 
 
@@ -374,8 +421,19 @@ def _apply_pipeline(
     try:
         return pipeline(str(audio_path), **kwargs)
     except Exception as exc:
+        hint = ""
+        if _is_compiler_arch_failure(exc):
+            hint = (
+                ". A CUDA kernel could not be compiled for this GPU's compute "
+                "capability (NVRTC). TorchInductor is disabled by default "
+                "(TORCH_COMPILE_DISABLE=1); if ALLOW_TORCH_COMPILE=1 or "
+                "TORCH_COMPILE_DISABLE=0 is set, remove it. If not, the pod's "
+                "PyTorch CUDA build is older than its GPU, so use the RunPod "
+                f"PyTorch image matched to it. Runtime: {_runtime_summary()}"
+            )
         raise DiarizationInferenceError(
-            f"pyannote diarization failed for {audio_path}: {type(exc).__name__}: {exc}"
+            f"pyannote diarization failed for {audio_path}: "
+            f"{type(exc).__name__}: {exc}{hint}"
         ) from exc
 
 
