@@ -109,6 +109,94 @@ def _require_cuda() -> Any:
     return torch
 
 
+def _configure_cuda_device(torch: Any, separator: Any, requested_device: str) -> Any:
+    """Force audio-separator and its BS-Roformer model onto the configured CUDA GPU."""
+
+    if requested_device != "cuda" and not requested_device.startswith("cuda:"):
+        raise SeparationInferenceError(
+            f"separation requires CUDA, but DEVICE is {requested_device!r}; "
+            "set DEVICE=cuda or DEVICE=cuda:N"
+        )
+
+    device = torch.device("cuda:0" if requested_device == "cuda" else requested_device)
+    if device.index is not None and device.index >= torch.cuda.device_count():
+        raise SeparationInferenceError(
+            f"configured CUDA device {device} does not exist "
+            f"({torch.cuda.device_count()} CUDA device(s) visible)"
+        )
+
+    torch.cuda.set_device(device)
+    # audio-separator detects CUDA automatically, but explicitly overwrite its
+    # selected device before load_model passes it to the architecture implementation.
+    separator.torch_device = device
+    separator.torch_device_cpu = torch.device("cpu")
+    return device
+
+
+def _verify_model_cuda(separator: Any) -> str:
+    """Verify the loaded BS-Roformer model—not only the wrapper—is set to CUDA."""
+
+    model_instance = getattr(separator, "model_instance", None)
+    if model_instance is None:
+        raise SeparationInferenceError(
+            "audio-separator reported success but loaded no model instance"
+        )
+
+    # ``model_run`` is the architecture's own PyTorch module, so its parameter
+    # device is the authoritative answer to "will inference use the GPU?".
+    parameter_device = None
+    model = getattr(model_instance, "model_run", None)
+    if model is not None:
+        try:
+            parameter_device = next(model.parameters()).device
+        except (AttributeError, StopIteration):
+            parameter_device = None
+
+    declared_device = getattr(model_instance, "torch_device", None)
+
+    if parameter_device is not None and getattr(parameter_device, "type", None) != "cuda":
+        raise SeparationInferenceError(
+            f"loaded BS-Roformer parameters are on {parameter_device}, not CUDA"
+        )
+    if declared_device is not None and getattr(declared_device, "type", None) != "cuda":
+        raise SeparationInferenceError(
+            f"loaded audio-separator model selected {declared_device}, not CUDA"
+        )
+    if parameter_device is None and declared_device is None:
+        raise SeparationInferenceError(
+            "could not confirm the loaded BS-Roformer model's CUDA placement"
+        )
+    if parameter_device is None:
+        logger.warning(
+            "Verified CUDA from audio-separator's declared device (%s); this "
+            "version does not expose the model parameters for a stricter check",
+            declared_device,
+        )
+    return str(parameter_device or declared_device)
+
+
+def _resolve_separator_output(
+    item: str | Path,
+    destination: Path,
+    expected_name: str,
+) -> Path:
+    """Resolve a returned file path, accounting for relative paths from the wrapper."""
+
+    returned = Path(item).expanduser()
+    candidates = (
+        [returned] if returned.is_absolute() else [returned, destination / returned]
+    )
+    candidates.append(destination / expected_name)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    searched = ", ".join(str(candidate) for candidate in candidates)
+    raise InvalidAudioError(
+        f"audio-separator returned {str(item)!r}, but no output file exists at "
+        f"the returned or expected paths: {searched}"
+    )
+
+
 def _write_silence(path: Path, info: Any) -> None:
     """Create the effects stem without allocating a full-duration audio array."""
 
@@ -169,30 +257,26 @@ def _run_audio_separator(
             # file chunker rejoins chunks with simple concatenation.
             chunk_duration=None,
         )
-        device = str(getattr(separator, "torch_device", ""))
-        if not device.lower().startswith("cuda"):
-            raise SeparationInferenceError(
-                f"audio-separator selected {device or 'an unknown device'} instead of CUDA"
-            )
+        device = _configure_cuda_device(torch, separator, settings.device)
+        device_name = torch.cuda.get_device_name(device)
+        logger.info(
+            "Separation runtime: torch CUDA device %s (%s), CUDA runtime %s",
+            device,
+            device_name,
+            torch.version.cuda,
+        )
 
-        if on_progress is not None:
-            on_progress(f"  separation loading model {MODEL_FILENAME}")
-        separator.load_model(model_filename=MODEL_FILENAME)
         if on_progress is not None:
             on_progress(
-                "  separation inference started (CUDA, model-managed overlap-add)"
+                f"  separation loading model {MODEL_FILENAME} on "
+                f"{device} ({device_name})"
             )
-
-        model_device = str(
-            getattr(
-                getattr(separator, "model_instance", None),
-                "torch_device",
-                device,
-            )
-        )
-        if not model_device.lower().startswith("cuda"):
-            raise SeparationInferenceError(
-                f"loaded separator model selected {model_device} instead of CUDA"
+        separator.load_model(model_filename=MODEL_FILENAME)
+        loaded_device = _verify_model_cuda(separator)
+        if on_progress is not None:
+            on_progress(
+                f"  separation inference started on {loaded_device} "
+                "(BS-Roformer model-managed overlap-add)"
             )
 
         generated = separator.separate(
@@ -210,14 +294,21 @@ def _run_audio_separator(
         speech: Path | None = None
         music: Path | None = None
         for item in generated:
-            output = Path(item)
-            label = output.stem.casefold()
+            returned = Path(item)
+            label = returned.stem.casefold()
             if "speech" in label or "vocal" in label:
+                output = _resolve_separator_output(
+                    item, destination, f"{source.stem}_speech.wav"
+                )
                 speech = output
             elif "music" in label or "instrumental" in label:
+                output = _resolve_separator_output(
+                    item, destination, f"{source.stem}_music.wav"
+                )
                 music = output
 
         if speech is None or music is None:
+            returned_paths = ", ".join(str(path) for path in generated) or "<none>"
             missing = [
                 name
                 for name, output in (
@@ -227,11 +318,15 @@ def _run_audio_separator(
                 if output is None
             ]
             raise MissingStemError(
-                "audio-separator output is missing expected stem(s): " + ", ".join(missing)
+                "audio-separator output is missing expected stem(s): "
+                + ", ".join(missing)
+                + f"; returned paths: {returned_paths}"
             )
         for name, output in (("speech/vocals", speech), ("music/instrumental", music)):
-            if not output.is_file() or output.stat().st_size == 0:
-                raise InvalidAudioError(f"audio-separator produced no usable {name} file")
+            if output.stat().st_size == 0:
+                raise InvalidAudioError(
+                    f"audio-separator produced a zero-byte {name} file: {output}"
+                )
             try:
                 output_info = sf.info(str(output))
             except (OSError, RuntimeError) as exc:

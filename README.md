@@ -598,13 +598,15 @@ configuration does not use is reported `[SKIP]` rather than `[FAIL]`. On RunPod,
 or `cuda:N`; without it, CUDA absence remains a non-blocking result for local
 development checks.
 
-The separation stage explicitly requires CUDA and verifies that audio-separator
-selected a CUDA device before loading its BS-Roformer checkpoint. BS-Roformer
-uses the model's native overlapping segment inference; the wrapper's optional
-file-level chunker is disabled because it rejoins chunks with simple concatenation.
-Vocals feed diarization and the instrumental output feeds the existing music bed.
-A silent effects stem keeps the downstream three-path interface without duplicating
-the instrumental.
+The separation stage explicitly requires CUDA: it rejects a non-CUDA `DEVICE`,
+forces audio-separator onto the configured GPU before loading its BS-Roformer
+checkpoint, and then verifies the loaded model's own parameters are on CUDA before
+any audio is processed. A CPU fallback therefore fails immediately instead of
+silently billing GPU-pod time for CPU inference. BS-Roformer uses the model's native
+overlapping segment inference; the wrapper's optional file-level chunker is disabled
+because it rejoins chunks with simple concatenation. Vocals feed diarization and the
+instrumental output feeds the existing music bed. A silent effects stem keeps the
+downstream three-path interface without duplicating the instrumental.
 Other local model stages use the configured device: pyannote diarization,
 faster-whisper transcription, OmniVoice synthesis, and local NLLB translation.
 GPU-oriented defaults include faster-whisper `large-v3` in FP16 and OmniVoice in FP16.

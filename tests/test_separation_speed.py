@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import dataclasses
 import gc
 import sys
 import types
@@ -17,6 +18,7 @@ import soundfile as sf
 from app.config import Settings
 from app.pipeline import separation
 from app.pipeline.separation import (
+    InvalidAudioError,
     MissingStemError,
     REQUIRED_SAMPLE_RATE,
     SeparationInferenceError,
@@ -30,6 +32,7 @@ class FakeCuda:
     def __init__(self, available: bool = True) -> None:
         self.available = available
         self.empty_cache_calls = 0
+        self.selected_device: Any | None = None
 
     def is_available(self) -> bool:
         return self.available
@@ -37,26 +40,72 @@ class FakeCuda:
     def empty_cache(self) -> None:
         self.empty_cache_calls += 1
 
+    def set_device(self, device: Any) -> None:
+        self.selected_device = device
+
+    def device_count(self) -> int:
+        return 1
+
+    def get_device_name(self, device: Any) -> str:
+        return "Fake A40"
+
+
+class FakeDevice:
+    def __init__(self, name: str) -> None:
+        self.type = name.split(":")[0]
+        self.index = int(name.split(":")[1]) if ":" in name else None
+
+    def __str__(self) -> str:
+        return f"{self.type}:{self.index}" if self.index is not None else self.type
+
+
+class FakeParameter:
+    def __init__(self, device: FakeDevice) -> None:
+        self.device = device
+
+
+class FakeModel:
+    def __init__(self, device: FakeDevice) -> None:
+        self.device = device
+
+    def parameters(self):
+        yield FakeParameter(self.device)
+
+
+class FakeModelInstance:
+    device = "cuda:0"
+
+    def __init__(self, device: Any) -> None:
+        self.torch_device = device
+        self.model_run = FakeModel(device)
+
 
 class FakeTorch:
     def __init__(self, cuda: FakeCuda) -> None:
         self.cuda = cuda
+        self.version = types.SimpleNamespace(cuda="12.8")
+
+    @staticmethod
+    def device(name: str) -> FakeDevice:
+        return FakeDevice(name)
 
 
 class FakeSeparator:
     instances: list["FakeSeparator"] = []
-    device = "cuda:0"
+    model_device = "cuda:0"
     output_stems = ("Vocals", "Instrumental")
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
-        self.torch_device = self.device
+        self.torch_device = FakeDevice("cpu")
+        self.model_instance: FakeModelInstance | None = None
         self.loaded_model: str | None = None
         self.separate_call: tuple[str, dict[str, str]] | None = None
         FakeSeparator.instances.append(self)
 
     def load_model(self, *, model_filename: str) -> None:
         self.loaded_model = model_filename
+        self.model_instance = FakeModelInstance(FakeDevice(self.model_device))
 
     def separate(
         self, audio_path: str, *, custom_output_names: dict[str, str]
@@ -71,7 +120,8 @@ class FakeSeparator:
                 np.ones((REQUIRED_SAMPLE_RATE, 2), dtype=np.float32) * 0.1,
                 REQUIRED_SAMPLE_RATE,
             )
-            output_paths.append(str(path))
+            # audio-separator returns its bare filename although it writes into output_dir.
+            output_paths.append(path.name)
         return output_paths
 
 
@@ -80,7 +130,7 @@ def fake_separator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[FakeCuda, Path]:
     FakeSeparator.instances = []
-    FakeSeparator.device = "cuda:0"
+    FakeSeparator.model_device = "cuda:0"
     FakeSeparator.output_stems = ("Vocals", "Instrumental")
     cuda = FakeCuda()
     monkeypatch.setattr(separation, "_require_cuda", lambda: FakeTorch(cuda))
@@ -99,7 +149,7 @@ def _settings(root: Path) -> Settings:
         work_dir=root / "work",
         output_dir=root / "out",
         model_cache_dir=root / "models",
-        device="cpu",
+        device="cuda",
     )
 
 
@@ -142,6 +192,7 @@ def test_two_stems_map_to_existing_contract_and_effects_are_silent(
     assert separator.loaded_model == separation.MODEL_FILENAME
     assert separator.kwargs["chunk_duration"] is None
     assert separator.kwargs["output_format"] == "WAV"
+    assert str(cuda.selected_device) == "cuda:0"
     assert separator.separate_call is not None
     assert separator.separate_call[0] == str(source)
     assert separator.separate_call[1] == {
@@ -160,13 +211,63 @@ def test_cuda_is_mandatory_and_device_fallback_is_rejected(
     fake_separator: tuple[FakeCuda, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, root = fake_separator
-    FakeSeparator.device = "cpu"
+    FakeSeparator.model_device = "cpu"
 
-    with pytest.raises(SeparationInferenceError, match="instead of CUDA"):
+    with pytest.raises(SeparationInferenceError, match="parameters are on cpu, not CUDA"):
         separate_stems(
             _write_audio(root / "clip.wav"),
             root / "out",
             settings=_settings(root),
+        )
+
+
+def test_cpu_device_setting_is_rejected(
+    fake_separator: tuple[FakeCuda, Path],
+) -> None:
+    _, root = fake_separator
+    settings = dataclasses.replace(_settings(root), device="cpu")
+
+    with pytest.raises(SeparationInferenceError, match="requires CUDA"):
+        separate_stems(
+            _write_audio(root / "clip.wav"),
+            root / "out",
+            settings=settings,
+        )
+
+
+def test_unresolvable_returned_paths_report_where_it_looked(
+    fake_separator: tuple[FakeCuda, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wrapper writes into output_dir but returns bare filenames."""
+
+    _, root = fake_separator
+
+    def separate_without_writing(
+        self: FakeSeparator, audio_path: str, *, custom_output_names: dict[str, str]
+    ) -> list[str]:
+        return [f"{name}.wav" for name in custom_output_names.values()]
+
+    monkeypatch.setattr(FakeSeparator, "separate", separate_without_writing)
+
+    with pytest.raises(InvalidAudioError, match="returned or expected paths"):
+        separate_stems(
+            _write_audio(root / "clip.wav"),
+            root / "out",
+            settings=_settings(root),
+        )
+
+
+def test_a_gpu_index_the_pod_does_not_have_is_rejected(
+    fake_separator: tuple[FakeCuda, Path],
+) -> None:
+    _, root = fake_separator
+    settings = dataclasses.replace(_settings(root), device="cuda:3")
+
+    with pytest.raises(SeparationInferenceError, match="does not exist"):
+        separate_stems(
+            _write_audio(root / "clip.wav"),
+            root / "out",
+            settings=settings,
         )
 
 

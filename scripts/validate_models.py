@@ -119,7 +119,9 @@ def load_separation() -> None:
     try:
         from audio_separator.separator import Separator
     except ImportError as exc:
-        raise RuntimeError("audio-separator is not installed") from exc
+        raise RuntimeError(
+            f"could not import audio-separator or one of its dependencies ({exc})"
+        ) from exc
 
     cache_dir = settings.model_cache_dir / "audio-separator"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -132,15 +134,17 @@ def load_separation() -> None:
         chunk_duration=None,
     )
     try:
-        device = str(getattr(separator, "torch_device", ""))
-        if not device.lower().startswith("cuda"):
-            raise RuntimeError(
-                f"audio-separator selected {device or 'an unknown device'} instead of CUDA"
-            )
+        device = separation._configure_cuda_device(  # noqa: SLF001
+            torch, separator, settings.device
+        )
         _report("model", separation.MODEL_FILENAME)
-        _report("device", device)
+        _report("GPU", torch.cuda.get_device_name(device))
         _report("native chunking", "BS-Roformer overlap-add")
         separator.load_model(model_filename=separation.MODEL_FILENAME)
+        _report(
+            "model inference device",
+            separation._verify_model_cuda(separator),  # noqa: SLF001
+        )
     finally:
         del separator
         gc.collect()
