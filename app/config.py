@@ -108,12 +108,15 @@ DEFAULT_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
 #: dimension and the model reads each as its own sequence - so batching them is the same
 #: arithmetic with more of the card in use.
 #:
-#: 8 is the measured ceiling on the 48 GB A40 this project targets, not a guess: 32 and
-#: 16 both ran out of memory there, and 8 completed. The peak is dominated by the
-#: per-chunk band features rather than by the weights, so a bigger card can take more -
-#: and raising this is safe, because an out-of-memory pass halves the batch and retries
-#: rather than failing the run.
-DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE = 8
+#: Start with a large batch on the 48 GB A40 target; on out-of-memory, inference
+#: halves the batch and retries rather than failing the run. A previous measurement
+#: completed at 8 while 16 and 32 ran out of memory, so confirm the settled size in
+#: RunPod logs and override this value if the A40 cannot sustain 64.
+DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE = 64
+
+# A 6-second BandIt hop leaves 2 seconds of overlap between its 8-second windows,
+# reducing redundant chunk computation. The upstream default is a 1-second hop.
+DEFAULT_SEPARATION_HOP_SECONDS = 6.0
 
 #: Optional bounds on the number of speakers diarization may report, or ``None``
 #: to let the model decide. Supplying them is the strongest single guard against
@@ -752,6 +755,8 @@ class Settings:
     diarization_max_speakers: Optional[int] = DEFAULT_DIARIZATION_MAX_SPEAKERS
     #: BandIt chunks pushed through the model per forward pass.
     separation_inference_batch_size: int = DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE
+    #: BandIt chunk advance in seconds; smaller values use more overlap and compute.
+    separation_hop_seconds: float = DEFAULT_SEPARATION_HOP_SECONDS
     #: faster-whisper model and CTranslate2 compute type for transcription.
     transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL
     transcription_compute_type: str = DEFAULT_TRANSCRIPTION_COMPUTE_TYPE
@@ -862,6 +867,9 @@ class Settings:
             separation_inference_batch_size=_read_int(
                 "SEPARATION_INFERENCE_BATCH_SIZE",
                 DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE,
+            ),
+            separation_hop_seconds=_read_float(
+                "SEPARATION_HOP_SECONDS", DEFAULT_SEPARATION_HOP_SECONDS
             ),
             transcription_model=(
                 _read_env("TRANSCRIPTION_MODEL", DEFAULT_TRANSCRIPTION_MODEL)
@@ -1113,6 +1121,7 @@ class Settings:
             "diarization_min_speakers": self.diarization_min_speakers,
             "diarization_max_speakers": self.diarization_max_speakers,
             "separation_inference_batch_size": self.separation_inference_batch_size,
+            "separation_hop_seconds": self.separation_hop_seconds,
             "transcription_model": self.transcription_model,
             "transcription_compute_type": self.transcription_compute_type,
             "qc_pronunciation": self.qc_pronunciation,
@@ -1185,6 +1194,7 @@ __all__ = [
     "DEFAULT_DIARIZATION_MIN_SPEAKERS",
     "DEFAULT_DIARIZATION_MODEL",
     "DEFAULT_SEPARATION_INFERENCE_BATCH_SIZE",
+    "DEFAULT_SEPARATION_HOP_SECONDS",
     "DEFAULT_MIX_DIALOGUE_GAIN_DB",
     "DEFAULT_MIX_DUCK_DB",
     "DEFAULT_MMS_SAMPLE_RATE",

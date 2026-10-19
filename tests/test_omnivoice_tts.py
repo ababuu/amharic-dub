@@ -235,6 +235,21 @@ def test_amharic_is_named_the_way_omnivoice_spells_it(
     assert call["language"] == tts.OMNIVOICE_AMHARIC == "Amharic"
 
 
+def test_generation_is_told_not_to_repeat_reference_dialogue(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch(monkeypatch)
+
+    _engine().synthesize(
+        text="ሰላም", voice_reference=_reference(tmp_path), destination=tmp_path / "o.wav"
+    )
+
+    call = FakeOmniVoice.instances[0].calls[0]
+    assert call["instruct"] == tts.OMNIVOICE_CLONE_INSTRUCTION
+    assert "provided Amharic text" in call["instruct"]
+    assert "Do not repeat" in call["instruct"]
+
+
 def test_position_sampling_uses_omnivoice_default_but_tokens_remain_greedy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -31,6 +31,7 @@ import os
 import time
 import warnings
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,7 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 
-from app.config import Settings, get_settings
+from app.config import DEFAULT_SEPARATION_HOP_SECONDS, Settings, get_settings
 
 try:  # ``bandit_infer`` pulls in torch/CUDA; it is a runtime-only dependency.
     from bandit_infer import BanditSession
@@ -60,10 +61,10 @@ STEM_NAMES: tuple[str, ...] = ("speech", "music", "effects")
 WEIGHTS_DIR_ENV_VAR = "BANDIT_INFER_WEIGHTS"
 
 #: Chunk geometry of BandIt's v2 inference handler, which decides both the cost and the
-#: peak memory of a run: the handler slides an 8-second window with a 1-second hop and
-#: cross-fades the outputs, so every second of audio costs eight forward passes.
+#: peak memory of a run: the handler slides an 8-second window and cross-fades outputs.
 BANDIT_CHUNK_SECONDS = 8.0
-BANDIT_HOP_SECONDS = 1.0
+BANDIT_UPSTREAM_HOP_SECONDS = 1.0
+BANDIT_HOP_SECONDS = DEFAULT_SEPARATION_HOP_SECONDS
 
 #: Ceiling on the ``(channels, chunks, chunk_samples)`` tensor BandIt's handler builds
 #: from its whole input and holds for the entire call. It grows linearly with duration, so
@@ -74,8 +75,10 @@ MAX_CHUNK_TENSOR_BYTES = 1 << 30
 #: How much neighbouring segments overlap when the input has to be split. The handler
 #: front-pads its own input by ``2 * (chunk - hop)`` so its output is already correct at
 #: the edges of a call, which is what makes a cross-fade in the overlap safe; this is that
-#: margin plus one chunk.
-BANDIT_STITCH_SECONDS = 2 * (BANDIT_CHUNK_SECONDS - BANDIT_HOP_SECONDS) + BANDIT_CHUNK_SECONDS
+#: margin plus one chunk, using the configured default hop.
+BANDIT_STITCH_SECONDS = (
+    2 * (BANDIT_CHUNK_SECONDS - BANDIT_HOP_SECONDS) + BANDIT_CHUNK_SECONDS
+)
 
 
 class SeparationError(RuntimeError):
@@ -164,26 +167,73 @@ def _validate_sample_rate(sample_rate: int) -> None:
         )
 
 
-def _configure_chunking(session: Any, batch_size: int) -> None:
-    """Ask BandIt's chunk handler to run several chunks per forward pass.
+def _configure_chunking(
+    session: Any, batch_size: int, hop_seconds: float
+) -> float:
+    """Configure chunk batching and overlap; return the hop actually in use.
 
     The handler defaults to one chunk per forward, which leaves a large GPU mostly
     idle: its chunks are independent - it flattens them into the batch dimension and the
     model reads each as its own sequence - so batching them is the same arithmetic with
     more of the card in use.
 
-    This reaches into the package, so every step is guarded. If a future release renames
-    the handler or the field, the run continues at the library's own default rather than
-    failing: a slow separation is much better than no separation.
+    BandIt's 8-second windows use an upstream 1-second hop. A 2-second hop still
+    leaves 6 seconds of overlap while roughly halving the number of independent
+    forwards. The handler internals are private, so only apply the hop when all
+    required state is present; otherwise retain and return the library's current
+    hop so memory sizing and stitching remain correct.
     """
 
     handler = getattr(getattr(session, "_runtime", None), "handler", None)
-    if handler is None or not hasattr(handler, "inference_batch_size"):
-        return
-    handler.inference_batch_size = max(1, int(batch_size))
+    if handler is None:
+        return BANDIT_UPSTREAM_HOP_SECONDS
+
+    if hasattr(handler, "inference_batch_size"):
+        handler.inference_batch_size = max(1, int(batch_size))
+
+    chunk_samples = getattr(handler, "chunk_size_samples", None)
+    previous_hop_samples = getattr(handler, "hop_size_samples", None)
+    scaled_window = getattr(handler, "scaled_window", None)
+    if (
+        not isinstance(chunk_samples, int)
+        or not isinstance(previous_hop_samples, int)
+        or previous_hop_samples <= 0
+        or scaled_window is None
+    ):
+        if isinstance(previous_hop_samples, int) and previous_hop_samples > 0:
+            return previous_hop_samples / REQUIRED_SAMPLE_RATE
+        return BANDIT_UPSTREAM_HOP_SECONDS
+
+    if not math.isfinite(hop_seconds) or hop_seconds <= 0:
+        raise ValueError(f"SEPARATION_HOP_SECONDS must be positive, got {hop_seconds!r}")
+
+    requested_hop_samples = int(round(hop_seconds * REQUIRED_SAMPLE_RATE))
+    if requested_hop_samples > chunk_samples:
+        raise ValueError(
+            f"SEPARATION_HOP_SECONDS ({hop_seconds}) must not exceed the "
+            f"{BANDIT_CHUNK_SECONDS}-second chunk size"
+        )
+    if requested_hop_samples == previous_hop_samples:
+        return requested_hop_samples / REQUIRED_SAMPLE_RATE
+
+    previous_scaler = chunk_samples / (2 * previous_hop_samples)
+    requested_scaler = chunk_samples / (2 * requested_hop_samples)
+    try:
+        updated_window = scaled_window * (previous_scaler / requested_scaler)
+    except (TypeError, RuntimeError):
+        return previous_hop_samples / REQUIRED_SAMPLE_RATE
+
+    handler.hop_size_samples = requested_hop_samples
+    handler.overlap_samples = chunk_samples - requested_hop_samples
+    handler.scaler = requested_scaler
+    handler.front_pad_samples = 2 * handler.overlap_samples
+    handler.scaled_window = updated_window
+    return requested_hop_samples / REQUIRED_SAMPLE_RATE
 
 
-def _max_segment_seconds(channels: int, sample_rate: int) -> float:
+def _max_segment_seconds(
+    channels: int, sample_rate: int, hop_seconds: float
+) -> float:
     """Return the longest input, in seconds, whose chunk tensor stays within budget.
 
     The bound has to be on the *unfolded* tensor rather than on the audio, because that
@@ -196,7 +246,7 @@ def _max_segment_seconds(channels: int, sample_rate: int) -> float:
         channels
         * chunk_samples
         * np.dtype(np.float32).itemsize
-        / BANDIT_HOP_SECONDS
+        / hop_seconds
     )
     return MAX_CHUNK_TENSOR_BYTES / bytes_per_second
 
@@ -206,6 +256,7 @@ def _infer_segmented(
     audio: np.ndarray,
     sample_rate: int,
     *,
+    hop_seconds: float,
     on_progress: Callable[[str], None] | None = None,
 ) -> dict[str, np.ndarray]:
     """Separate ``audio``, splitting it only when one call would not fit in memory.
@@ -217,7 +268,7 @@ def _infer_segmented(
     """
 
     channels, samples = audio.shape
-    longest = _max_segment_seconds(channels, sample_rate)
+    longest = _max_segment_seconds(channels, sample_rate, hop_seconds)
     if samples / sample_rate <= longest:
         started = time.perf_counter()
         if on_progress is not None:
@@ -225,7 +276,10 @@ def _infer_segmented(
                 f"  separation inference segment 1/1 started "
                 f"({samples / sample_rate:.1f}s of audio)"
             )
-        stems = _collect_stems(session.infer(audio, sample_rate=sample_rate))
+        raw_stems = session.infer(audio, sample_rate=sample_rate)
+        stems = _collect_stems(raw_stems)
+        del raw_stems
+        _release_cuda_cache()
         if on_progress is not None:
             on_progress(
                 f"  separation inference segment 1/1 completed in "
@@ -234,7 +288,10 @@ def _infer_segmented(
         return stems
 
     segment = int(round(longest * sample_rate))
-    overlap = min(int(round(BANDIT_STITCH_SECONDS * sample_rate)), segment // 2)
+    stitch_seconds = (
+        2 * (BANDIT_CHUNK_SECONDS - hop_seconds) + BANDIT_CHUNK_SECONDS
+    )
+    overlap = min(int(round(stitch_seconds * sample_rate)), segment // 2)
     step = segment - overlap
     if step <= 0:  # pragma: no cover - only if the budget is set absurdly low
         raise SeparationInferenceError(
@@ -254,9 +311,11 @@ def _infer_segmented(
                 f"  separation inference segment {segment_number}/{segment_count} "
                 f"started ({(stop - start) / sample_rate:.1f}s of audio)"
             )
-        stems = _collect_stems(
-            session.infer(audio[:, start:stop], sample_rate=sample_rate)
-        )
+        segment_audio = audio[:, start:stop]
+        raw_stems = session.infer(segment_audio, sample_rate=sample_rate)
+        stems = _collect_stems(raw_stems)
+        del raw_stems, segment_audio
+        _release_cuda_cache()
         if on_progress is not None:
             on_progress(
                 f"  separation inference segment {segment_number}/{segment_count} "
@@ -276,6 +335,7 @@ def _infer_segmented(
         for name in STEM_NAMES:
             blended[name][:, start:stop] += stems[name] * ramp
         weight[start:stop] += ramp
+        del stems
 
     # Every sample is covered by at least one segment, so this cannot divide by zero;
     # the guard is here because a silent failure would be a loud artefact.
@@ -311,11 +371,22 @@ def _release_cuda_cache() -> None:
         pass
 
 
+def _inference_context() -> AbstractContextManager[None]:
+    """Disable gradient tracking during inference when PyTorch is available."""
+
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - supports importable lightweight tests
+        return nullcontext()
+    return torch.no_grad()
+
+
 def _infer_adaptively(
     session: Any,
     audio: np.ndarray,
     sample_rate: int,
     batch_size: int,
+    hop_seconds: float,
     *,
     on_progress: Callable[[str], None] | None = None,
 ) -> dict[str, np.ndarray]:
@@ -336,17 +407,22 @@ def _infer_adaptively(
     asked = current
 
     while True:
-        _configure_chunking(session, current)
+        actual_hop_seconds = _configure_chunking(session, current, hop_seconds)
         attempt_started = time.perf_counter()
         if on_progress is not None:
             on_progress(
                 f"  separation inference started "
-                f"(batch size {current} chunks per forward pass)"
+                f"(batch size {current}, hop {actual_hop_seconds:g}s)"
             )
         try:
-            stems = _infer_segmented(
-                session, audio, sample_rate, on_progress=on_progress
-            )
+            with _inference_context():
+                stems = _infer_segmented(
+                    session,
+                    audio,
+                    sample_rate,
+                    hop_seconds=actual_hop_seconds,
+                    on_progress=on_progress,
+                )
         except Exception as exc:
             if current == 1 or not _is_out_of_memory(exc):
                 raise
@@ -416,6 +492,7 @@ def _run_bandit(
             audio,
             REQUIRED_SAMPLE_RATE,
             settings.separation_inference_batch_size,
+            settings.separation_hop_seconds,
             on_progress=on_progress,
         )
     except SeparationError:
@@ -489,6 +566,15 @@ def separate_stems(
     """
 
     settings = settings if settings is not None else get_settings()
+    if (
+        not math.isfinite(settings.separation_hop_seconds)
+        or settings.separation_hop_seconds <= 0
+        or settings.separation_hop_seconds > BANDIT_CHUNK_SECONDS
+    ):
+        raise SeparationInferenceError(
+            f"SEPARATION_HOP_SECONDS must be > 0 and <= "
+            f"{BANDIT_CHUNK_SECONDS}, got {settings.separation_hop_seconds!r}"
+        )
     source = Path(input_path)
 
     read_started = time.perf_counter()

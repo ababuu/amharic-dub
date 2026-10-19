@@ -27,6 +27,7 @@ from app.pipeline.separation import (
     MAX_CHUNK_TENSOR_BYTES,
     MissingStemError,
     REQUIRED_SAMPLE_RATE,
+    SeparationInferenceError,
     StemPaths,
     separate_stems,
 )
@@ -37,6 +38,14 @@ class FakeHandler:
 
     def __init__(self) -> None:
         self.inference_batch_size = 1
+        self.chunk_size_samples = int(separation.BANDIT_CHUNK_SECONDS * REQUIRED_SAMPLE_RATE)
+        self.hop_size_samples = int(
+            separation.BANDIT_UPSTREAM_HOP_SECONDS * REQUIRED_SAMPLE_RATE
+        )
+        self.overlap_samples = self.chunk_size_samples - self.hop_size_samples
+        self.scaler = self.chunk_size_samples / (2 * self.hop_size_samples)
+        self.front_pad_samples = 2 * self.overlap_samples
+        self.scaled_window = 1.0 / self.scaler
 
 
 class FakeRuntime:
@@ -122,6 +131,30 @@ def test_several_chunks_are_pushed_per_forward_pass(tmp_path: Path) -> None:
 
     (session,) = FakeSession.instances
     assert session._runtime.handler.inference_batch_size == 8
+    assert session._runtime.handler.hop_size_samples == int(
+        separation.BANDIT_HOP_SECONDS * REQUIRED_SAMPLE_RATE
+    )
+    assert session._runtime.handler.overlap_samples == int(
+        (separation.BANDIT_CHUNK_SECONDS - separation.BANDIT_HOP_SECONDS)
+        * REQUIRED_SAMPLE_RATE
+    )
+
+
+def test_default_hop_reduces_chunk_count_and_rescales_the_overlap_window() -> None:
+    handler = FakeHandler()
+    session = type("Session", (), {"_runtime": FakeRuntime()})()
+    session._runtime.handler = handler
+    original_window = handler.scaled_window
+
+    actual_hop = separation._configure_chunking(
+        session, 8, separation.BANDIT_HOP_SECONDS
+    )
+
+    assert actual_hop == separation.BANDIT_HOP_SECONDS
+    assert handler.inference_batch_size == 8
+    assert handler.scaled_window == pytest.approx(original_window * 6.0)
+    assert handler.scaler == pytest.approx(2.0 / 3.0)
+    assert handler.front_pad_samples == 2 * handler.overlap_samples
 
 
 def test_separation_reports_io_loading_and_inference_progress(tmp_path: Path) -> None:
@@ -155,6 +188,27 @@ def test_a_batch_size_below_one_is_clamped(tmp_path: Path) -> None:
 
     (session,) = FakeSession.instances
     assert session._runtime.handler.inference_batch_size == 1
+
+
+def test_default_hop_uses_one_sixth_as_many_chunks_as_upstream() -> None:
+    upstream = separation._max_segment_seconds(
+        2, REQUIRED_SAMPLE_RATE, separation.BANDIT_UPSTREAM_HOP_SECONDS
+    )
+    configured = separation._max_segment_seconds(
+        2, REQUIRED_SAMPLE_RATE, separation.BANDIT_HOP_SECONDS
+    )
+
+    assert separation.BANDIT_HOP_SECONDS == 6.0
+    assert configured == pytest.approx(upstream * 6.0)
+
+
+def test_invalid_hop_is_rejected_before_reading_audio(tmp_path: Path) -> None:
+    with pytest.raises(SeparationInferenceError, match="SEPARATION_HOP_SECONDS"):
+        separate_stems(
+            tmp_path / "missing.wav",
+            tmp_path / "out",
+            settings=_settings(tmp_path, separation_hop_seconds=9.0),
+        )
 
 
 def test_a_session_without_that_handler_still_runs(tmp_path: Path) -> None:
@@ -193,8 +247,12 @@ def test_a_session_without_that_handler_still_runs(tmp_path: Path) -> None:
 def test_the_budget_shrinks_as_channels_grow() -> None:
     """The tensor the handler holds is proportional to channels * chunks * samples."""
 
-    mono = separation._max_segment_seconds(1, REQUIRED_SAMPLE_RATE)
-    stereo = separation._max_segment_seconds(2, REQUIRED_SAMPLE_RATE)
+    mono = separation._max_segment_seconds(
+        1, REQUIRED_SAMPLE_RATE, separation.BANDIT_HOP_SECONDS
+    )
+    stereo = separation._max_segment_seconds(
+        2, REQUIRED_SAMPLE_RATE, separation.BANDIT_HOP_SECONDS
+    )
 
     assert stereo == pytest.approx(mono / 2)
 
@@ -203,7 +261,9 @@ def test_the_budget_matches_the_tensor_it_bounds() -> None:
     """The number is only meaningful if it really keeps that tensor inside the ceiling."""
 
     channels = 2
-    seconds = separation._max_segment_seconds(channels, REQUIRED_SAMPLE_RATE)
+    seconds = separation._max_segment_seconds(
+        channels, REQUIRED_SAMPLE_RATE, separation.BANDIT_HOP_SECONDS
+    )
 
     chunks = seconds / separation.BANDIT_HOP_SECONDS
     tensor_bytes = (

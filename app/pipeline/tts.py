@@ -936,6 +936,14 @@ OMNIVOICE_ENGINE_NAME = "omnivoice"
 #: The Amharic-tuned checkpoint's documented API takes the language name.
 OMNIVOICE_AMHARIC = "Amharic"
 
+# The reference is an English movie recording while the generated content is
+# Amharic. Make the content boundary explicit so the cloned voice is used for
+# identity only, not as dialogue to continue or quote.
+OMNIVOICE_CLONE_INSTRUCTION = (
+    "Speak only the provided Amharic text. Do not repeat, quote, or continue "
+    "any words from the voice-reference recording."
+)
+
 #: The rate OmniVoice generates at.
 OMNIVOICE_SAMPLE_RATE = 24_000
 
@@ -1204,6 +1212,7 @@ class OmniVoiceEngine(VoiceCloningEngine):
             "text": text,
             "language": OMNIVOICE_AMHARIC,
             "voice_clone_prompt": prompt,
+            "instruct": OMNIVOICE_CLONE_INSTRUCTION,
             "generation_config": config,
         }
         if rate is not None:

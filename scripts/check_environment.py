@@ -137,39 +137,48 @@ def check_python() -> bool:
     return supported
 
 
-def check_torch() -> bool:
+def check_torch(*, require_cuda: bool = False) -> bool:
     """Report PyTorch/CUDA status.
 
     PyTorch is optional at this stage of the project, so a missing installation
-    is reported and treated as non-blocking. Returns ``False`` only for real
-    failures.
+    is reported and treated as non-blocking unless ``require_cuda`` is set.
     """
 
     try:
         import torch
     except ImportError:
-        print("PyTorch version: not installed  [SKIP] (required once AI stages are added)")
-        return True
+        status = "FAIL" if require_cuda else "SKIP"
+        print(f"PyTorch version: not installed  [{status}]")
+        return not require_cuda
 
     print(f"PyTorch version: {torch.__version__}")
 
     try:
         cuda_available = torch.cuda.is_available()
     except Exception as exc:  # pragma: no cover - depends on broken CUDA installs
-        print(f"CUDA available: unknown  [WARN] ({exc})")
-        return True
+        status = "FAIL" if require_cuda else "WARN"
+        print(f"CUDA available: unknown  [{status}] ({exc})")
+        return not require_cuda
 
     print(f"CUDA available: {cuda_available}")
     if not cuda_available:
         print("GPU name: n/a")
         print("Available VRAM: n/a")
-        return True
+        if require_cuda:
+            print("CUDA is required for this RunPod pre-flight  [FAIL]")
+        return not require_cuda
 
     try:
         device_count = torch.cuda.device_count()
     except Exception as exc:  # pragma: no cover
-        print(f"CUDA devices: unknown  [WARN] ({exc})")
-        return True
+        status = "FAIL" if require_cuda else "WARN"
+        print(f"CUDA devices: unknown  [{status}] ({exc})")
+        return not require_cuda
+
+    if device_count < 1:
+        status = "FAIL" if require_cuda else "WARN"
+        print(f"CUDA devices: {device_count}  [{status}]")
+        return not require_cuda
 
     for index in range(device_count):
         try:
@@ -201,6 +210,23 @@ def check_torch() -> bool:
             print("Available VRAM: unknown")
 
     return True
+
+
+def check_configured_device(*, require_cuda: bool = False) -> bool:
+    """Ensure a GPU pre-flight will not knowingly run model stages on the CPU."""
+
+    if not require_cuda:
+        return True
+
+    from app.config import get_settings
+
+    device = get_settings().device
+    configured_for_cuda = device == "cuda" or device.startswith("cuda:")
+    status = "OK" if configured_for_cuda else "FAIL"
+    print(f"Configured model device: {device}  [{status}]")
+    if not configured_for_cuda:
+        print("Set DEVICE=cuda (or DEVICE=cuda:N) on the RunPod pod.")
+    return configured_for_cuda
 
 
 def check_ffmpeg() -> bool:
@@ -372,6 +398,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also check credentials and every runtime import",
     )
+    parser.add_argument(
+        "--require-cuda",
+        action="store_true",
+        help="fail unless CUDA is available and DEVICE selects a CUDA device",
+    )
     args = parser.parse_args(argv)
 
     print("Amharic dubbing pipeline - environment health check")
@@ -380,7 +411,8 @@ def main(argv: list[str] | None = None) -> int:
 
     checks = {
         "Python": check_python(),
-        "PyTorch": check_torch(),
+        "PyTorch": check_torch(require_cuda=args.require_cuda),
+        "Configured device": check_configured_device(require_cuda=args.require_cuda),
         "FFmpeg": check_ffmpeg(),
     }
 

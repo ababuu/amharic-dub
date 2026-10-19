@@ -43,9 +43,9 @@ from scripts.check_environment import check_runtime_imports
 raise SystemExit(0 if check_runtime_imports() else 1)
 "
 
-echo "==> Checking the pinned torch line survived"
+echo "==> Checking the RunPod CUDA PyTorch runtime"
 "${PYTHON}" - <<'PY'
-"""Fail loudly if the CUDA-matched torch was replaced during the install."""
+"""Fail before a paid run if the RunPod CUDA runtime is unavailable."""
 
 import torch
 
@@ -55,6 +55,17 @@ if not torch.__version__.startswith("2.8"):
         f"  torch is {torch.__version__}, not the pinned 2.8 line; "
         "the CUDA-matched build was replaced"
     )
+if not torch.cuda.is_available():
+    raise SystemExit(
+        "  CUDA is unavailable. Use the documented RunPod PyTorch GPU image "
+        "and verify that the Pod has a GPU attached."
+    )
+if not torch.version.cuda or not torch.version.cuda.startswith("12.8"):
+    raise SystemExit(
+        f"  torch was built for CUDA {torch.version.cuda!r}, not CUDA 12.8; "
+        "use the documented RunPod PyTorch GPU image."
+    )
+print(f"  CUDA runtime {torch.version.cuda}")
 PY
 
 echo "==> pip check"
@@ -62,6 +73,6 @@ echo "==> pip check"
 
 echo
 echo "Done. Next:"
-echo "  python scripts/check_environment.py --full                  # credentials, imports"
+echo "  python scripts/check_environment.py --full --require-cuda   # GPU, credentials, imports"
 echo "  python scripts/validate_models.py                           # load each model once"
 echo "  python -m app.pipeline.orchestrator data/input/test.mp4     # -> dubbed MP4"

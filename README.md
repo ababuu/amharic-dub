@@ -210,7 +210,10 @@ seconds and prefers a reference no longer than six seconds when one is available
 because longer reference dialogue was being echoed at the start of generated lines.
 It can use up to ten seconds when a speaker has no suitable shorter interval. The
 known transcript is passed directly to OmniVoice to avoid loading ASR, while the
-model's standard reference preprocessing remains enabled to remove silence.
+model's standard reference preprocessing remains enabled to remove silence. Every
+generation also receives an instruction to speak only the supplied Amharic line and
+not repeat or continue dialogue from the English reference; this is a model instruction,
+not a guaranteed audio-level filter.
 The pipeline reports a tentative pitch-based vocal-presentation estimate, but preserves
 the actor's voice by cloning the reference rather than treating that estimate as a
 gender label or synthesizer control.
@@ -366,7 +369,8 @@ environment, so values configured on the RunPod pod always win.
 | `DIARIZATION_MODEL` | Hugging Face pipeline id for diarization            | `pyannote/speaker-diarization-community-1` |
 | `DIARIZATION_MIN_SPEAKERS` | Fewest speakers diarization may report; unset lets it decide | *(unset)* |
 | `DIARIZATION_MAX_SPEAKERS` | Most speakers diarization may report; unset lets it decide | *(unset)* |
-| `SEPARATION_INFERENCE_BATCH_SIZE` | BandIt chunks per forward pass in the separation stage. The library defaults to **1**, which left a measured run spending 354 s of 590 s here; the chunks are independent, so batching is the same arithmetic with more of the GPU used. **8** is the tested setting for a 48 GB A40; 16 and 32 ran out of memory and had to retry at smaller sizes. Higher values may suit larger GPUs; OOM recovery halves the batch rather than failing the run | `8` |
+| `SEPARATION_INFERENCE_BATCH_SIZE` | BandIt chunks per forward pass. The RunPod A40 starting default is **64**; OOM recovery halves the batch and retries. An earlier measurement completed at 8 but ran out of memory at 16 and 32, so check the reported settled size and lower this value if needed. | `64` |
+| `SEPARATION_HOP_SECONDS` | Advance between BandIt's 8-second inference windows. The default **6.0** leaves 2 seconds of overlap, reducing redundant model chunks; smaller hops increase overlap and compute. Reduce it if a source shows seam artefacts. | `6.0` |
 | `TRANSCRIPTION_MODEL` | faster-whisper model for transcription            | `large-v3`         |
 | `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
 | `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |
@@ -578,7 +582,7 @@ it loads only the engine and backend a run will actually use.
 **4. Pre-flight, then validate the models stage by stage.**
 
 ```bash
-python scripts/check_environment.py --full
+python scripts/check_environment.py --full --require-cuda
 python scripts/validate_models.py
 ```
 
@@ -590,7 +594,19 @@ actually needs (flagging a value that is still the `.env.example` placeholder) a
 every module the stages import at run time. What is required follows the
 configuration: the Hugging Face token always, and the configured provider's key only
 under `TRANSLATION_BACKEND=openai` (`GEMINI_API_KEY` by default). Anything the
-configuration does not use is reported `[SKIP]` rather than `[FAIL]`.
+configuration does not use is reported `[SKIP]` rather than `[FAIL]`. On RunPod,
+`--require-cuda` additionally fails unless CUDA is visible and `DEVICE` is `cuda`
+or `cuda:N`; without it, CUDA absence remains a non-blocking result for local
+development checks.
+
+The local model stages use that configured device: BandIt separation, pyannote
+diarization, faster-whisper transcription, OmniVoice synthesis, and local NLLB
+translation. GPU-oriented defaults are BandIt batch size 8 and a 2-second
+separation hop, faster-whisper `large-v3` in FP16, and OmniVoice in FP16. The
+default Gemini/DeepSeek translation backend is a remote API call, not a model
+running on the Pod GPU. FFmpeg audio/video extraction and final muxing also use
+the CPU. The installer checks the RunPod PyTorch 2.8 / CUDA 12.8 runtime and
+stops if the GPU is unavailable, before a model run begins.
 
 `scripts/validate_models.py` loads each model **on its own** - BandIt, pyannote,
 faster-whisper, the configured translation backend, the configured synthesis engine -
@@ -673,7 +689,8 @@ Transcription uses faster-whisper `large-v3`, which is **not** gated and is
 downloaded into `MODEL_CACHE_DIR` on first run. It defaults to `float16`, which
 targets the A40 GPU; a CPU-only run needs
 `TRANSCRIPTION_COMPUTE_TYPE=int8` because CTranslate2 does not support fp16 on
-CPU. The pipeline never falls back from GPU to CPU on its own.
+CPU. The pipeline never falls back from GPU to CPU on its own. On the GPU Pod,
+keep `DEVICE=cuda` and `TRANSCRIPTION_COMPUTE_TYPE=float16`.
 
 The `nllb` backend translates locally: NLLB is a local checkpoint, so no key and no
 network access are needed. The default `openai` backend calls out to a third party -
