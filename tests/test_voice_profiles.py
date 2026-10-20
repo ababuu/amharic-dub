@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import sys
 import types
 from dataclasses import dataclass
@@ -1758,3 +1759,65 @@ def test_variety_cannot_outweigh_a_clear_audio_difference(
     # on the audio - which is the point of the test - rather than on the text.
     assert profile.reference_start == 30.5
     assert profile.reference_text == REPETITIVE_TEXT
+
+
+# ---------------------------------------------------------------------------
+# the reference ends where the speaker stopped, not inside a word
+# ---------------------------------------------------------------------------
+
+
+def test_the_reference_keeps_silence_after_its_last_word(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """A prompt that stops mid-word is what makes OmniVoice repeat that word.
+
+    The transcript ends at 6.0 s but the recording's release runs to 6.08 s. The
+    window has to follow the audio and keep room after it, or the model treats the
+    cut word as unfinished and speaks it before the line it was given.
+    """
+
+    stem = _write_stem(
+        tmp_path / "speech.wav", [(1.0, 6.08, LOUD), (6.08, 7.5, SILENCE)]
+    )
+    line = TranscriptSegment("SPEAKER_00", 1.0, 6.0, "a complete line of dialogue")
+
+    profile = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", 1.0, 6.0)],
+        stem,
+        transcript=[line],
+        settings=_settings(tmp_path, voice_reference_target_duration=5.0),
+    )["SPEAKER_00"]
+
+    assert profile.reference_start == pytest.approx(1.0)
+    assert profile.reference_end == pytest.approx(6.38, abs=0.05)
+    # Silence carries no words, so the same transcript still describes the audio.
+    assert profile.reference_text == line.text
+
+
+def test_a_tail_still_speaking_at_the_search_limit_is_left_as_cut(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """Without an acoustic offset there is nothing to pad to, so nothing changes."""
+
+    stem = _write_stem(tmp_path / "speech.wav", [(1.0, 8.0, LOUD)])
+
+    profile = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", 1.0, 6.0)],
+        stem,
+        transcript=[TranscriptSegment("SPEAKER_00", 1.0, 6.0, "still speaking")],
+        settings=_settings(tmp_path, voice_reference_target_duration=5.0),
+    )["SPEAKER_00"]
+
+    assert profile.reference_end == pytest.approx(6.0)
+
+
+def test_padding_cannot_reach_into_the_next_line() -> None:
+    assert voice_profiles._speech_limit_after(6.0, [(1.0, 6.0), (6.05, 9.0)]) == (
+        pytest.approx(6.05)
+    )
+
+
+def test_a_region_straddling_the_end_does_not_bound_the_padding() -> None:
+    """A diarized turn that runs past the line is this speaker still talking."""
+
+    assert voice_profiles._speech_limit_after(6.0, [(1.0, 7.0)]) == math.inf

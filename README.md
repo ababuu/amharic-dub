@@ -217,6 +217,20 @@ every line. Without a transcript, OmniVoice preprocesses first and transcribes t
 processed audio, so the pair stays aligned. `instruct` is a *voice-design* control that
 only accepts a fixed vocabulary of accent, age and style words, so it is left unset in
 cloning mode.
+
+**A reference ends where the speaker stopped, not where the transcript says.** A
+recogniser's end time is not an acoustic offset, and OmniVoice's prompt is a *prefix*
+of an utterance whose masked region is trained to continue it, so a prompt that stops
+inside a word asks the model to finish that word before it speaks the line. On the run
+that exposed this, the transcript ended at 12.512s while the word "room" kept sounding
+to about 12.95s, and the prompt therefore ended mid-word. Each reference is now grown
+past its transcript line to the real acoustic offset - found with the same energy VAD
+used to score windows - and keeps 0.3s of the silence after it. The window never
+reaches into another character's speech, never exceeds
+`VOICE_REFERENCE_MAX_DURATION`, and is left exactly as cut when the tail is steady
+material with no offset to find. This is what OmniVoice's author recommends for the
+mirror-image defect as well: a reference "with appropriate silences".
+
 The pipeline reports a tentative pitch-based vocal-presentation estimate, but preserves
 the actor's voice by cloning the reference rather than treating that estimate as a
 gender label or synthesizer control.
@@ -746,6 +760,15 @@ measurements the selection used:
   sent and the engine transcribes the reference itself. `preprocess_prompt` is
   switched off whenever a transcript is supplied, because its silence-stripping edits
   the audio after the transcript was taken from it.
+* *An acoustic end.* Exactness is not enough at the tail: a recogniser's end time is
+  not where the word ends. On the second run the transcript stopped at `12.512s`
+  while the actor's last word kept sounding to about `12.95s`, so the prompt held a
+  word cut through its release - and OmniVoice, whose prompt is a prefix that its
+  masked region is trained to continue, finished that word at the start of every
+  generated line. A window is now grown past its line to the observed acoustic
+  offset and keeps 0.3s of the silence after it, but only when that silence is
+  actually present, so a pause between syllables is never mistaken for the end of an
+  utterance.
 
 Candidate windows are ranked on duration, speech presence, dynamic range,
 loudness, overlap with other speakers and clipping, and the best window of the

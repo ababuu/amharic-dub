@@ -215,6 +215,32 @@ CLIPPING_TOLERANCE = 0.01
 #: Peak the extracted reference is attenuated to. Never boosted.
 REFERENCE_PEAK_DBFS = -1.0
 
+#: Silence a reference keeps after the last word it speaks, how far past the
+#: transcript the real acoustic offset is searched for, and the guard kept between
+#: that offset and the next line.
+#:
+#: A transcript's end time is not an acoustic offset, and OmniVoice's prompt is a
+#: *prefix* of an utterance whose masked region is trained to continue it (the
+#: prompt region carries no loss; see ``omnivoice/data/processor.py``). A prompt
+#: that stops inside a word therefore asks the model to finish that word before it
+#: speaks the target line, and that fragment is heard at the start of every take.
+#: The project's author gives the same advice for the mirror-image defect: use a
+#: reference "with appropriate silences"
+#: (https://github.com/k2-fsa/OmniVoice/issues/116).
+REFERENCE_TRAIL_SILENCE_SECONDS = 0.30
+
+#: How far past the transcript window the acoustic offset is searched for. A
+#: recogniser's end time can sit well before a word's release.
+REFERENCE_EDGE_SEARCH_SECONDS = 0.60
+
+#: Gap kept between the padded window and the next line, so padding can never
+#: reach into a neighbouring character's first syllable.
+REFERENCE_EDGE_GUARD_SECONDS = 0.05
+
+#: A search region this share active has no acoustic offset to find - it is steady
+#: material such as a music bed or bleed - so the window is left exactly as cut.
+REFERENCE_EDGE_ACTIVE_RATIO_LIMIT = 0.95
+
 #: Orthographic targets of the phonetic-variety proxy: distinct symbols and
 #: distinct words a reference should exercise, and the number of words below
 #: which a window simply has not said enough to characterise a speaker.
@@ -725,23 +751,50 @@ class _ReferenceCandidate:
     #: ``True`` when the window shares time with simultaneous speech, so the
     #: recording contains more than one voice.
     contaminated: bool = False
+    #: The transcript-exact span this window was grown from. ``start``..``end``
+    #: add the silence after it, which carries no words, so the transcript still
+    #: describes the audio; these two keep the *speech* length available to the
+    #: scoring and selection rules that care about it.
+    speech_start: float | None = None
+    speech_end: float | None = None
 
     @property
     def duration(self) -> float:
-        """Length of the window in seconds."""
+        """Length of the window in seconds, including its silence."""
 
         return self.end - self.start
 
-    def is_usable(self, min_duration: float) -> bool:
-        """Return whether the window is long enough and carries actual speech."""
+    @property
+    def speech_duration(self) -> float:
+        """Length of the spoken part of the window, in seconds."""
 
-        return self.duration >= min_duration and self.stats.speech_ratio >= MIN_SPEECH_RATIO
+        if self.speech_start is None or self.speech_end is None:
+            return self.duration
+        return self.speech_end - self.speech_start
+
+    @property
+    def edge_silence(self) -> float:
+        """Silence the window adds after its speech, in seconds."""
+
+        return max(0.0, self.duration - self.speech_duration)
+
+    def is_usable(self, min_duration: float) -> bool:
+        """Return whether the window is long enough and carries actual speech.
+
+        The minimum applies to the *spoken* part: silence added around a window is
+        there to frame the speech, not to make a short reference pass the bar.
+        """
+
+        return (
+            self.speech_duration >= min_duration
+            and self.stats.speech_ratio >= MIN_SPEECH_RATIO
+        )
 
     def _terms(self, target_duration: float) -> list[tuple[float, float]]:
         """Return the ``(weight, score)`` pairs that apply to this window."""
 
         terms = [
-            (SCORE_DURATION_WEIGHT, min(self.duration / target_duration, 1.0)),
+            (SCORE_DURATION_WEIGHT, min(self.speech_duration / target_duration, 1.0)),
             (
                 SCORE_SPEECH_WEIGHT,
                 _clamp(self.stats.speech_ratio / SPEECH_COVERAGE_TARGET),
@@ -784,13 +837,18 @@ class _ReferenceCandidate:
         """Explain, in one line, why this window was preferred."""
 
         reason = (
-            f"{self.duration:.1f}s of continuous speech, "
+            f"{self.speech_duration:.1f}s of continuous speech, "
             f"{self.stats.speech_ratio:.0%} active speech, "
             f"{self.stats.dynamic_range_db:.0f} dB dynamic range, "
             f"{self.overlap_seconds:.1f}s overlapped by other speakers, "
             f"{self.stats.rms_dbfs:.1f} dBFS, "
             f"{self.stats.clipped_fraction:.1%} clipped"
         )
+        if self.edge_silence > 0.0:
+            reason += (
+                f", {self.edge_silence:.1f}s of silence after the speech so the "
+                "prompt ends where the speaker stopped rather than inside a word"
+            )
         if self.variety is not None:
             reason += f", phonetic variety {self.variety:.2f}"
         if self.text is None:
@@ -1123,6 +1181,95 @@ def _measure_window(samples: np.ndarray, sample_rate: int) -> _WindowStats:
     )
 
 
+def _speech_limit_after(end: float, occupied: Sequence[tuple[float, float]]) -> float:
+    """Return the earliest time speech starts at or after ``end``, or infinity.
+
+    Regions that straddle ``end`` are ignored: they are the window's own speech
+    continuing, not a boundary it must stay clear of.
+    """
+
+    limit = math.inf
+    for region_start, _region_end in occupied:
+        if region_start >= end - TIMESTAMP_TOLERANCE:
+            limit = min(limit, region_start)
+    return limit
+
+
+def _trailing_silence_window(
+    reader: _StemReader,
+    start: float,
+    end: float,
+    occupied: Sequence[tuple[float, float]],
+    *,
+    maximum: float,
+) -> tuple[float, float]:
+    """Grow a window's end past its transcript line, into the silence that follows.
+
+    A transcript's end time is not an acoustic offset. On the film that prompted
+    this, the selected reference ended *inside* a word: its last 40 ms sat at
+    -30 dBFS and the file simply stopped there. OmniVoice's prompt is a prefix of an
+    utterance whose masked region is trained to continue it, so a prompt that stops
+    inside a word asks the model to finish that word first - which is heard as a
+    fragment of the reference at the start of every take.
+
+    The real offset is located with the same energy VAD used to measure windows, and
+    :data:`REFERENCE_TRAIL_SILENCE_SECONDS` of the silence after it is kept. An offset
+    is accepted only when that much silence is actually observed after it; otherwise
+    the speech may simply be pausing between syllables, and guessing would pull the
+    next, untranscribed words into the prompt. The window never grows into another
+    line and never past ``maximum``, and a tail that is still active at the end of the
+    search range (a music bed, or speech carrying on too far to trust) is left exactly
+    as cut.
+
+    The head is deliberately untouched: the model continues the *end* of a prompt,
+    never its beginning, and pulling a window backwards would risk swallowing the
+    tail of the previous line.
+    """
+
+    limit = _speech_limit_after(end, occupied)
+    search = REFERENCE_EDGE_SEARCH_SECONDS + REFERENCE_TRAIL_SILENCE_SECONDS
+    room = search if math.isinf(limit) else limit - end - REFERENCE_EDGE_GUARD_SECONDS
+    if room <= 0.0:
+        return start, end
+
+    read_end = end + min(room, search)
+    samples = reader.read(end, read_end)
+    if samples.size == 0:
+        return start, end
+
+    levels = _frame_levels(samples, reader.sample_rate)
+    if levels.size < 3:
+        return start, end
+
+    noise_floor = float(np.percentile(levels, NOISE_FLOOR_PERCENTILE))
+    threshold = max(noise_floor + ACTIVITY_MARGIN_DB, SILENCE_FLOOR_DBFS)
+    active = levels >= threshold
+
+    sounded = np.flatnonzero(active)
+    if sounded.size == 0:
+        # The window already ends in silence; there is nothing to add.
+        return start, end
+    if int(sounded[-1]) >= active.size - 1:
+        # Speech runs to the edge of what may be taken: no offset to trust.
+        return start, end
+    if float(active.mean()) >= REFERENCE_EDGE_ACTIVE_RATIO_LIMIT:
+        return start, end
+
+    acoustic_end = end + (int(sounded[-1]) + 1) * ANALYSIS_FRAME_SECONDS
+    padded_end = acoustic_end + REFERENCE_TRAIL_SILENCE_SECONDS
+    if padded_end > read_end:
+        # The silence after the last frame is shorter than the reference needs, so
+        # the speech may simply be pausing between syllables. Without seeing the
+        # silence itself there is no offset to trust, and guessing would pull the
+        # next, untranscribed words into the prompt.
+        return start, end
+    if padded_end - start > maximum:
+        padded_end = start + maximum
+    if padded_end <= end:
+        return start, end
+    return start, padded_end
+
+
 def _candidates_for(
     speaker_id: str,
     own: list[SpeakerSegment],
@@ -1150,6 +1297,16 @@ def _candidates_for(
         key=lambda line: (line.start, line.end),
     )
 
+    # Anything that must not be crossed while a window grows out to its real
+    # acoustic offset: another speaker's diarized turn, any transcript line, and
+    # any crosstalk region. Only regions that *start* at or after the window's end
+    # bound it; this speaker's own turns do not, because a diarization split inside
+    # one utterance is not a new thing said - the energy VAD decides where speech
+    # actually stops.
+    occupied: list[tuple[float, float]] = [
+        (segment.start, segment.end) for segment in others
+    ] + [(line.start, line.end) for line in transcript] + list(contaminated)
+
     spans: list[tuple[float, float]] = []
     if own_lines:
         spans.extend(
@@ -1166,25 +1323,32 @@ def _candidates_for(
     candidates: list[_ReferenceCandidate] = []
     seen: set[tuple[float, float]] = set()
     for start, end in spans:
-        key = (round(start, 4), round(end, 4))
+        # The transcript describes this span exactly, so it is read before the
+        # window grows: the added silence carries no words.
+        text = _window_text(speaker_id, start, end, transcript)
+        covered = _covered_text(speaker_id, start, end, transcript)
+        padded_start, padded_end = _trailing_silence_window(
+            reader, start, end, occupied, maximum=maximum
+        )
+        key = (round(padded_start, 4), round(padded_end, 4))
         if key in seen:
             continue
         seen.add(key)
-        samples = reader.read(start, end)
+        samples = reader.read(padded_start, padded_end)
         if samples.size == 0:
             continue
-        text = _window_text(speaker_id, start, end, transcript)
-        covered = _covered_text(speaker_id, start, end, transcript)
         candidates.append(
             _ReferenceCandidate(
                 speaker_id=speaker_id,
-                start=start,
-                end=end,
+                start=padded_start,
+                end=padded_end,
                 stats=_measure_window(samples, reader.sample_rate),
-                overlap_seconds=_overlap_seconds(start, end, others),
+                overlap_seconds=_overlap_seconds(padded_start, padded_end, others),
                 text=text,
                 variety=_phonetic_variety(covered or text),
-                contaminated=_contaminated(start, end, contaminated),
+                contaminated=_contaminated(padded_start, padded_end, contaminated),
+                speech_start=start,
+                speech_end=end,
             )
         )
     return candidates
@@ -1204,7 +1368,7 @@ def _no_usable_reference(
             "diarized speech inside the dialogue stem"
         )
 
-    longest = max(candidate.duration for candidate in candidates)
+    longest = max(candidate.speech_duration for candidate in candidates)
     active = max(candidate.stats.speech_ratio for candidate in candidates)
 
     reasons = [f"the longest continuous stretch of speech is {longest:.2f}s"]
@@ -1733,7 +1897,7 @@ def build_voice_profiles(
             # dialogue to echo; keep a one-fifth margin for natural line boundaries,
             # but retain longer references as a fallback for sparse speakers.
             preferred_maximum = min(maximum, target * 1.2)
-            shorter = [item for item in pool if item.duration <= preferred_maximum]
+            shorter = [item for item in pool if item.speech_duration <= preferred_maximum]
             if shorter:
                 pool = shorter
 
@@ -1745,7 +1909,12 @@ def build_voice_profiles(
                 for item in pool
                 if not any(
                     line.speaker_id == item.speaker_id
-                    and abs(line.end - item.end) <= TIMESTAMP_TOLERANCE
+                    and abs(
+                        line.end - (
+                            item.speech_end if item.speech_end is not None else item.end
+                        )
+                    )
+                    <= TIMESTAMP_TOLERANCE
                     and line.duration < 1.0
                     for line in lines
                 )
