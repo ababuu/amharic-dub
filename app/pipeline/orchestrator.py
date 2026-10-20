@@ -853,7 +853,8 @@ def _engine_note(settings: Settings) -> str:
     if tts.engine_needs_profiles(settings.tts_engine):
         return (
             f"{settings.tts_engine} runs voice cloning: each character is spoken in "
-            "their own voice, cloned from their isolated English performance"
+            "their own voice, cloned from their isolated performance in the film, so "
+            "the dub carries that performance's accent as well as its timbre"
         )
     return (
         f"{settings.tts_engine} is a single-voice engine: one voice speaks every part"

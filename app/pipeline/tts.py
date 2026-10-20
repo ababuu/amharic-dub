@@ -118,7 +118,11 @@ CLIP_DIRECTORY_NAME = "clips"
 #: Bump when a change here would make an existing take or clip wrong; it is part
 #: of every generated file name, so old artifacts can never be mistaken for new
 #: ones.
-SYNTHESIS_RECIPE_VERSION = 2
+#:
+#: 3: OmniVoice prompts keep the reference audio untouched when its transcript is
+#: known, so takes made while silence removal could leave the reference's last word
+#: at the start of every line must not be reused.
+SYNTHESIS_RECIPE_VERSION = 3
 
 #: Shortest original window a line is *reported* for, in seconds. It is not a reason to
 #: leave a line unsaid: a brief English line is normal, and the Amharic that replaces it
@@ -939,6 +943,22 @@ OMNIVOICE_AMHARIC = "Amharic"
 #: The rate OmniVoice generates at.
 OMNIVOICE_SAMPLE_RATE = 24_000
 
+#: Characters that already end a reference transcript as a complete sentence.
+_SENTENCE_END = (".", "!", "?", "…", "。", "！", "？", "።", "፧")
+
+
+def _terminate_reference_text(text: str) -> str:
+    """Return ``text`` with terminal punctuation, as OmniVoice's preprocessing would.
+
+    The punctuation is what marks where the reference stops and the line to speak
+    begins, so it has to survive when that preprocessing is turned off.
+    """
+
+    text = text.strip()
+    if text and not text.endswith(_SENTENCE_END):
+        return text + "."
+    return text
+
 
 def _require_omnivoice() -> tuple[Any, Any, Any]:
     """Return ``(torch, OmniVoice, OmniVoiceGenerationConfig)``, or say what is missing."""
@@ -1133,9 +1153,13 @@ class OmniVoiceEngine(VoiceCloningEngine):
         describes the reference exactly: without it the model transcribes the reference
         with an ASR model of its own, which is both slower and one more download.
 
-        OmniVoice preprocessing is enabled for both known and unknown transcripts.
-        With a known transcript, its long-reference trimming is skipped to preserve
-        transcript alignment; silence removal does not change the spoken words.
+        OmniVoice preprocessing is disabled when the transcript is known. Its
+        mid-silence removal shortens the prompt audio while the transcript still
+        describes the original length, so the model treats the reference's trailing
+        words as unspoken and repeats them at the start of every generated line (a
+        reference ending "in this very room." was heard as "room" before each line).
+        Without a transcript, preprocessing runs first and the model transcribes the
+        processed audio, so the two stay aligned.
         """
 
         key = (str(reference), (reference_text or "").strip())
@@ -1144,12 +1168,12 @@ class OmniVoiceEngine(VoiceCloningEngine):
             return prompt
 
         _torch, network, _config = self._load()
-        text = key[1] or None
+        text = _terminate_reference_text(key[1]) or None
         try:
             prompt = network.create_voice_clone_prompt(
                 ref_audio=str(reference),
                 ref_text=text,
-                preprocess_prompt=True,
+                preprocess_prompt=text is None,
             )
         except Exception as exc:
             raise SynthesisError(

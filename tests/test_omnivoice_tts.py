@@ -387,10 +387,15 @@ def test_two_characters_get_two_prompts(
     assert prompts[0].ref_audio != prompts[1].ref_audio
 
 
-def test_the_reference_transcript_is_passed_when_it_is_known(
+def test_a_known_transcript_is_passed_and_never_silence_compressed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Supplying it is what stops a run loading an ASR model it does not need."""
+    """Proving the transcript is what stops a run loading an ASR model.
+
+    Silence compression must be off for the same prompt: it shortens the reference
+    audio while the transcript keeps its original length, and the model then repeats
+    the reference's final words at the start of every line.
+    """
 
     _patch(monkeypatch)
 
@@ -401,14 +406,18 @@ def test_the_reference_transcript_is_passed_when_it_is_known(
         reference_text="  hello world  ",
     )
 
-    assert FakeOmniVoice.instances[0].prompts[0].ref_text == "hello world"
-    assert FakeOmniVoice.instances[0].prompts[0].preprocess_prompt is True
+    assert FakeOmniVoice.instances[0].prompts[0].ref_text == "hello world."
+    assert FakeOmniVoice.instances[0].prompts[0].preprocess_prompt is False
 
 
 def test_the_transcript_is_left_to_the_model_when_unknown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An empty transcript means "not known", never "the empty string"."""
+    """An empty transcript means "not known", never "the empty string".
+
+    OmniVoice preprocesses first and transcribes the processed audio, so its
+    silence removal still runs without breaking the audio/transcript alignment.
+    """
 
     _patch(monkeypatch)
 
@@ -421,6 +430,25 @@ def test_the_transcript_is_left_to_the_model_when_unknown(
 
     assert FakeOmniVoice.instances[0].prompts[0].ref_text is None
     assert FakeOmniVoice.instances[0].prompts[0].preprocess_prompt is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("hello world", "hello world."),
+        ("  hello world  ", "hello world."),
+        ("really?", "really?"),
+        ("ሰላም።", "ሰላም።"),
+        ("ሰላም", "ሰላም."),
+        ("", ""),
+    ],
+)
+def test_a_reference_transcript_gains_terminal_punctuation_only_once(
+    raw: str, expected: str
+) -> None:
+    """The transcription boundary has to survive without OmniVoice's normaliser."""
+
+    assert tts._terminate_reference_text(raw) == expected
 
 
 # ---------------------------------------------------------------------------

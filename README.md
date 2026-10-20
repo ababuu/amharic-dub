@@ -209,13 +209,14 @@ reference must contain at least four seconds of speech. The selector targets fiv
 seconds and prefers a reference no longer than six seconds when one is available,
 because longer reference dialogue was being echoed at the start of generated lines.
 It can use up to ten seconds when a speaker has no suitable shorter interval. The
-known transcript is passed directly to OmniVoice to avoid loading ASR, while the
-model's standard reference preprocessing remains enabled to remove silence.
-OmniVoice's `instruct` field is a *voice-design* control that only accepts a fixed
-vocabulary of accent, age and style words, so it is left unset in cloning mode; the
-short-reference preference and the reference transcript are the only controls against
-the model continuing the English recording, and neither is a guaranteed audio-level
-filter.
+known transcript is passed directly to OmniVoice to avoid loading ASR, and reference
+preprocessing is disabled for that case: its silence removal shortens the prompt audio
+while the transcript keeps the original length, which made the model repeat the
+reference's final word ("room", from "even now in this very room.") at the start of
+every line. Without a transcript, OmniVoice preprocesses first and transcribes the
+processed audio, so the pair stays aligned. `instruct` is a *voice-design* control that
+only accepts a fixed vocabulary of accent, age and style words, so it is left unset in
+cloning mode.
 The pipeline reports a tentative pitch-based vocal-presentation estimate, but preserves
 the actor's voice by cloning the reference rather than treating that estimate as a
 gender label or synthesizer control.
