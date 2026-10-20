@@ -235,19 +235,22 @@ def test_amharic_is_named_the_way_omnivoice_spells_it(
     assert call["language"] == tts.OMNIVOICE_AMHARIC == "Amharic"
 
 
-def test_generation_is_told_not_to_repeat_reference_dialogue(
+def test_cloning_sends_no_voice_design_instruct(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """``instruct`` is voice design and validates against a closed vocabulary.
+
+    A prose content-boundary instruction raises ``ValueError`` inside OmniVoice and
+    fails the line, so cloning must leave the field at its default.
+    """
+
     _patch(monkeypatch)
 
     _engine().synthesize(
         text="ሰላም", voice_reference=_reference(tmp_path), destination=tmp_path / "o.wav"
     )
 
-    call = FakeOmniVoice.instances[0].calls[0]
-    assert call["instruct"] == tts.OMNIVOICE_CLONE_INSTRUCTION
-    assert "provided Amharic text" in call["instruct"]
-    assert "Do not repeat" in call["instruct"]
+    assert "instruct" not in FakeOmniVoice.instances[0].calls[0]
 
 
 def test_position_sampling_uses_omnivoice_default_but_tokens_remain_greedy(

@@ -210,10 +210,12 @@ seconds and prefers a reference no longer than six seconds when one is available
 because longer reference dialogue was being echoed at the start of generated lines.
 It can use up to ten seconds when a speaker has no suitable shorter interval. The
 known transcript is passed directly to OmniVoice to avoid loading ASR, while the
-model's standard reference preprocessing remains enabled to remove silence. Every
-generation also receives an instruction to speak only the supplied Amharic line and
-not repeat or continue dialogue from the English reference; this is a model instruction,
-not a guaranteed audio-level filter.
+model's standard reference preprocessing remains enabled to remove silence.
+OmniVoice's `instruct` field is a *voice-design* control that only accepts a fixed
+vocabulary of accent, age and style words, so it is left unset in cloning mode; the
+short-reference preference and the reference transcript are the only controls against
+the model continuing the English recording, and neither is a guaranteed audio-level
+filter.
 The pipeline reports a tentative pitch-based vocal-presentation estimate, but preserves
 the actor's voice by cloning the reference rather than treating that estimate as a
 gender label or synthesizer control.
