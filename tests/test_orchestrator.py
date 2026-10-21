@@ -382,7 +382,11 @@ def test_each_stage_receives_the_previous_stage_output(
     assert separation_stems == stages.track
     assert stages.received["diarization"][0] == stages.received["separation"][1] / "movie_speech.wav"
     assert stages.received["transcription"][0] == stages.received["diarization"][0]
-    assert stages.received["translation"][0] == tuple(stages.lines)
+    # What reaches adaptation is the sentence, not the raw transcriber segment.
+    units = stages.received["translation"][0]
+    assert isinstance(units, tuple)  # type: ignore[unreachable]
+    assert [unit.text for unit in units] == ["I love you."]  # type: ignore[union-attr]
+    assert [(unit.start, unit.end) for unit in units] == [(1.0, 4.0)]  # type: ignore[union-attr]
     assert stages.received["tts"][0] == tuple(stages.dialogue)
     placed = stages.received["timing"][0]
     assert len(placed) == len(stages.dialogue)  # type: ignore[arg-type]
@@ -444,7 +448,7 @@ def test_max_lines_shortens_only_the_synthesis(
     assert result.dialogue == tuple(stages.dialogue)
     assert len(stages.received["tts"][0]) == 2  # type: ignore[arg-type]
     assert len(result.clips) == 2
-    assert stages.received["translation"][0] == tuple(stages.lines)  # type: ignore[arg-type]
+    assert len(stages.received["translation"][0]) == 1  # type: ignore[arg-type]
     # A shortened run still produces a deliverable, but it is a partial dub.
     assert result.partial
     assert result.synthesized_lines == 2
@@ -952,3 +956,39 @@ def test_cli_returns_zero_on_a_complete_run(
 
     assert code == 0
     assert (tmp_path / "run" / MANIFEST_FILENAME).is_file()
+
+
+def test_one_spoken_sentence_reaches_adaptation_as_one_unit(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """A pause must not turn one thought into two translation and speech units.
+
+    The transcriber segments on pauses, so a single sentence routinely arrives as
+    several segments. Adapting and speaking each one separately is what produces
+    several utterances with several final intonations.
+    """
+
+    stages.lines = [
+        _line(start=1.0, end=2.0, text="It is the world"),
+        _line(start=2.2, end=4.0, text="that has been pulled over your eyes."),
+    ]
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=_settings(tmp_path), progress=messages.append)
+
+    units = stages.received["translation"][0]
+    assert len(units) == 1  # type: ignore[arg-type]
+    (sentence,) = units  # type: ignore[union-attr]
+    assert sentence.text == "It is the world that has been pulled over your eyes."
+    assert len(sentence.parts) == 2
+    assert "assembled into 1 sentence" in " ".join(messages)
+
+
+def test_a_sentence_report_is_not_printed_when_nothing_was_joined(
+    tmp_path: Path, stages: Stages
+) -> None:
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=_settings(tmp_path), progress=messages.append)
+
+    assert "assembled into" not in " ".join(messages)

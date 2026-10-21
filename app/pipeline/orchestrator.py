@@ -210,6 +210,7 @@ class PipelineResult:
             },
             "transcription": {
                 "lines": len(self.lines),
+                "sentences": len(self.dialogue),
                 "segments": [_segment_dict(segment) for segment in self.lines],
             },
             "translation": {
@@ -349,7 +350,7 @@ def _segment_dict(segment: Any) -> dict[str, Any]:
 def _dialogue_dict(line: AdaptedDialogue) -> dict[str, Any]:
     """Return the full content of one adapted Amharic line."""
 
-    return {
+    entry: dict[str, Any] = {
         "speaker_id": line.speaker_id,
         "start": line.start,
         "end": line.end,
@@ -361,6 +362,11 @@ def _dialogue_dict(line: AdaptedDialogue) -> dict[str, Any]:
         "pause_before": line.pause_before,
         "pause_after": line.pause_after,
     }
+    if line.beats:
+        # One sentence, several performances: the direction and the moment it
+        # applies to, so nothing the dialogue model saw is lost in the manifest.
+        entry["beats"] = [beat.as_dict() for beat in line.beats]
+    return entry
 
 
 def _report_dialogue_fit(
@@ -533,6 +539,20 @@ def run_pipeline(
     if not lines:
         raise EmptyStageError("transcription produced no lines; nothing to adapt")
 
+    # A transcriber segments on pauses, not on grammar, so one spoken sentence
+    # routinely arrives as several segments. Adapting and speaking each of them
+    # separately produces exactly what a listener hears as broken delivery: the
+    # same thought becomes several utterances, each with its own final intonation.
+    # The sentence is therefore the unit from here on; the raw segments stay the
+    # record of what was transcribed, and the clauses inside a sentence stay
+    # available as performance beats.
+    sentences = tuple(transcription.assemble_sentences(lines))
+    if sentences and len(sentences) < len(lines):
+        report(
+            f"  dialogue: {len(lines)} transcribed segment(s) assembled into "
+            f"{len(sentences)} sentence(s)"
+        )
+
     # Consistency state, not a guess: an absent bible yields an empty one, so a
     # first run works and a second run inherits whatever was filled in by hand.
     bible = dialogue_context.CharacterBible.load(resolved.dialogue_bible_path)
@@ -543,7 +563,7 @@ def run_pipeline(
             seconds,
             report,
             translation.adapt_dialogue,
-            lines,
+            sentences,
             settings=resolved,
             bible=bible,
             enforce_budget=resolved.translation_enforce_budget,
@@ -949,8 +969,8 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help=(
-            "synthesize only the first N adapted lines (first-run cost control). "
-            "The result is a partial dub: the remaining lines are not voiced."
+            "synthesize only the first N adapted sentences (first-run cost control). "
+            "The result is a partial dub: the remaining sentences are not voiced."
         ),
     )
     args = parser.parse_args(argv)

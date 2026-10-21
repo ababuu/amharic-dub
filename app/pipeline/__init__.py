@@ -9,8 +9,9 @@ Stage order
 1. ``video``         - extract the audio from the source video; mux the dub back later.
 2. ``separation``    - split the soundtrack into dialogue / music / effects stems.
 3. ``diarization``   - identify who spoke when.
-4. ``transcription`` - transcribe the dialogue stem with timestamps.
-5. ``translation``   - adapt and translate the dialogue into Amharic.
+4. ``transcription`` - transcribe the dialogue stem with timestamps, then assemble
+   the pause-delimited segments into complete sentences.
+5. ``translation``   - adapt and translate the sentences into Amharic.
 6. ``voice_profiles``- build a per-character Amharic voice profile.
 7. ``tts``           - synthesize Amharic dialogue with cloned voices.
 8. ``timing``        - align synthesized speech to the original timings.

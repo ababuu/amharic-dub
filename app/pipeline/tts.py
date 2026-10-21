@@ -582,7 +582,7 @@ class TtsClip:
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe view of the clip for a manifest or a report."""
 
-        return {
+        entry: dict[str, object] = {
             "index": self.index,
             "speaker_id": self.speaker_id,
             "start": self.start,
@@ -611,6 +611,12 @@ class TtsClip:
             "performance_engine": self.performance_engine,
             "style_engine": self.style_engine,
         }
+        if self.dialogue.beats:
+            # The sentence was spoken as one utterance, but the performance it was
+            # written from changed inside it. Recorded so a later engine or a human
+            # director can reproduce that arc instead of inferring it.
+            entry["beats"] = [beat.as_dict() for beat in self.dialogue.beats]
+        return entry
 
 
 # ---------------------------------------------------------------------------

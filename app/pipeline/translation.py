@@ -82,7 +82,7 @@ from app.pipeline.dialogue_context import (
     segment_scenes,
     syllable_budget,
 )
-from app.pipeline.transcription import TranscriptSegment
+from app.pipeline.transcription import DialogueSentence, TranscriptSegment
 
 try:  # Runtime dependency (pulls in httpx). Guarded so that this module stays
     # importable (and testable) without the API client installed.
@@ -97,6 +97,9 @@ except ImportError:  # pragma: no cover - only without the API client installed
 #: ``dialogue_000001``. The model must echo these back unchanged.
 DIALOGUE_ID_PREFIX = "dialogue_"
 DIALOGUE_ID_DIGITS = 6
+
+#: Slack allowed when comparing a beat's timestamps with the line's, in seconds.
+TIMESTAMP_TOLERANCE = 1e-3
 
 #: The reuseable system prompt for cinematic English -> Amharic adaptation.
 _LEGACY_SYSTEM_PROMPT = """\
@@ -266,6 +269,18 @@ not subtitles. Use the scene and character context. Preserve intent, subtext, pl
 facts, names, numbers, relationships and tone. Do not invent, explain, sanitize, or
 make casual speech formal.
 
+Each input line is ONE complete spoken sentence. Translate it as one continuous
+sentence in the order a speaker would say it, not as clauses joined back together.
+Its "parts" field lists the moments the actor paused inside that sentence: use them
+only to describe how the delivery changes, never as sentence boundaries. Do not end
+the Amharic at a part boundary, and do not give it more than one final stop.
+
+Amharic punctuation follows the spoken sentence, not the English source. End a
+sentence with the Ethiopian full stop, use the question mark for questions and the
+exclamation mark for exclamations, and use commas for the breaths inside a sentence.
+Never copy an English punctuation mark whose job the Amharic sentence does
+differently.
+
 FIT IS A HARD REQUIREMENT. Each line has a duration and syllable_budget. Stay within
 that budget while sounding natural. Use compact Amharic grammar; remove filler,
 repetition, recoverable pronouns, obvious vocatives, and details already conveyed by
@@ -278,13 +293,16 @@ spellings consistent.
 
 For each line return concise performance metadata: emotion (short label), intensity
 (0.0-1.0), delivery (2-5 words), and realistic pause_before/pause_after values in
-seconds. Do not invent long silences.
+seconds. Do not invent long silences. When a line has "parts", also return one
+"beats" entry per part - its part number, emotion, intensity and delivery - so the
+change of tone inside the sentence is not lost.
 
 Return exactly one JSON object matching this schema, with every input id copied
 exactly once and in order. Do not add, omit, merge, split, or reorder lines or fields.
 Return no prose, markdown, or code fences:
 {"lines":[{"id":"<id>","amharic":"...","emotion":"...","intensity":0.0,
-"delivery":"...","pause_before":0.0,"pause_after":0.0}]}
+"delivery":"...","pause_before":0.0,"pause_after":0.0,
+"beats":[{"part":1,"emotion":"...","intensity":0.0,"delivery":"..."}]}]}
 """
 
 
@@ -359,8 +377,71 @@ def _required_text(name: str, value: object) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class PerformanceBeat:
+    """How one part of a sentence is performed, on the original timeline.
+
+    A sentence is one utterance, but a performance usually changes inside it: a
+    line can begin as a question, turn quiet, and end accusing. The dialogue model
+    reports that per part, and keeping the part's own timestamps is what preserves
+    the relationship between the direction and the moment it applies to.
+
+    The Amharic voice currently has no control that can act on this inside a single
+    synthesis call - OmniVoice clones a timbre and takes no emotion or style input -
+    so a beat is recorded rather than acted on. It is still what makes a later
+    engine, or a human director, able to reproduce the performance, and dropping it
+    would silently flatten a sentence to one label.
+    """
+
+    start: float
+    end: float
+    emotion: str
+    intensity: float
+    delivery: str
+
+    def __post_init__(self) -> None:
+        start = _finite_number("start", self.start)
+        end = _finite_number("end", self.end)
+        if start < 0:
+            raise InvalidSegmentError(f"start must be >= 0 seconds, got {start}")
+        if end <= start:
+            raise InvalidSegmentError(
+                f"end must be greater than start ({start} seconds), got {end}"
+            )
+
+        emotion = _required_text("emotion", self.emotion)
+        delivery = _required_text("delivery", self.delivery)
+        intensity = _finite_number("intensity", self.intensity)
+        if not 0.0 <= intensity <= 1.0:
+            raise InvalidSegmentError(
+                f"intensity must be between 0.0 and 1.0, got {intensity}"
+            )
+
+        object.__setattr__(self, "start", start)
+        object.__setattr__(self, "end", end)
+        object.__setattr__(self, "emotion", emotion)
+        object.__setattr__(self, "intensity", intensity)
+        object.__setattr__(self, "delivery", delivery)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the beat as a manifest-friendly mapping."""
+
+        return {
+            "start": self.start,
+            "end": self.end,
+            "emotion": self.emotion,
+            "intensity": self.intensity,
+            "delivery": self.delivery,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AdaptedDialogue:
     """One dubbing-ready Amharic line plus its performance direction.
+
+    One line is one **sentence** - the unit the translator was asked to write and
+    the unit the voice speaks - not a transcriber's pause-delimited segment. Its
+    ``beats`` describe how the performance changes inside it, on the original
+    timeline.
 
     Instances are immutable and always valid, and the timing and identity fields
     are always the application-owned values from the original
@@ -378,6 +459,7 @@ class AdaptedDialogue:
     delivery: str
     pause_before: float
     pause_after: float
+    beats: tuple[PerformanceBeat, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.speaker_id, str) or not self.speaker_id.strip():
@@ -410,6 +492,24 @@ class AdaptedDialogue:
         if pause_after < 0:
             raise InvalidSegmentError(f"pause_after must be >= 0 seconds, got {pause_after}")
 
+        beats = tuple(self.beats)
+        previous_end = start
+        for index, beat in enumerate(beats):
+            if not isinstance(beat, PerformanceBeat):
+                raise InvalidSegmentError(
+                    f"beats[{index}] is {type(beat).__name__}, expected a PerformanceBeat"
+                )
+            if beat.start < start - TIMESTAMP_TOLERANCE or beat.end > end + TIMESTAMP_TOLERANCE:
+                raise InvalidSegmentError(
+                    f"beats[{index}] ({beat.start}-{beat.end}s) falls outside the line "
+                    f"({start}-{end}s)"
+                )
+            if beat.start < previous_end - TIMESTAMP_TOLERANCE:
+                raise InvalidSegmentError(
+                    f"beats[{index}] starts before the beat before it ends"
+                )
+            previous_end = beat.end
+
         # Normalise so the declared types are guaranteed.
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "end", end)
@@ -420,6 +520,7 @@ class AdaptedDialogue:
         object.__setattr__(self, "intensity", intensity)
         object.__setattr__(self, "pause_before", pause_before)
         object.__setattr__(self, "pause_after", pause_after)
+        object.__setattr__(self, "beats", beats)
 
     @property
     def duration(self) -> float:
@@ -434,20 +535,29 @@ def _dialogue_id(position: int) -> str:
     return f"{DIALOGUE_ID_PREFIX}{position:0{DIALOGUE_ID_DIGITS}d}"
 
 
-def _validate_segments(segments: Iterable[TranscriptSegment]) -> list[TranscriptSegment]:
-    """Return the transcript as a chronological, validated list."""
+def _validate_segments(
+    segments: Iterable[TranscriptSegment | DialogueSentence],
+) -> list[TranscriptSegment | DialogueSentence]:
+    """Return the dialogue units as a chronological, validated list.
+
+    A unit is either a raw :class:`TranscriptSegment` or a
+    :class:`DialogueSentence` assembled from several of them. Both carry the same
+    identity, timing and text interface, and the orchestrator hands over sentences
+    so that one thought is translated and spoken once.
+    """
 
     if isinstance(segments, (str, bytes)) or not isinstance(segments, Iterable):
         raise InvalidTranscriptSegmentsError(
-            "segments must be an iterable of TranscriptSegment objects, got "
-            f"{type(segments).__name__}"
+            "segments must be an iterable of TranscriptSegment or DialogueSentence "
+            f"objects, got {type(segments).__name__}"
         )
 
     items = list(segments)
     for index, item in enumerate(items):
-        if not isinstance(item, TranscriptSegment):
+        if not isinstance(item, (TranscriptSegment, DialogueSentence)):
             raise InvalidTranscriptSegmentsError(
-                f"segments[{index}] is {type(item).__name__}, expected a TranscriptSegment"
+                f"segments[{index}] is {type(item).__name__}, expected a "
+                "TranscriptSegment or DialogueSentence"
             )
 
     return sorted(items, key=lambda item: (item.start, item.end, item.speaker_id))
@@ -533,8 +643,8 @@ def _build_client(settings: Settings, api_key: str) -> Any:
 
 
 def _batches(
-    segments: list[TranscriptSegment], size: int
-) -> Iterator[list[TranscriptSegment]]:
+    segments: Sequence[TranscriptSegment | DialogueSentence], size: int
+) -> Iterator[list[TranscriptSegment | DialogueSentence]]:
     """Yield consecutive batches of at most ``size`` lines."""
 
     for start in range(0, len(segments), size):
@@ -594,9 +704,28 @@ def _context_block(
     return "\n".join(parts)
 
 
+def _parts_payload(segment: TranscriptSegment | DialogueSentence) -> dict[str, Any]:
+    """Return the ``parts`` field describing a multi-part sentence, or nothing.
+
+    Only a sentence that really was assembled from several segments carries parts;
+    a single-segment line is already one unit, and adding a one-element list would
+    invite the model to look for a boundary that is not there.
+    """
+
+    parts = getattr(segment, "parts", ())
+    if len(parts) < 2:
+        return {}
+    return {
+        "parts": [
+            {"part": index, "duration": round(part.duration, 3), "text": part.text}
+            for index, part in enumerate(parts, start=1)
+        ]
+    }
+
+
 def _request_kwargs(
     settings: Settings,
-    batch: list[TranscriptSegment],
+    batch: list[TranscriptSegment | DialogueSentence],
     ids: list[str],
     *,
     context: str | None = None,
@@ -609,6 +738,10 @@ def _request_kwargs(
     supplied, the number of syllables it may use: a faithful translation of an
     English line routinely needs more time than the original took, so the line is
     asked to fit *before* it is synthesized rather than stretched afterwards.
+
+    A sentence that was assembled from several transcribed segments also carries
+    those segments as ``parts``. They are not translation units - the whole line is
+    - and exist so the model can say how the delivery changes across the sentence.
     """
 
     payload: dict[str, Any] = {
@@ -623,6 +756,7 @@ def _request_kwargs(
                     if budgets is not None
                     else {}
                 ),
+                **_parts_payload(segment),
             }
             for segment, line_id, budget in zip(
                 batch, ids, budgets if budgets is not None else (None,) * len(batch)
@@ -859,7 +993,101 @@ def _parse_response(content: str, ids: list[str]) -> dict[str, Any]:
     return found
 
 
-def _build(segment: TranscriptSegment, line_id: str, line: Any) -> AdaptedDialogue:
+def _beats_from(
+    raw: Any,
+    parts: Sequence[Any],
+    *,
+    fallback: tuple[str, float, str],
+) -> tuple[PerformanceBeat, ...]:
+    """Return the model's per-part direction on the parts' own timeline.
+
+    A single-segment line has no beats: its direction *is* the line's direction.
+    When a line was assembled from several parts, each part must be covered, because
+    an uncovered part is exactly the flattening this exists to prevent - the dialogue
+    model is required to return one entry per part. A part the model simply omitted
+    inherits the line's direction rather than failing a whole run, but a structural
+    error (an unknown or repeated part number) is reported as invalid model output:
+    the application will not guess which part was meant.
+    """
+
+    if len(parts) < 2:
+        return ()
+    if raw is None:
+        return tuple(
+            PerformanceBeat(
+                start=part.start,
+                end=part.end,
+                emotion=fallback[0],
+                intensity=fallback[1],
+                delivery=fallback[2],
+            )
+            for part in parts
+        )
+    if not isinstance(raw, list):
+        raise InvalidModelOutputError(
+            "the model returned 'beats' that is not a list of performance beats"
+        )
+
+    by_part: dict[int, PerformanceBeat] = {}
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise InvalidModelOutputError(
+                f"a performance beat is a JSON {type(entry).__name__}, expected an object"
+            )
+        number = entry.get("part")
+        # JSON has one number type, so a model may well answer 1.0 for part 1.
+        # Rejecting that would fail a whole film over a formatting detail.
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or not float(number).is_integer()
+        ):
+            raise InvalidModelOutputError(
+                f"a performance beat has part {number!r}, expected a part number"
+            )
+        number = int(number)
+        if not 1 <= number <= len(parts):
+            raise InvalidModelOutputError(
+                f"a performance beat names part {number}, but the line has "
+                f"{len(parts)} part(s)"
+            )
+        if number in by_part:
+            raise InvalidModelOutputError(
+                f"the model returned part {number} more than once"
+            )
+        part = parts[number - 1]
+        try:
+            by_part[number] = PerformanceBeat(
+                start=part.start,
+                end=part.end,
+                emotion=entry.get("emotion"),
+                intensity=entry.get("intensity"),
+                delivery=entry.get("delivery"),
+            )
+        except InvalidSegmentError as exc:
+            raise InvalidModelOutputError(
+                f"the model returned an unusable performance beat for part "
+                f"{number}: {exc}"
+            ) from exc
+
+    return tuple(
+        by_part.get(
+            number,
+            PerformanceBeat(
+                start=part.start,
+                end=part.end,
+                emotion=fallback[0],
+                intensity=fallback[1],
+                delivery=fallback[2],
+            ),
+        )
+        for number, part in enumerate(parts, start=1)
+    )
+
+
+def _build(
+    segment: TranscriptSegment | DialogueSentence, line_id: str, line: Any
+) -> AdaptedDialogue:
     """Combine the model's adaptation with the application-owned metadata.
 
     Identity and timing come from ``segment``, never from the model, so a model
@@ -869,6 +1097,15 @@ def _build(segment: TranscriptSegment, line_id: str, line: Any) -> AdaptedDialog
     """
 
     try:
+        beats = _beats_from(
+            line.get("beats"),
+            getattr(segment, "parts", ()),
+            fallback=(
+                _required_text("emotion", line.get("emotion")),
+                _finite_number("intensity", line.get("intensity")),
+                _required_text("delivery", line.get("delivery")),
+            ),
+        )
         return AdaptedDialogue(
             speaker_id=segment.speaker_id,
             start=segment.start,
@@ -880,6 +1117,7 @@ def _build(segment: TranscriptSegment, line_id: str, line: Any) -> AdaptedDialog
             delivery=line.get("delivery"),
             pause_before=line.get("pause_before"),
             pause_after=line.get("pause_after"),
+            beats=beats,
         )
     except InvalidSegmentError as exc:
         raise InvalidModelOutputError(
@@ -921,7 +1159,7 @@ def describe_fallback(settings: Settings) -> str:
 
 def _adapt_batch(
     failover: _SingleRequest,
-    batch: list[TranscriptSegment],
+    batch: list[TranscriptSegment | DialogueSentence],
     ids: list[str],
     *,
     context: str | None = None,
@@ -1036,7 +1274,7 @@ def _is_improvement(
 
 def _reduce_overshooting_lines(
     failover: _SingleRequest,
-    batch: list[TranscriptSegment],
+    batch: list[TranscriptSegment | DialogueSentence],
     first_position: int,
     adapted: list[AdaptedDialogue],
     budgets: Sequence[SyllableBudget],
@@ -1170,7 +1408,7 @@ def _reduce_overshooting_lines(
 
 def _reduce_again(
     failover: _SingleRequest,
-    batch: list[TranscriptSegment],
+    batch: list[TranscriptSegment | DialogueSentence],
     first_position: int,
     adapted: list[AdaptedDialogue],
     budgets: Sequence[SyllableBudget],
@@ -1289,7 +1527,7 @@ NEUTRAL_PAUSE = 0.0
 
 
 def _adapt_with_nllb(
-    transcript: list[TranscriptSegment],
+    transcript: list[TranscriptSegment | DialogueSentence],
     *,
     settings: Settings,
     translator: Any | None = None,
@@ -1343,7 +1581,7 @@ def _adapt_with_nllb(
 
 
 def adapt_dialogue(
-    segments: Iterable[TranscriptSegment],
+    segments: Iterable[TranscriptSegment | DialogueSentence],
     *,
     settings: Settings | None = None,
     scenes: Sequence[Scene] | None = None,
@@ -1366,9 +1604,13 @@ def adapt_dialogue(
     Parameters
     ----------
     segments:
-        The lines returned by :func:`app.pipeline.transcription.transcribe`. They
-        are processed in chronological order and each one keeps its speaker id
-        and timestamps verbatim.
+        The dialogue units from
+        :func:`app.pipeline.transcription.assemble_sentences` - one complete
+        sentence per unit, assembled from the transcriber's pause-delimited
+        segments - or raw
+        :class:`~app.pipeline.transcription.TranscriptSegment` lines. They are
+        processed in chronological order and each one keeps its speaker id and
+        timestamps verbatim.
     settings:
         Project settings override; defaults to :func:`app.config.get_settings`.
         The backend, API key, base URL, model, batch size and thinking toggle all
@@ -1562,6 +1804,7 @@ __all__ = [
     "InvalidTranscriptSegmentsError",
     "MalformedResponseError",
     "MissingApiKeyError",
+    "PerformanceBeat",
     "TranslationError",
     "adapt_dialogue",
     "describe_thinking",

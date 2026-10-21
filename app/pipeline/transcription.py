@@ -11,6 +11,12 @@ Each diarized region is transcribed on its own, so every line is attributed to
 the speaker who actually said it instead of being guessed afterwards from a
 whole-movie transcript.
 
+Those segments are pause-delimited, not sentence-delimited, so
+:func:`assemble_sentences` turns them into the :class:`DialogueSentence` units the
+rest of the pipeline adapts and speaks. A sentence keeps every timestamp of its
+parts, and the parts stay available for the performance metadata that genuinely
+changes inside one thought.
+
 Timing model
 ------------
 faster-whisper is handed the samples of a single diarized region, so the
@@ -523,11 +529,236 @@ def transcribe(
     return transcribed
 
 
+# ---------------------------------------------------------------------------
+# Sentences
+# ---------------------------------------------------------------------------
+
+#: Longest pause between two transcribed segments that can still belong to the
+#: same sentence, in seconds.
+#:
+#: Whisper segments on pauses, not on grammar, so one spoken sentence routinely
+#: arrives as several segments. A pause longer than this is treated as the end of
+#: the thought whatever the words look like, so a beat in the scene is never
+#: swallowed into one run-on utterance.
+MAX_SENTENCE_GAP_SECONDS = 2.0
+
+#: Longest span one assembled sentence may cover, and the largest number of
+#: transcribed segments it may join. Both are safety valves for a transcript with
+#: sparse punctuation: without them a monologue would collapse into one unit that
+#: no longer fits the timing model.
+MAX_SENTENCE_SECONDS = 12.0
+MAX_SENTENCE_PARTS = 6
+
+#: Characters that end a sentence in the languages this pipeline transcribes.
+_TERMINAL_PUNCTUATION = (".", "!", "?", "\u2026", "\u1362", "\u1367")
+
+#: Decoration that can sit outside a sentence's own punctuation.
+_WRAPPING = "\"'\u201d\u2019\u2018\u201c\u00ab\u00bb()[]"
+
+
+def _without_wrapping(text: str) -> str:
+    """Return ``text`` stripped of surrounding whitespace and quotation marks."""
+
+    return text.strip().strip(_WRAPPING)
+
+
+def _ends_sentence(text: str) -> bool:
+    """Return whether ``text`` already ends with terminal punctuation."""
+
+    stripped = _without_wrapping(text)
+    return bool(stripped) and stripped[-1] in _TERMINAL_PUNCTUATION
+
+
+def _starts_mid_sentence(text: str) -> bool:
+    """Return whether ``text`` begins as a continuation rather than a new sentence.
+
+    A lowercase first letter is what a transcriber writes when it believes the
+    previous segment was still the same sentence, so it is the one cue that
+    survives even when every segment carries a full stop.
+    """
+
+    stripped = text.strip().lstrip(_WRAPPING)
+    return bool(stripped) and stripped[0].isalpha() and stripped[0].islower()
+
+
+def _last_written_index(text: str) -> int:
+    """Return the index of the last character that is not wrapping decoration."""
+
+    index = len(text) - 1
+    while index >= 0 and text[index] in _WRAPPING:
+        index -= 1
+    return index
+
+
+def _join_sentence_parts(parts: Sequence[TranscriptSegment]) -> str:
+    """Return the text of ``parts`` as one sentence.
+
+    The boundary between two parts of one sentence is not a sentence end, so a
+    full stop a transcriber put there becomes a comma. Question and exclamation
+    marks are left alone: they carry the speaker's intent, not the segmenter's
+    opinion.
+    """
+
+    joined: list[str] = []
+    for part in parts:
+        text = part.text.strip()
+        if joined and _starts_mid_sentence(text):
+            previous = joined[-1]
+            index = _last_written_index(previous)
+            if index >= 0 and previous[index] == ".":
+                joined[-1] = previous[:index] + "," + previous[index + 1 :]
+        joined.append(text)
+    return " ".join(joined)
+
+
+@dataclass(frozen=True, slots=True)
+class DialogueSentence:
+    """One complete spoken thought, assembled from transcribed segments.
+
+    A :class:`TranscriptSegment` is a *pause-delimited* unit, not a sentence, and
+    the difference is audible: translating and synthesizing each segment on its
+    own turns one thought into several utterances, each with its own final
+    intonation and its own full stop. This type is the sentence.
+
+    Its ``parts`` are kept because the performance genuinely varies inside a
+    sentence - a line can start neutral and end accusing - and that is metadata
+    the dialogue model reports per part. ``start`` and ``end`` span the first and
+    last part, so the original timing is preserved exactly; the gaps between parts
+    are part of the span and are what the sentence may use to be spoken.
+    """
+
+    speaker_id: str
+    start: float
+    end: float
+    text: str
+    parts: tuple[TranscriptSegment, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.speaker_id, str) or not self.speaker_id.strip():
+            raise InvalidSegmentError("speaker_id must be a non-empty string")
+
+        start = _strict_seconds("start", self.start)
+        end = _strict_seconds("end", self.end)
+
+        if start < 0:
+            raise InvalidSegmentError(f"start must be >= 0 seconds, got {start}")
+        if end <= start:
+            raise InvalidSegmentError(
+                f"end must be greater than start ({start} seconds), got {end}"
+            )
+
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise InvalidSegmentError("text must be a non-empty string")
+
+        parts = tuple(self.parts)
+        if not parts:
+            raise InvalidSegmentError("a sentence needs at least one part")
+        for index, part in enumerate(parts):
+            if not isinstance(part, TranscriptSegment):
+                raise InvalidSegmentError(
+                    f"parts[{index}] is {type(part).__name__}, expected a TranscriptSegment"
+                )
+            if part.speaker_id != self.speaker_id:
+                raise InvalidSegmentError(
+                    f"parts[{index}] belongs to {part.speaker_id!r}, not {self.speaker_id!r}"
+                )
+
+        object.__setattr__(self, "start", start)
+        object.__setattr__(self, "end", end)
+        object.__setattr__(self, "text", self.text.strip())
+        object.__setattr__(self, "parts", parts)
+
+    @property
+    def duration(self) -> float:
+        """Length of the sentence's span in seconds, gaps included."""
+
+        return self.end - self.start
+
+
+def assemble_sentences(
+    segments: Iterable[TranscriptSegment],
+) -> list[DialogueSentence]:
+    """Group transcribed segments into complete sentences.
+
+    The rules are deliberately textual first and temporal second, because a pause
+    is a performance choice while a sentence boundary is a grammatical one:
+
+    * segments of different speakers never join;
+    * a segment that does not end with terminal punctuation continues;
+    * a segment whose text starts mid-sentence (lowercase) continues, which is
+      how a transcriber marks "the same sentence, split at a pause";
+    * otherwise the sentence ends;
+    * a pause longer than :data:`MAX_SENTENCE_GAP_SECONDS`, a span longer than
+      :data:`MAX_SENTENCE_SECONDS` or more than :data:`MAX_SENTENCE_PARTS` parts
+      ends it regardless.
+
+    The result is chronological and keeps every timestamp of the input: the
+    first part's ``start`` and the last part's ``end`` become the sentence's.
+    """
+
+    if isinstance(segments, (str, bytes)) or not isinstance(segments, Iterable):
+        raise InvalidSegmentError(
+            "segments must be an iterable of TranscriptSegment objects, got "
+            f"{type(segments).__name__}"
+        )
+
+    ordered = list(segments)
+    for index, segment in enumerate(ordered):
+        if not isinstance(segment, TranscriptSegment):
+            raise InvalidSegmentError(
+                f"segments[{index}] is {type(segment).__name__}, expected a TranscriptSegment"
+            )
+    ordered.sort(key=lambda segment: (segment.start, segment.end, segment.speaker_id))
+
+    sentences: list[DialogueSentence] = []
+    parts: list[TranscriptSegment] = []
+
+    def flush() -> None:
+        if parts:
+            sentences.append(
+                DialogueSentence(
+                    speaker_id=parts[0].speaker_id,
+                    start=parts[0].start,
+                    end=parts[-1].end,
+                    text=_join_sentence_parts(parts),
+                    parts=tuple(parts),
+                )
+            )
+            parts.clear()
+
+    for segment in ordered:
+        if not parts:
+            parts.append(segment)
+            continue
+        previous = parts[-1]
+        continues = (
+            segment.speaker_id == previous.speaker_id
+            and segment.start - previous.end <= MAX_SENTENCE_GAP_SECONDS
+            and len(parts) < MAX_SENTENCE_PARTS
+            and segment.end - parts[0].start <= MAX_SENTENCE_SECONDS
+            and (
+                not _ends_sentence(previous.text)
+                or _starts_mid_sentence(segment.text)
+            )
+        )
+        if continues:
+            parts.append(segment)
+        else:
+            flush()
+            parts.append(segment)
+    flush()
+    return sentences
+
+
 __all__ = [
+    "MAX_SENTENCE_GAP_SECONDS",
+    "MAX_SENTENCE_PARTS",
+    "MAX_SENTENCE_SECONDS",
     "MIN_REGION_SECONDS",
     "SAMPLE_RATE",
     "WORD_TIMESTAMPS",
     "AudioDecodeError",
+    "DialogueSentence",
     "InvalidInputError",
     "InvalidSegmentError",
     "InvalidSpeakerSegmentsError",
@@ -537,6 +768,7 @@ __all__ = [
     "TranscriptionError",
     "TranscriptionInferenceError",
     "UnsupportedOutputError",
+    "assemble_sentences",
     "build_amharic_transcriber",
     "transcribe",
 ]

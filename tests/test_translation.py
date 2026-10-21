@@ -2102,3 +2102,171 @@ def test_nllb_does_not_attempt_a_second_translation() -> None:
 
     assert engine.calls == [None]
     assert dialogue[0].amharic == over
+
+
+# ---------------------------------------------------------------------------
+# one sentence, several performances
+# ---------------------------------------------------------------------------
+
+
+def _sentence(*segments, speaker="SPEAKER_00"):
+    from app.pipeline.transcription import DialogueSentence
+
+    parts = tuple(segments)
+    return DialogueSentence(
+        speaker_id=speaker,
+        start=parts[0].start,
+        end=parts[-1].end,
+        text=" ".join(part.text for part in parts),
+        parts=parts,
+    )
+
+
+def test_a_sentence_is_sent_as_one_line_with_its_parts(monkeypatch):
+    """The line is the sentence; the parts only describe how it is performed.
+
+    Sending the parts as separate lines is what made one thought become several
+    utterances, each with its own final intonation.
+    """
+
+    _patch(monkeypatch)
+    sentence = _sentence(
+        _segment(start=0.0, end=1.5, text="It is the world"),
+        _segment(start=1.6, end=4.0, text="that has been pulled over your eyes."),
+    )
+
+    adapt_dialogue([sentence], settings=_settings())
+
+    payload = json.loads(FakeOpenAI.requests[0]["messages"][1]["content"])
+    assert len(payload["lines"]) == 1
+    line = payload["lines"][0]
+    assert line["text"].startswith("It is the world")
+    assert line["duration"] == pytest.approx(4.0)
+    assert [part["part"] for part in line["parts"]] == [1, 2]
+    assert [part["text"] for part in line["parts"]] == [
+        "It is the world",
+        "that has been pulled over your eyes.",
+    ]
+
+
+def test_a_single_segment_line_carries_no_parts(monkeypatch):
+    """There is no boundary to describe, and listing one would invite a split."""
+
+    _patch(monkeypatch)
+
+    adapt_dialogue([_segment()], settings=_settings())
+
+    payload = json.loads(FakeOpenAI.requests[0]["messages"][1]["content"])
+    assert "parts" not in payload["lines"][0]
+
+
+def test_beats_keep_the_timing_of_each_part(monkeypatch):
+    """The performance changes inside the sentence, and the manifest keeps where."""
+
+    _patch(monkeypatch)
+    sentence = _sentence(
+        _segment(start=0.0, end=1.5, text="It is the world"),
+        _segment(start=1.6, end=4.0, text="that has been pulled over your eyes."),
+    )
+
+    def add_beats(body):
+        body["lines"][0]["beats"] = [
+            {"part": 1, "emotion": "mysterious", "intensity": 0.4, "delivery": "quiet"},
+            {"part": 2, "emotion": "intense", "intensity": 0.8, "delivery": "accusing"},
+        ]
+        return body
+
+    FakeOpenAI.transform = add_beats
+
+    (adapted,) = adapt_dialogue([sentence], settings=_settings())
+
+    assert [(beat.start, beat.end) for beat in adapted.beats] == [(0.0, 1.5), (1.6, 4.0)]
+    assert [beat.emotion for beat in adapted.beats] == ["mysterious", "intense"]
+    assert adapted.beats[1].delivery == "accusing"
+
+
+def test_a_missing_beat_inherits_the_sentence_direction(monkeypatch):
+    """The line's own direction is a usable fallback; guessing a part's is not."""
+
+    _patch(monkeypatch)
+    sentence = _sentence(
+        _segment(start=0.0, end=1.5, text="I never said"),
+        _segment(start=1.6, end=3.0, text="that."),
+    )
+
+    def only_one_beat(body):
+        body["lines"][0]["emotion"] = "stern"
+        body["lines"][0]["intensity"] = 0.9
+        body["lines"][0]["delivery"] = "flat and hard"
+        body["lines"][0]["beats"] = [
+            {"part": 2, "emotion": "angry", "intensity": 0.9, "delivery": "raised"},
+        ]
+        return body
+
+    FakeOpenAI.transform = only_one_beat
+
+    (adapted,) = adapt_dialogue([sentence], settings=_settings())
+
+    assert [beat.emotion for beat in adapted.beats] == ["stern", "angry"]
+
+
+def test_an_unknown_part_number_is_reported(monkeypatch):
+    _patch(monkeypatch)
+    sentence = _sentence(
+        _segment(start=0.0, end=1.5, text="one"),
+        _segment(start=1.6, end=3.0, text="two"),
+    )
+
+    def bad_beats(body):
+        body["lines"][0]["beats"] = [
+            {"part": 7, "emotion": "angry", "intensity": 0.9, "delivery": "raised"},
+        ]
+        return body
+
+    FakeOpenAI.transform = bad_beats
+
+    with pytest.raises(InvalidModelOutputError, match="part 7"):
+        adapt_dialogue([sentence], settings=_settings())
+
+
+def test_a_repeated_part_number_is_reported(monkeypatch):
+    _patch(monkeypatch)
+    sentence = _sentence(
+        _segment(start=0.0, end=1.5, text="one"),
+        _segment(start=1.6, end=3.0, text="two"),
+    )
+
+    def repeated(body):
+        body["lines"][0]["beats"] = [
+            {"part": 1, "emotion": "angry", "intensity": 0.5, "delivery": "raised"},
+            {"part": 1, "emotion": "sad", "intensity": 0.5, "delivery": "quiet"},
+        ]
+        return body
+
+    FakeOpenAI.transform = repeated
+
+    with pytest.raises(InvalidModelOutputError, match="more than once"):
+        adapt_dialogue([sentence], settings=_settings())
+
+
+def test_a_whole_number_part_index_is_accepted(monkeypatch):
+    """JSON has one number type; 1.0 means part 1, not a malformed response."""
+
+    _patch(monkeypatch)
+    sentence = _sentence(
+        _segment(start=0.0, end=1.5, text="one"),
+        _segment(start=1.6, end=3.0, text="two"),
+    )
+
+    def float_parts(body):
+        body["lines"][0]["beats"] = [
+            {"part": 1.0, "emotion": "calm", "intensity": 0.3, "delivery": "level"},
+            {"part": 2.0, "emotion": "angry", "intensity": 0.8, "delivery": "raised"},
+        ]
+        return body
+
+    FakeOpenAI.transform = float_parts
+
+    (adapted,) = adapt_dialogue([sentence], settings=_settings())
+
+    assert [beat.emotion for beat in adapted.beats] == ["calm", "angry"]

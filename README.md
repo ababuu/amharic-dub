@@ -22,7 +22,8 @@ flowchart LR
     V["Source video"] --> SEP["Source separation<br/>BS-Roformer via audio-separator"]
     SEP -->|dialogue| DIA["Speaker diarization<br/>pyannote Community-1"]
     DIA --> ASR["Transcription<br/>faster-whisper large-v3"]
-    ASR --> TR["Adapt + translate to Amharic<br/>NLLB-200 3.3B or an LLM with<br/>scene + character bible"]
+    ASR --> SEN["Sentence assembly<br/>one unit per spoken thought"]
+    SEN --> TR["Adapt + translate to Amharic<br/>NLLB-200 3.3B or an LLM with<br/>scene + character bible"]
     TR --> VP["Voice profiles<br/>best clean reference per speaker"]
     VP --> TTS["Speech synthesis<br/>OmniVoice cloned voice per character"]
     TTS --> TIM["Timing alignment"]
@@ -331,7 +332,7 @@ amharic-dub/
       __init__.py
       separation.py           # audio-separator BS-Roformer separation (implemented)
       diarization.py          # pyannote Community-1 diarization (implemented)
-      transcription.py        # faster-whisper large-v3 transcription (implemented)
+      transcription.py        # faster-whisper large-v3 transcription + sentence assembly (implemented)
       translation.py          # Amharic dialogue adaptation (backend-selecting) (implemented)
       voice_profiles.py       # per-speaker voice references + clone-prompt cache (implemented)
       nllb.py                 # local NLLB-200 translation (default backend) (implemented)
@@ -822,6 +823,14 @@ OmniVoice speaks each line in the voice cloned from that character's own referen
 recording, so there is no conversion step - see
 [Choosing a speech engine](#choosing-a-speech-engine).
 
+**One line is one sentence, and one clip.** The unit handed to the engine is the
+assembled sentence described above, so a thought is synthesized in a single call and
+keeps its intonation from beginning to end; the sub-sentence pauses the transcriber
+saw are part of the sentence's span, not clip boundaries. `TtsClip` records the
+line's `beats` when it has any - the same timestamped emotion/intensity/delivery
+metadata the dialogue model returned per part - so the performance arc survives into
+the manifest even though the current engine cannot act on it.
+
 `VoiceProfile.reference_audio` is the only reference this stage reads, and it is what
 makes a character sound like themselves across a film: the same reference for every
 line of a speaker is the whole mechanism. A `VoiceProfile` is never modified by this
@@ -1001,6 +1010,54 @@ re-listening to it.
 speech synthesis on purpose: it exists to validate the GPU stages on a new
 machine, and the stages after it need no GPU. Run the orchestrator afterwards to
 get the MP4 - it reuses the clips the runner already wrote.
+
+### One sentence, one utterance (`transcription.py`, `translation.py`, `tts.py`)
+
+A transcriber segments on **pauses**, not on grammar. One spoken sentence routinely
+arrives as several segments - the actor breathes, and Whisper starts a new segment
+with its own full stop - and if each segment becomes a translation unit, a TTS call
+and a clip, the listener hears the thought broken into several utterances, each with
+its own final intonation. That is a delivery defect no amount of translation quality
+can hide.
+
+`assemble_sentences` therefore runs between transcription and adaptation and turns
+the pause-delimited segments into **sentences**:
+
+* segments of different speakers never join;
+* a segment with no terminal punctuation continues;
+* a segment that starts mid-sentence (lowercase) continues, which is how a
+  transcriber marks "same sentence, split at a pause";
+* otherwise the sentence ends;
+* a pause longer than `MAX_SENTENCE_GAP_SECONDS` (2 s), a span longer than
+  `MAX_SENTENCE_SECONDS` (12 s) or more than `MAX_SENTENCE_PARTS` (6) segments ends
+  it regardless, so a sparsely punctuated monologue cannot collapse into one
+  unbounded unit.
+
+The sentence - not the segment - is then the **translation unit** and the
+**synthesis unit**. Its span is the first part's start to the last part's end, so
+the original timing, including the pauses inside the sentence, is preserved exactly;
+the parts stay attached as **beats** (see below).
+
+The three boundaries are deliberately not the same thing:
+
+| Boundary | What it is | Who owns it |
+| --- | --- | --- |
+| Sentence | a complete spoken thought | `assemble_sentences` |
+| Beat | a stretch of a sentence with its own emotion/intensity/delivery | the dialogue model, per part |
+| Synthesis unit | what is handed to the voice | the sentence |
+
+Emotion is still detected *inside* a sentence, not once per sentence: the request
+carries the sentence's `parts`, and the response returns one `beats` entry per part.
+Each beat keeps that part's original timestamps, so the manifest says not only *what*
+the performance did but *when*. OmniVoice has no control that can act on emotion
+inside one call - it clones a timbre and takes no style input, and the Amharic
+checkpoint was trained without style instructions - so beats are recorded rather than
+synthesized. Synthesizing each beat separately, which is what the pipeline used to
+do, buys no expressiveness from this engine and costs the prosody of the sentence.
+
+Amharic punctuation follows the sentence, too: the model is asked for one final stop
+per line and commas for the breaths inside it, rather than a full stop at every
+pause the transcriber saw.
 
 ### Cinematic dialogue adaptation (`dialogue_context.py`, `translation.py`)
 

@@ -874,3 +874,124 @@ def test_non_finite_whisper_timestamp_is_reported(monkeypatch, tmp_path):
             [_region("SPEAKER_00", 0.0, 2.0)],
             settings=_settings(tmp_path),
         )
+
+
+# ---------------------------------------------------------------------------
+# sentences: one thought, however many pauses the transcriber split it at
+# ---------------------------------------------------------------------------
+
+
+def _segment(start: float, end: float, text: str, speaker: str = "SPEAKER_00") -> TranscriptSegment:
+    return TranscriptSegment(speaker_id=speaker, start=start, end=end, text=text)
+
+
+def test_a_sentence_split_at_a_pause_is_one_sentence() -> None:
+    """The transcriber segments on pauses; the sentence, not the segment, is the unit."""
+
+    sentences = transcription.assemble_sentences(
+        [
+            _segment(0.0, 2.0, "It is the world"),
+            _segment(2.5, 5.0, "that has been pulled over your eyes."),
+        ]
+    )
+
+    assert len(sentences) == 1
+    sentence = sentences[0]
+    assert sentence.text == "It is the world that has been pulled over your eyes."
+    assert (sentence.start, sentence.end) == (0.0, 5.0)
+    assert len(sentence.parts) == 2
+
+
+def test_a_lowercase_continuation_joins_even_after_a_full_stop() -> None:
+    """A transcriber writes a full stop it does not believe, and lowercases the rest."""
+
+    sentences = transcription.assemble_sentences(
+        [
+            _segment(0.0, 2.0, "You can see it when you look out your window."),
+            _segment(2.4, 4.0, "or when you turned on your television."),
+        ]
+    )
+
+    assert len(sentences) == 1
+    assert (
+        sentences[0].text
+        == "You can see it when you look out your window, "
+        "or when you turned on your television."
+    )
+
+
+def test_two_capitalised_sentences_stay_two() -> None:
+    sentences = transcription.assemble_sentences(
+        [
+            _segment(0.0, 1.0, "The matrix is everywhere."),
+            _segment(1.4, 2.4, "It is all around us."),
+        ]
+    )
+
+    assert [sentence.text for sentence in sentences] == [
+        "The matrix is everywhere.",
+        "It is all around us.",
+    ]
+
+
+def test_a_different_speaker_always_starts_a_sentence() -> None:
+    sentences = transcription.assemble_sentences(
+        [
+            _segment(0.0, 1.0, "Are you ready"),
+            _segment(1.1, 2.0, "yes I am.", speaker="SPEAKER_01"),
+        ]
+    )
+
+    assert [sentence.speaker_id for sentence in sentences] == ["SPEAKER_00", "SPEAKER_01"]
+
+
+def test_a_long_pause_ends_a_sentence_whatever_the_words_say() -> None:
+    """Two seconds of silence is a beat in the scene, not a comma."""
+
+    sentences = transcription.assemble_sentences(
+        [
+            _segment(0.0, 1.0, "I never said that"),
+            _segment(4.0, 5.0, "and I never would."),
+        ]
+    )
+
+    assert len(sentences) == 2
+
+
+def test_a_sentence_never_grows_past_its_caps() -> None:
+    """An unpunctuated monologue must not become one unbounded unit."""
+
+    transcript = [
+        _segment(float(i), float(i) + 2.0, "and then the thing happened")
+        for i in range(0, 40, 2)
+    ]
+
+    sentences = transcription.assemble_sentences(transcript)
+
+    assert len(sentences) > 1
+    assert all(
+        sentence.duration <= transcription.MAX_SENTENCE_SECONDS
+        for sentence in sentences
+    )
+    assert all(
+        len(sentence.parts) <= transcription.MAX_SENTENCE_PARTS
+        for sentence in sentences
+    )
+
+
+def test_no_segments_means_no_sentences() -> None:
+    assert transcription.assemble_sentences([]) == []
+
+
+def test_a_sentence_rejects_parts_from_another_speaker() -> None:
+    with pytest.raises(InvalidSegmentError, match="belongs to"):
+        transcription.DialogueSentence(
+            speaker_id="SPEAKER_00",
+            start=0.0,
+            end=2.0,
+            text="hello",
+            parts=(
+                _segment(0.0, 1.0, "hello"),
+                _segment(1.0, 2.0, "there", speaker="SPEAKER_01"),
+            ),
+        )
