@@ -968,7 +968,7 @@ class HuggingFaceRowSource:
         token: str | None = None,
         timeout: float = 120.0,
         page_delay: float = PAGE_DELAY_SECONDS,
-        attempts: int = 4,
+        attempts: int = 6,
         backoff: float = 1.5,
     ) -> None:
         self.dataset = dataset
@@ -991,10 +991,15 @@ class HuggingFaceRowSource:
     def _get(self, url: str) -> bytes:
         """Return ``url``'s bytes, retrying the failures that are worth retrying.
 
-        A full scan is hundreds of requests to a shared public endpoint, so a
-        single 502 or 429 must not throw away the pages already scanned. Only
-        server-side and rate-limit statuses are retried; a 401 or 404 is a real
-        answer and is raised immediately.
+        A full scan is dozens of requests to a shared public endpoint, so a single 502
+        or 429 must not throw away the pages already scanned. Only server-side and
+        rate-limit statuses are retried; a 401 or 404 is a real answer and is raised
+        immediately.
+
+        A rate limit is not a server fault, so it is waited out on its own terms: the
+        server's ``Retry-After`` is honoured when it sends one, and otherwise the delay
+        grows geometrically (1.5s, 3s, 6s, ...). Retrying a 429 after a fixed 1.5s just
+        spends the whole retry budget inside the window that is limiting us.
         """
 
         last_error = ""
@@ -1014,15 +1019,29 @@ class HuggingFaceRowSource:
                         f"Hugging Face returned HTTP {exc.code} for {url}{hint}"
                     ) from exc
                 last_error = f"HTTP {exc.code}"
+                if attempt < self._attempts:
+                    time.sleep(self._retry_delay(exc, attempt))
+                continue
             except urllib.error.URLError as exc:
                 last_error = str(exc)
 
             if attempt < self._attempts:
-                time.sleep(self._backoff * attempt)
+                time.sleep(self._backoff * (2 ** (attempt - 1)))
 
         raise BankBuildError(
             f"could not read {url} after {self._attempts} attempts: {last_error}"
         )
+
+    def _retry_delay(self, error: urllib.error.HTTPError, attempt: int) -> float:
+        """Return how long to wait before retrying ``error``."""
+
+        header = error.headers.get("Retry-After") if error.headers else None
+        if header:
+            try:
+                return max(0.0, float(header))
+            except ValueError:
+                pass
+        return self._backoff * (2 ** (attempt - 1))
 
     def _describe(self) -> None:
         """Record the dataset revision and license, when the API offers them."""
@@ -1164,6 +1183,15 @@ def _voice_id(gender: str, speaker: str, taken: set[str]) -> str:
         candidate = f"{base}-{counter}"
         counter += 1
     return candidate
+
+
+def _balance_unmet(best: Mapping[str, _Candidate], balance: bool) -> bool:
+    """Return whether a bank would still be one-sided with the speakers found so far."""
+
+    if not balance:
+        return False
+    genders = {candidate.gender for candidate in best.values()}
+    return not {"male", "female"} <= genders
 
 
 def _select_cast(
@@ -1315,7 +1343,18 @@ def build_voice_bank(
         offset += len(page)
         pages += 1
         if max_pages is not None and pages >= max_pages:
-            break
+            # A page limit exists to make a build quick, not to make it silently
+            # one-sided. This corpus stores each speaker's clips together, so a short
+            # scan can hold only one gender - and a bank like that casts every
+            # character, women included, in a man's voice. So the scan continues until
+            # both genders are represented, or until the split runs out.
+            if not _balance_unmet(best, balance_genders):
+                break
+            if pages == max_pages:
+                say(
+                    "  only one gender found in the first "
+                    f"{max_pages} page(s); scanning further to keep the cast mixed"
+                )
 
     say(f"accepted {accepted} row(s) from {len(best)} distinct speaker(s)")
     for reason, count in sorted(rejected.items(), key=lambda item: -item[1]):
@@ -1325,6 +1364,15 @@ def build_voice_bank(
         raise BankBuildError(
             "no row in the corpus passed the filters; loosen BankFilters or choose "
             "another corpus"
+        )
+
+    if balance_genders and _balance_unmet(best, balance_genders):
+        available = sorted({candidate.gender for candidate in best.values()})
+        say(
+            "  only "
+            + " and ".join(available)
+            + " voices were found in the whole corpus, so every character will be "
+            "cast in one of them"
         )
 
     cast = _select_cast(

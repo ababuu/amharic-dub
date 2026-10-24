@@ -786,7 +786,11 @@ def test_no_bank_keeps_the_films_own_references(tmp_path: Path, stages: Stages) 
 
     run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
 
-    assert "casting" not in " ".join(messages)
+    reported = " ".join(messages)
+    # The absence is stated, with where it looked: the bank is a build artifact, so a
+    # silent fall back to the actor's voice is the likeliest way to think casting ran.
+    assert "voice bank: none at" in reported
+    assert "casting from a native-Amharic bank" not in reported
     (_turns, _speech, _transcript, _passed, require_transcript) = stages.received[
         "voice_profiles"
     ]
@@ -1080,6 +1084,93 @@ def test_cli_returns_zero_on_a_complete_run(
 
     assert code == 0
     assert (tmp_path / "run" / MANIFEST_FILENAME).is_file()
+
+
+def test_cast_from_bank_builds_a_missing_bank_before_the_run(
+    tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh checkout has no bank, so the flag has to be able to create one.
+
+    The bank is a build artifact - deliberately not committed - which makes "I asked for
+    casting and got the actor's voice" the easy mistake on a new pod. This is the flag
+    that removes the extra manual step; the network is stubbed by the fake source.
+    """
+
+    from app.pipeline import voice_bank as vb
+
+    monkeypatch.setattr(orchestrator, "get_settings", lambda: _settings(tmp_path))
+
+    built: list[Path] = []
+
+    def fake_build(*, destination, settings, **kwargs):
+        built.append(Path(destination))
+        Path(destination).mkdir(parents=True, exist_ok=True)
+        clip = Path(destination) / "clips" / "am-m-test.wav"
+        clip.parent.mkdir(parents=True, exist_ok=True)
+        import numpy as np
+        import soundfile as sf
+
+        rate = 24_000
+        seconds = 5.0
+        time = np.arange(int(seconds * rate)) / rate
+        sf.write(
+            str(clip),
+            (0.2 * np.sin(2 * np.pi * 120.0 * time)).astype(np.float32),
+            rate,
+            subtype="PCM_16",
+        )
+        voice = vb.BankVoice(
+            voice_id="am-m-test",
+            audio=clip,
+            text="ዛሬ ጠዋት አዲስ አበባ ውስጥ በጣም ቀዝቃዛ አየር ነበር",
+            duration=seconds,
+            gender="male",
+            presentation="masculine",
+            pitch_hz=118.0,
+        )
+        bank = vb.VoiceBank(directory=Path(destination), voices=(voice,))
+        (Path(destination) / vb.BANK_MANIFEST_FILENAME).write_text(
+            json.dumps(bank.to_dict()), encoding="utf-8"
+        )
+        return bank
+
+    monkeypatch.setattr(orchestrator.voice_bank, "build_voice_bank", fake_build)
+
+    code = orchestrator.main(
+        [str(_source(tmp_path)), "--out", str(tmp_path / "run"), "--cast-from-bank"]
+    )
+
+    assert code == 0
+    assert built == [tmp_path / "voice-bank"]
+    (_dialogue, _speech, received, _passed) = stages.received["tts"]
+    (profile,) = received.values()
+    assert profile.reference_source == "voice_bank"
+
+
+def test_cast_from_bank_reuses_an_existing_bank(
+    tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An already-built bank is not rebuilt: the build is network work, not a no-op."""
+
+    bank_dir = _write_bank(tmp_path)
+    monkeypatch.setattr(
+        orchestrator, "get_settings",
+        lambda: _settings(tmp_path, voice_bank_dir=bank_dir),
+    )
+
+    def explode(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("an existing bank must not be rebuilt")
+
+    monkeypatch.setattr(orchestrator.voice_bank, "build_voice_bank", explode)
+
+    code = orchestrator.main(
+        [str(_source(tmp_path)), "--out", str(tmp_path / "run"), "--cast-from-bank"]
+    )
+
+    assert code == 0
+    (_dialogue, _speech, received, _passed) = stages.received["tts"]
+    (profile,) = received.values()
+    assert profile.reference_voice_id == "am-m-test"
 
 
 def test_one_spoken_sentence_reaches_adaptation_as_one_unit(

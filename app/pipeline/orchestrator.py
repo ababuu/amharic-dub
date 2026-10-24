@@ -46,7 +46,7 @@ import sys
 import time
 import traceback
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -675,10 +675,18 @@ def run_pipeline(
                     f"{profile.reference_duration:.1f}s)"
                 )
         else:
+            # Said out loud, with the directory it looked in: a run that silently keeps the
+            # actor's voice when an operator expected casting is indistinguishable from a
+            # bank that was never uploaded, and that is an easy mistake to make because the
+            # bank is a build artifact rather than a committed file.
             report(
                 "  voice references: using clean, transcript-matched film-actor audio "
                 "(one continuous 4-10 second interval per character; "
                 "Amharic-tuned OmniVoice)"
+            )
+            report(
+                f"  voice bank: none at {resolved.voice_bank_dir} "
+                f"(a {voice_bank.BANK_MANIFEST_FILENAME} there switches casting on)"
             )
             for speaker_id, profile in profiles.items():
                 pitch = (
@@ -983,6 +991,58 @@ def _write_manifest(
     return target
 
 
+#: How many pages of corpus metadata an automatic bank build scans. The full split is
+#: ~140 pages and takes minutes; 40 is already thousands of rows from dozens of
+#: speakers, which is far more than the dozen voices a film needs, and keeps the
+#: pre-flight short on a pod that is billing by the minute.
+AUTO_BANK_PAGES = 40
+
+#: Voices an automatic bank build keeps.
+AUTO_BANK_VOICES = 12
+
+
+def ensure_voice_bank(
+    directory: str | Path,
+    *,
+    settings: Settings,
+    voices: int = AUTO_BANK_VOICES,
+    max_pages: int = AUTO_BANK_PAGES,
+    report: Callable[[str], None] | None = None,
+) -> "voice_bank.VoiceBank":
+    """Return the bank in ``directory``, building one there first if it is empty.
+
+    Casting needs a bank, and a bank is a build artifact rather than a committed file,
+    so a fresh checkout has nothing to cast from. Building it is cheap (metadata plus a
+    dozen short clips - no model, no GPU) but it is not free and it needs the network,
+    which is why the orchestrator never does it implicitly: this is only reached when
+    the caller asked for casting on the command line.
+
+    Raises
+    ------
+    voice_bank.VoiceBankError
+        A bank exists but cannot be read, or the build failed.
+    """
+
+    base = Path(directory)
+    say = report if report is not None else (lambda _message: None)
+
+    existing = voice_bank.load_voice_bank(directory=base)
+    if existing is not None:
+        say(f"voice bank: using the {len(existing)} voice(s) already in {base}")
+        return existing
+
+    say(f"voice bank: none in {base}; building one before the run")
+    built = voice_bank.build_voice_bank(
+        destination=base,
+        settings=settings,
+        voices=voices,
+        max_pages=max_pages,
+        report=say,
+    )
+    say(f"voice bank: built {len(built)} voice(s) in {base}")
+    return built
+
+
 def main(argv: list[str] | None = None) -> int:
     """Command-line entry point: ``python -m app.pipeline.orchestrator SOURCE``."""
 
@@ -1009,10 +1069,41 @@ def main(argv: list[str] | None = None) -> int:
             "The result is a partial dub: the remaining sentences are not voiced."
         ),
     )
+    parser.add_argument(
+        "--cast-from-bank",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DIR",
+        help=(
+            "cast every character from a native-Amharic voice bank instead of the "
+            "actor's own reference, trading actor identity for native pronunciation. "
+            "Uses DIR (default: VOICE_BANK_DIR), building a bank there first if none "
+            "exists - which is what a fresh checkout needs, since a bank is a build "
+            "artifact and is not committed."
+        ),
+    )
     args = parser.parse_args(argv)
 
+    settings = get_settings()
+    if args.cast_from_bank is not None:
+        directory = Path(args.cast_from_bank) if args.cast_from_bank else Path(
+            settings.voice_bank_dir
+        )
+        try:
+            ensure_voice_bank(directory, settings=settings, report=print)
+        except voice_bank.VoiceBankError as exc:
+            print(f"\nFAILED: could not prepare a voice bank: {exc}", file=sys.stderr)
+            return 1
+        settings = replace(settings, voice_bank_dir=directory)
+
     try:
-        result = run_pipeline(args.source, output_dir=args.out, max_lines=args.max_lines)
+        result = run_pipeline(
+            args.source,
+            output_dir=args.out,
+            settings=settings,
+            max_lines=args.max_lines,
+        )
     except OrchestrationError as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)
         traceback.print_exc()
@@ -1045,6 +1136,7 @@ __all__ = [
     "OrchestrationError",
     "PipelineResult",
     "StageError",
+    "ensure_voice_bank",
     "main",
     "run_pipeline",
 ]

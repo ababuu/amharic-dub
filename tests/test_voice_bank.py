@@ -562,6 +562,51 @@ def test_building_keeps_the_best_clip_per_speaker(tmp_path) -> None:
     assert bank.voices[0].source_clip_id == "near"
 
 
+def test_a_bounded_build_still_finds_both_genders(tmp_path) -> None:
+    """A page limit must not silently produce a one-sided bank.
+
+    This corpus stores each speaker's clips together, so a short scan can hold a single
+    gender - and that bank casts every character, women included, in a man's voice. The
+    limit makes a build quick; it is not allowed to make it unbalanced.
+    """
+
+    settings = _settings(tmp_path)
+    rows = [_row(speaker_id="spk_m1", clip_id="m1", gender="male")]
+    # One page of page-size rows, all male, then a female speaker beyond the limit.
+    rows += [
+        _row(speaker_id=f"spk_m{index}", clip_id=f"m{index}", gender="male")
+        for index in range(2, 101)
+    ]
+    rows.append(_row(speaker_id="spk_f1", clip_id="f1", gender="female"))
+
+    bank = build_voice_bank(
+        destination=tmp_path / "bank",
+        settings=settings,
+        voices=2,
+        source=_FakeSource(rows),
+        max_pages=1,
+    )
+
+    assert {voice.gender for voice in bank} == {"male", "female"}
+
+
+def test_a_corpus_with_one_gender_says_so(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    lines: list[str] = []
+    rows = [_row(speaker_id=f"spk{index}", clip_id=f"c{index}", gender="male") for index in range(3)]
+
+    bank = build_voice_bank(
+        destination=tmp_path / "bank",
+        settings=settings,
+        voices=2,
+        source=_FakeSource(rows),
+        report=lines.append,
+    )
+
+    assert {voice.gender for voice in bank} == {"male"}
+    assert any("one of them" in line for line in lines)
+
+
 def test_building_fails_when_nothing_qualifies(tmp_path) -> None:
     settings = _settings(tmp_path)
     with pytest.raises(BankBuildError):
