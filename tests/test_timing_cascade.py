@@ -200,9 +200,11 @@ def test_genuine_simultaneous_dialogue_is_preserved(tmp_path: Path) -> None:
     """When the source overlapped two performances, the overlap *is* the scene."""
 
     clips = [
-        _clip(tmp_path, index=0, start=5.0, end=6.0, speech=1.0),
+        _clip(tmp_path, index=0, start=5.0, end=6.0, speech=1.0, speaker_id="SPEAKER_00"),
         # Line 1 began 0.6s into line 0 in the source: two people talking at once.
-        _clip(tmp_path, index=1, start=5.6, end=6.6, speech=1.0),
+        # They have to be *two* people - one character cannot hand over to themselves,
+        # which is a separate rule with its own test.
+        _clip(tmp_path, index=1, start=5.6, end=6.6, speech=1.0, speaker_id="SPEAKER_01"),
     ]
 
     aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
@@ -211,6 +213,44 @@ def test_genuine_simultaneous_dialogue_is_preserved(tmp_path: Path) -> None:
     assert second.drift == pytest.approx(0.0)
     assert second.start == pytest.approx(5.6)
     assert second.start < first.end  # the overlap the source actually had
+
+
+def test_a_source_overlap_beyond_the_allowance_is_still_capped(tmp_path: Path) -> None:
+    """Preserving the scene is not a licence for two voices over each other.
+
+    The allowance is about intelligibility: a film that overlapped its lines by two
+    seconds still gets a comprehensible dub, so the delivered overlap is capped even
+    though the source had more.
+    """
+
+    clips = [
+        _clip(tmp_path, index=0, start=5.0, end=7.0, speech=2.0, speaker_id="SPEAKER_00"),
+        _clip(tmp_path, index=1, start=5.2, end=7.2, speech=2.0, speaker_id="SPEAKER_01"),
+    ]
+
+    aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
+
+    first, second = aligned
+    assert second.drift > 0.0
+    assert first.end - second.start <= DEFAULT_TIMING_MAX_OVERLAP_SECONDS + 1e-6
+
+
+def test_a_later_line_is_not_pushed_by_one_that_started_after_it(tmp_path: Path) -> None:
+    """Placement follows the film's timeline, not the order the clips arrived in."""
+
+    clips = [
+        _clip(tmp_path, index=0, start=5.0, end=5.4, speech=1.6, speaker_id="SPEAKER_00"),
+        _clip(tmp_path, index=1, start=2.0, end=2.4, speech=0.4, speaker_id="SPEAKER_01"),
+    ]
+
+    aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
+
+    # Returned in the order it was given...
+    assert [line.index for line in aligned] == [0, 1]
+    # ...but the line the film plays second is the one that makes way.
+    earlier, later = aligned[1], aligned[0]
+    assert earlier.drift == pytest.approx(0.0)
+    assert later.start >= earlier.end - DEFAULT_TIMING_MAX_OVERLAP_SECONDS - 1e-6
 
 
 def test_a_moved_line_says_so_on_the_clip(tmp_path: Path) -> None:

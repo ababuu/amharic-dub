@@ -50,6 +50,9 @@ def _settings(root: Path, **overrides: object) -> Settings:
         # native-speaker samples in `data/voice-samples`: those switch the run to a
         # Whisper transcription of each sample, which is not what these tests exercise.
         "voice_sample_dir": root / "voice-samples",
+        # Same reason: a bank built into `data/voice-bank` would switch every run in
+        # this file to casting mode, so the default here is a path that has no manifest.
+        "voice_bank_dir": root / "voice-bank",
         "dialogue_bible_path": root / "work" / "dialogue_bible.json",
         # These tests exercise the per-character path, which needs voice profiles,
         # so they pin the engine that uses them rather than inheriting the default.
@@ -495,6 +498,9 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert payload["run"]["diarization"] == {
         "turns": 1,
         "speakers": [SPEAKER],
+        # Present even when empty: a run that corrected nothing has to be
+        # distinguishable from a run whose diarization could not verify attribution.
+        "speaker_corrections": [],
         "crosstalk": {"regions": 0, "seconds": 0.0, "detail": []},
     }
     assert payload["run"]["tts"]["clips"][0]["amharic"] == stages.dialogue[0].amharic
@@ -526,8 +532,12 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert payload["provenance"]["translation_backend"] == "openai"
     assert payload["provenance"]["translation_provider"] == "gemini"
     assert payload["provenance"]["translation_model"] == DEFAULT_TRANSLATION_GEMINI_MODEL
-    # What was *sent*, not what was configured.
-    assert payload["provenance"]["translation_thinking"] == "reasoning_effort=medium"
+    # What was *sent*, not what was configured: `off` cannot be honoured by a Gemini 3
+    # model, so the manifest records the lowest level that was actually asked for
+    # rather than echoing the request.
+    recorded = payload["provenance"]["translation_thinking"]
+    assert recorded.startswith("off requested, sent reasoning_effort=low")
+    assert "cannot disable reasoning" in recorded
 
 
 def test_crosstalk_is_reported_in_the_manifest(tmp_path: Path, monkeypatch) -> None:
@@ -651,7 +661,9 @@ def test_voice_sample_files_do_not_replace_film_actor_references(
 
     reported = " ".join(messages)
     assert "voice samples" not in reported
-    assert "voice references: using the film actors" in reported
+    # The line names the film-actor path so a run is auditable for which of the two
+    # reference sources produced the dub.
+    assert "voice references: using clean, transcript-matched film-actor audio" in reported
     assert "voice_samples" not in result.stage_seconds
     (_dialogue, _speech, received, passed_settings) = stages.received["tts"]
     (profile,) = received.values()
@@ -674,6 +686,118 @@ def test_without_samples_the_films_own_references_are_used(
     (profile,) = received.values()
     assert profile.reference_audio == stages.profiles["SPEAKER_00"].reference_audio
     assert profile.reference_text != "ሰላም"
+
+
+def _write_bank(root: Path) -> Path:
+    """Build a one-voice bank so the casting path runs without the network."""
+
+    import numpy as np
+    import soundfile as sf
+
+    from app.pipeline.voice_bank import (
+        BANK_MANIFEST_FILENAME,
+        BankVoice,
+        VoiceBank,
+    )
+
+    clip = root / "bank" / "clips" / "am-m-test.wav"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    rate = 24_000
+    seconds = 5.0
+    time = np.arange(int(seconds * rate)) / rate
+    sf.write(
+        str(clip),
+        (0.2 * np.sin(2 * np.pi * 120.0 * time)).astype(np.float32),
+        rate,
+        subtype="PCM_16",
+    )
+
+    voice = BankVoice(
+        voice_id="am-m-test",
+        audio=clip,
+        text="ዛሬ ጠዋት አዲስ አበባ ውስጥ በጣም ቀዝቃዛ አየር ነበር",
+        duration=seconds,
+        gender="male",
+        presentation="masculine",
+        pitch_hz=118.0,
+    )
+    bank = VoiceBank(directory=root / "bank", voices=(voice,), dataset="fake/corpus")
+    (root / "bank" / BANK_MANIFEST_FILENAME).write_text(
+        json.dumps(bank.to_dict()), encoding="utf-8"
+    )
+    return root / "bank"
+
+
+def test_a_voice_bank_casts_every_character_from_native_recordings(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """A bank before the run is an explicit request to trade identity for accent."""
+
+    bank_dir = _write_bank(tmp_path)
+    settings = _settings(tmp_path, voice_bank_dir=bank_dir)
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+
+    reported = " ".join(messages)
+    assert "casting from a native-Amharic bank" in reported
+    assert "identity is traded for native pronunciation" in reported
+    assert f"cast: {SPEAKER} -> am-m-test" in reported
+
+    # The film no longer has to supply an exactly transcribed window: the bank clip
+    # brings its own transcript, so a poorly transcribed film can still be cast.
+    (_turns, _speech, _transcript, _passed, require_transcript) = stages.received[
+        "voice_profiles"
+    ]
+    assert require_transcript is False
+
+    (_dialogue, _speech_stem, received, _passed_settings) = stages.received["tts"]
+    (profile,) = received.values()
+    assert profile.reference_source == "voice_bank"
+    assert profile.reference_voice_id == "am-m-test"
+    assert profile.reference_audio.name == "bank_reference.wav"
+    assert profile.reference_text == "ዛሬ ጠዋት አዲስ አበባ ውስጥ በጣም ቀዝቃዛ አየር ነበር"
+    assert profile.reference_audio != stages.profiles[SPEAKER].reference_audio
+
+
+def test_a_bank_is_reported_when_the_engine_cannot_use_it(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """A single-voice engine ignores references, so say so instead of dropping it."""
+
+    bank_dir = _write_bank(tmp_path)
+    settings = _settings(
+        tmp_path, voice_bank_dir=bank_dir, tts_engine="mms"
+    )
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+
+    reported = " ".join(messages)
+    assert "voice profiles: skipped" in reported
+    assert "voice bank: not used" in reported
+
+
+def test_no_bank_keeps_the_films_own_references(tmp_path: Path, stages: Stages) -> None:
+    """Casting is opt-in: no manifest means the run is unchanged."""
+
+    settings = _settings(tmp_path, voice_bank_dir=tmp_path / "no-bank")
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+
+    assert "casting" not in " ".join(messages)
+    (_turns, _speech, _transcript, _passed, require_transcript) = stages.received[
+        "voice_profiles"
+    ]
+    # Without a bank the film reference is still the identity, so it still has to be
+    # transcribed exactly.
+    assert require_transcript is True
+
+    (_dialogue, _speech_stem, received, _passed) = stages.received["tts"]
+    (profile,) = received.values()
+    assert profile.reference_source == "film"
+    assert profile.reference_voice_id is None
 
 
 def test_the_adaptation_report_names_the_model_and_what_it_was_asked_for(

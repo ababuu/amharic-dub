@@ -11,6 +11,8 @@ The stage order is the one ``app/pipeline/__init__.py`` documents::
                                         the backend produces it)
       -> voice_profiles.build_voice_profiles   one identity reference per speaker
                                         (per-character engines only)
+      -> voice_bank.apply_voice_bank    opt-in: cast each character from a
+                                        native-Amharic bank instead of the actor
       -> tts.synthesize_dialogue        Amharic speech clips
       -> timing.align_dialogue          each line fitted to its original window
       -> mixing.mix_track              dialogue over ducked music + effects
@@ -61,6 +63,7 @@ from app.pipeline import (
     translation,
     tts,
     video,
+    voice_bank,
     voice_profiles,
 )
 from app.pipeline.amharic_text import count_syllables
@@ -232,6 +235,8 @@ class PipelineResult:
                     "selection_reason": profile.selection_reason,
                     "estimated_vocal_presentation": profile.estimated_vocal_presentation,
                     "estimated_pitch_hz": profile.estimated_pitch_hz,
+                    "reference_source": profile.reference_source,
+                    "reference_voice_id": profile.reference_voice_id,
                 }
                 for speaker_id, profile in self.profiles.items()
             },
@@ -613,9 +618,21 @@ def run_pipeline(
     # TTS stage's own contract, asked rather than assumed here.
     needs_profiles = tts.engine_needs_profiles(resolved.tts_engine)
     profiles: Mapping[str, VoiceProfile] = {}
+    # A built bank switches the run to casting mode: the character's reference is
+    # replaced after this stage, so the film only has to supply who spoke when and
+    # roughly what they sound like - not a clean, transcript-matched window.
+    bank = voice_bank.load_voice_bank(settings=resolved)
     if not needs_profiles:
         seconds["voice_profiles"] = 0.0
         report(f"  voice profiles: skipped ({resolved.tts_engine} is single-voice)")
+        if bank is not None:
+            # Said rather than silently ignored: a configured bank that changes nothing
+            # is the one case where the operator cannot tell from the output that
+            # casting is off.
+            report(
+                f"  voice bank: not used ({len(bank)} voice(s) available, but "
+                f"{resolved.tts_engine} speaks every character in one voice)"
+            )
     else:
         # Built from every transcribed line, not from a shortened run: a profile is a
         # character's identity and is reused across runs, so it is never truncated.
@@ -632,29 +649,48 @@ def run_pipeline(
             crosstalk=crosstalk,
             transcript=lines,
             settings=resolved,
-            require_reference_transcript=True,
+            # Casting replaces the film reference, so its transcript no longer has
+            # to be exact - the bank clip brings its own.
+            require_reference_transcript=bank is None,
         )
         if not profiles:
             raise EmptyStageError(
                 "no voice profile could be built from the dialogue stem; the TTS stage "
                 "needs one identity reference per speaker"
             )
-        report(
-            "  voice references: using clean, transcript-matched film-actor audio "
-            "(one continuous 4-10 second interval per character; "
-            "Amharic-tuned OmniVoice)"
-        )
-        for speaker_id, profile in profiles.items():
-            pitch = (
-                f", median pitch {profile.estimated_pitch_hz:.0f} Hz"
-                if profile.estimated_pitch_hz is not None
-                else ""
+        if bank is not None:
+            profiles = voice_bank.apply_voice_bank(
+                profiles, settings=resolved, bank=bank
             )
             report(
-                f"  voice presentation estimate: {speaker_id} "
-                f"{profile.estimated_vocal_presentation}{pitch}; actor reference "
-                "is the voice identity"
+                f"  voice references: casting from a native-Amharic bank "
+                f"({len(bank)} voice(s), {bank.dataset}"
+                f"{'@' + bank.revision[:8] if bank.revision else ''}); "
+                "the actor's identity is traded for native pronunciation"
             )
+            for speaker_id, profile in profiles.items():
+                report(
+                    f"  cast: {speaker_id} -> {profile.reference_voice_id} "
+                    f"({profile.estimated_vocal_presentation}, "
+                    f"{profile.reference_duration:.1f}s)"
+                )
+        else:
+            report(
+                "  voice references: using clean, transcript-matched film-actor audio "
+                "(one continuous 4-10 second interval per character; "
+                "Amharic-tuned OmniVoice)"
+            )
+            for speaker_id, profile in profiles.items():
+                pitch = (
+                    f", median pitch {profile.estimated_pitch_hz:.0f} Hz"
+                    if profile.estimated_pitch_hz is not None
+                    else ""
+                )
+                report(
+                    f"  voice presentation estimate: {speaker_id} "
+                    f"{profile.estimated_vocal_presentation}{pitch}; actor reference "
+                    "is the voice identity"
+                )
 
     spoken = dialogue
     if max_lines is not None and max_lines < len(dialogue):

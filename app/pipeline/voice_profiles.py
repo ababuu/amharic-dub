@@ -458,6 +458,9 @@ class VoiceProfile:
     stay stable.
     Its optional pitch and vocal-presentation estimates are descriptive only;
     the actor reference, not the estimate, is what the TTS engine clones.
+    ``reference_source`` and ``reference_voice_id`` record where the reference
+    came from - the film's own dialogue or a native-speaker bank voice - so a
+    casting run can never be mistaken for an actor-preserving one.
     """
 
     speaker_id: str
@@ -470,6 +473,12 @@ class VoiceProfile:
     selection_reason: str = ""
     estimated_vocal_presentation: str = "unknown"
     estimated_pitch_hz: float | None = None
+    #: Where the reference came from: ``film`` for a window cut from the actor's
+    #: own dialogue, ``voice_bank`` for a native-speaker recording the character
+    #: was cast with. Recorded so a run can never be mistaken for the other.
+    reference_source: str = "film"
+    #: The bank voice behind a ``voice_bank`` reference; ``None`` for a film one.
+    reference_voice_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.speaker_id, str) or not self.speaker_id.strip():
@@ -543,6 +552,25 @@ class VoiceProfile:
                 )
         object.__setattr__(self, "estimated_pitch_hz", pitch)
 
+        if self.reference_source not in {"film", "voice_bank"}:
+            raise InvalidProfileError(
+                "reference_source must be film or voice_bank, got "
+                f"{self.reference_source!r}"
+            )
+
+        voice_id = self.reference_voice_id
+        if voice_id is not None:
+            if not isinstance(voice_id, str) or not voice_id.strip():
+                raise InvalidProfileError(
+                    "reference_voice_id must be a non-empty string or None"
+                )
+            voice_id = voice_id.strip()
+        if self.reference_source == "voice_bank" and voice_id is None:
+            raise InvalidProfileError(
+                "a voice_bank reference must record the voice it was cast with"
+            )
+        object.__setattr__(self, "reference_voice_id", voice_id)
+
     @property
     def reference_duration(self) -> float:
         """Length of the reference window in seconds.
@@ -583,6 +611,8 @@ class VoiceProfile:
             "selection_reason": self.selection_reason,
             "estimated_vocal_presentation": self.estimated_vocal_presentation,
             "estimated_pitch_hz": self.estimated_pitch_hz,
+            "reference_source": self.reference_source,
+            "reference_voice_id": self.reference_voice_id,
         }
 
     @classmethod
@@ -620,6 +650,8 @@ class VoiceProfile:
                 "estimated_vocal_presentation", "unknown"
             ),  # type: ignore[arg-type]
             estimated_pitch_hz=payload.get("estimated_pitch_hz"),  # type: ignore[arg-type]
+            reference_source=str(payload.get("reference_source", "film")),
+            reference_voice_id=payload.get("reference_voice_id"),  # type: ignore[arg-type]
         )
 
 
@@ -985,12 +1017,16 @@ def _resolve_duration_bounds(
         "voice_reference_max_duration", settings.voice_reference_max_duration, ConfigurationError
     )
 
-    minimum = max(minimum, minimum_required)
-    if not MIN_REFERENCE_DURATION <= minimum:
+    # Validate what was configured before raising it to the floor a transcript-matched
+    # reference needs: a value the configuration cannot honour is reported, not quietly
+    # replaced. Clamping *after* this check is what keeps the tuned floor below from
+    # hiding an impossible setting.
+    if minimum < MIN_REFERENCE_DURATION:
         raise ConfigurationError(
             "VOICE_REFERENCE_MIN_DURATION must be at least "
             f"{MIN_REFERENCE_DURATION:g} seconds, got {minimum}"
         )
+    minimum = max(minimum, minimum_required)
     if target < minimum:
         raise ConfigurationError(
             f"VOICE_REFERENCE_TARGET_DURATION ({target}) must not be shorter than "
@@ -1683,6 +1719,18 @@ def _estimate_vocal_presentation(reference_audio: Path) -> tuple[float | None, s
     return median_pitch, presentation
 
 
+def estimate_vocal_presentation(reference: str | Path) -> tuple[float | None, str]:
+    """Estimate a recording's median pitch and vocal register.
+
+    Public entry point for stages that need to describe a reference they did not
+    build themselves - casting a bank voice, for instance. The estimate is
+    descriptive only: it is never used to alter audio, and a profile's own
+    documented gender stays authoritative where one exists.
+    """
+
+    return _estimate_vocal_presentation(Path(reference))
+
+
 def _build_profile(
     candidate: _ReferenceCandidate,
     *,
@@ -2245,6 +2293,7 @@ __all__ = [
     "VoiceProfile",
     "VoiceProfileError",
     "build_voice_profiles",
+    "estimate_vocal_presentation",
     "load_voice_profiles",
     "portable_path",
     "resolve_project_path",

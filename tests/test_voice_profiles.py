@@ -380,19 +380,31 @@ def test_profile_strips_the_selection_reason(tmp_path: Path) -> None:
 
 
 def test_profile_has_no_performance_metadata() -> None:
+    """A profile answers "what is this voice", never "how is this line delivered".
+
+    Deliberately not an exact set: identity metadata (pitch, vocal presentation, the
+    reference's provenance) belongs on a profile and grows as the pipeline learns more,
+    so pinning the whole field list would turn every such addition into a test failure
+    that says nothing about the rule this test exists to protect.
+    """
+
     fields = set(VoiceProfile.__dataclass_fields__)
 
-    assert fields == {
+    for identity in (
         "speaker_id",
         "reference_audio",
         "reference_start",
         "reference_end",
         "reference_text",
-        "clone_prompt_path",
-        "quality_score",
-        "selection_reason",
-    }
-    for forbidden in ("emotion", "intensity", "delivery", "pause_before", "pause_after"):
+    ):
+        assert identity in fields
+    for forbidden in (
+        "emotion",
+        "intensity",
+        "delivery",
+        "pause_before",
+        "pause_after",
+    ):
         assert forbidden not in fields
 
 
@@ -645,16 +657,39 @@ def test_best_candidate_prefers_the_louder_clean_window(
 
 
 def test_longer_clean_speech_is_preferred(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
+    """Two clean windows: the one nearest the target duration wins.
+
+    The target is set explicitly rather than inherited. Selection is *relative to*
+    ``VOICE_REFERENCE_TARGET_DURATION``, so a test of the duration preference has to
+    state the preference it is testing - otherwise it silently asserts whatever the
+    shipping default happens to be, and the default moved from 10s to 5s to stop long
+    reference transcripts being echoed at the start of generated lines.
+    """
+
     stem = _write_stem(tmp_path / "speech.wav", [(10.0, 14.0, LOUD), (30.0, 39.0, LOUD)])
     segments = [
         SpeakerSegment("SPEAKER_00", 10.0, 14.0),
         SpeakerSegment("SPEAKER_00", 30.0, 39.0),
     ]
 
-    profile = build_voice_profiles(segments, stem, settings=_settings(tmp_path))["SPEAKER_00"]
+    profile = build_voice_profiles(
+        segments,
+        stem,
+        settings=_settings(
+            tmp_path,
+            voice_reference_target_duration=10.0,
+            voice_reference_max_duration=10.0,
+        ),
+    )["SPEAKER_00"]
 
     assert profile.reference_duration == 9.0
     assert profile.reference_start == 30.0
+
+    # The shipping default prefers the short prompt instead, which is the trade the
+    # 5s target exists to make.
+    short = build_voice_profiles(segments, stem, settings=_settings(tmp_path))["SPEAKER_00"]
+    assert short.reference_duration == 4.0
+    assert short.reference_start == 10.0
 
 
 def test_overlapping_speech_is_penalized(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
@@ -769,14 +804,33 @@ def test_distant_turns_are_not_concatenated(tmp_path: Path, ffmpeg: FakeFfmpeg) 
 def test_a_long_monologue_is_scanned_with_a_sliding_window(
     tmp_path: Path, ffmpeg: FakeFfmpeg
 ) -> None:
+    """The best window inside a long turn is found, rather than the turn being used whole.
+
+    The target is stated because it decides the window length; the point of the test is
+    that a 40s monologue is *scanned*, not that any particular default is in force.
+    """
+
     stem = _write_stem(tmp_path / "speech.wav", [(10.0, 30.0, QUIET), (30.0, 50.0, LOUD)])
 
     profile = build_voice_profiles(
-        [SpeakerSegment("SPEAKER_00", 10.0, 50.0)], stem, settings=_settings(tmp_path)
+        [SpeakerSegment("SPEAKER_00", 10.0, 50.0)],
+        stem,
+        settings=_settings(
+            tmp_path,
+            voice_reference_target_duration=10.0,
+            voice_reference_max_duration=10.0,
+        ),
     )["SPEAKER_00"]
 
+    # The loud half is where the usable window starts, at whatever length is asked for.
     assert profile.reference_start == 30.0
     assert profile.reference_duration == 10.0
+
+    short = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", 10.0, 50.0)], stem, settings=_settings(tmp_path)
+    )["SPEAKER_00"]
+    assert short.reference_start == 30.0
+    assert short.reference_duration == 5.0
 
 
 def test_ties_are_broken_deterministically(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
@@ -896,9 +950,12 @@ def test_the_reference_text_describes_the_reference_audio_exactly(
     """
 
     stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD)])
+    # Long enough to clear the four-second floor a cloning reference needs. Two 1.5s
+    # lines would be described exactly but unusable, and the selector would - correctly
+    # - fall back to the undescribed turn, which is a different property from this one.
     transcript = [
         TranscriptSegment("SPEAKER_00", 10.0, 12.0, "hello"),
-        TranscriptSegment("SPEAKER_00", 12.0, 13.0, "there"),
+        TranscriptSegment("SPEAKER_00", 12.0, 15.0, "there"),
     ]
 
     profile = build_voice_profiles(
@@ -910,7 +967,7 @@ def test_the_reference_text_describes_the_reference_audio_exactly(
 
     # The window is cut on the line boundaries, so the text is theirs exactly.
     assert profile.reference_start == 10.0
-    assert profile.reference_end == 13.0
+    assert profile.reference_end == 15.0
     assert profile.reference_text == "hello there"
 
 
@@ -1547,9 +1604,11 @@ def test_a_richer_window_wins_when_both_are_transcribed(
         SpeakerSegment("SPEAKER_00", 10.0, 20.0),
         SpeakerSegment("SPEAKER_00", 30.0, 40.0),
     ]
+    # Each line has to clear the four-second floor on its own, or it is no candidate at
+    # all and there is no tie for variety to break.
     transcript = [
-        TranscriptSegment("SPEAKER_00", 10.5, 14.0, REPETITIVE_TEXT),
-        TranscriptSegment("SPEAKER_00", 30.5, 34.0, RICH_TEXT),
+        TranscriptSegment("SPEAKER_00", 10.5, 15.0, REPETITIVE_TEXT),
+        TranscriptSegment("SPEAKER_00", 30.5, 35.0, RICH_TEXT),
     ]
 
     profile = build_voice_profiles(
@@ -1588,7 +1647,9 @@ def test_a_described_window_beats_a_longer_undescribed_one(
     """
 
     stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD)])
-    transcript = [TranscriptSegment("SPEAKER_00", 10.5, 14.0, REPETITIVE_TEXT)]
+    # Four seconds or more, or the described window is not a candidate and the test
+    # would be comparing against a floor rather than against the undescribed turn.
+    transcript = [TranscriptSegment("SPEAKER_00", 10.5, 15.0, REPETITIVE_TEXT)]
 
     profile = build_voice_profiles(
         [SpeakerSegment("SPEAKER_00", 10.0, 20.0)],
@@ -1598,7 +1659,7 @@ def test_a_described_window_beats_a_longer_undescribed_one(
     )["SPEAKER_00"]
 
     assert profile.reference_start == 10.5
-    assert profile.reference_end == 14.0
+    assert profile.reference_end == 15.0
     assert profile.reference_text == REPETITIVE_TEXT
 
 
@@ -1746,8 +1807,8 @@ def test_variety_cannot_outweigh_a_clear_audio_difference(
         SpeakerSegment("SPEAKER_00", 30.0, 40.0),
     ]
     transcript = [
-        TranscriptSegment("SPEAKER_00", 10.5, 14.0, RICH_TEXT),
-        TranscriptSegment("SPEAKER_00", 30.5, 34.0, REPETITIVE_TEXT),
+        TranscriptSegment("SPEAKER_00", 10.5, 15.0, RICH_TEXT),
+        TranscriptSegment("SPEAKER_00", 30.5, 35.0, REPETITIVE_TEXT),
     ]
 
     profile = build_voice_profiles(

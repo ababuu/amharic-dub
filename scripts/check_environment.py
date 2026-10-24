@@ -117,6 +117,7 @@ PROJECT_MODULES: tuple[str, ...] = (
     "app.pipeline.translation",
     "app.pipeline.tts",
     "app.pipeline.video",
+    "app.pipeline.voice_bank",
     "app.pipeline.voice_profiles",
 )
 

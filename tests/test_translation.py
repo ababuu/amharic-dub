@@ -622,6 +622,8 @@ def test_a_level_provider_is_sent_the_level_it_understands(monkeypatch):
 
     _patch(monkeypatch)
 
+    # The default request asks for no reasoning at all. Gemini 3 cannot honour that,
+    # so the lowest level it *does* have is what goes on the wire.
     adapt_dialogue(
         [_segment()],
         settings=_settings(
@@ -630,8 +632,21 @@ def test_a_level_provider_is_sent_the_level_it_understands(monkeypatch):
             translation_model="gemini-3.8-flash",
         ),
     )
-    assert FakeOpenAI.requests[0]["reasoning_effort"] == "medium"
+    assert FakeOpenAI.requests[0]["reasoning_effort"] == "low"
     assert "extra_body" not in FakeOpenAI.requests[0]
+
+    # A level it does have is passed through unchanged.
+    _patch(monkeypatch)
+    adapt_dialogue(
+        [_segment()],
+        settings=_settings(
+            translation_provider="gemini",
+            gemini_api_key="test-key",
+            translation_model="gemini-3.8-flash",
+            translation_thinking="high",
+        ),
+    )
+    assert FakeOpenAI.requests[0]["reasoning_effort"] == "high"
 
 
 def test_the_thinking_switch_is_used_for_a_provider_that_has_one(monkeypatch):

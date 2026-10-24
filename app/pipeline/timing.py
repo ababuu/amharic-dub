@@ -184,6 +184,23 @@ class AlignedClip:
         return self.clip.speaker_id
 
     @property
+    def source_start(self) -> float:
+        """Where the actor's line began in the film, before any placement."""
+
+        return self.clip.dialogue.start
+
+    @property
+    def source_end(self) -> float:
+        """Where the actor's line ended in the film.
+
+        Kept alongside :attr:`end` because they answer different questions: this one
+        is the performance the film had, and ``end`` is where the dubbed file was put.
+        Whether two lines were *already* simultaneous is a fact about this window.
+        """
+
+        return self.clip.dialogue.end
+
+    @property
     def residual(self) -> float:
         """How much longer than its window the delivered speech is, in seconds.
 
@@ -673,8 +690,25 @@ def align_dialogue(
     if not ordered:
         return []
 
+    for clip in ordered:
+        if not isinstance(clip, TtsClip):
+            raise InvalidClipError(
+                f"expected a TtsClip, got {type(clip).__name__}"
+            )
+
     directory = resolve_timing_directory(output_dir, settings=resolved)
     directory.mkdir(parents=True, exist_ok=True)
+
+    # Everything below reasons about "the line before this one" and "the next line",
+    # and in a film those mean neighbours *on the timeline*. Input order is normally
+    # chronological, but relying on it would place a line against whichever clip
+    # happened to arrive next, so the work is done in time order and the result is put
+    # back into the order it was given - which is what the caller and the manifest
+    # expect.
+    by_time = sorted(
+        range(len(ordered)),
+        key=lambda position: (ordered[position].dialogue.start, position),
+    )
 
     # Each line is told the room it has before the next one begins. The next line's own
     # leading pause is included, because that pause is part of where its audio starts and
@@ -683,29 +717,32 @@ def align_dialogue(
     # language longer than English - simply overruns into its neighbour and two voices
     # speak at once.
     guard = resolved.timing_min_line_gap
-    rooms: list[float | None] = []
-    for position, clip in enumerate(ordered):
-        if position + 1 >= len(ordered):
-            rooms.append(None)
+    rooms: dict[int, float | None] = {}
+    for slot, position in enumerate(by_time):
+        clip = ordered[position]
+        if slot + 1 >= len(by_time):
+            rooms[position] = None
             continue
-        following = ordered[position + 1]
+        following = ordered[by_time[slot + 1]]
         deadline = _audio_start(following) - guard
-        rooms.append(deadline - clip.dialogue.start - clip.rendered_pause_after)
+        rooms[position] = deadline - clip.dialogue.start - clip.rendered_pause_after
 
-    aligned: list[AlignedClip] = []
-    for clip, room in zip(ordered, rooms):
-        if not isinstance(clip, TtsClip):
-            raise InvalidClipError(
-                f"expected a TtsClip, got {type(clip).__name__}"
-            )
+    aligned: dict[int, AlignedClip] = {}
+    for position, clip in enumerate(ordered):
         destination = directory / f"{Path(clip.audio_path).stem}.wav"
-        aligned.append(align_clip(clip, destination, settings=resolved, room=room))
+        aligned[position] = align_clip(
+            clip, destination, settings=resolved, room=rooms[position]
+        )
 
-    return _cascade(
-        aligned,
+    placed = _cascade(
+        [aligned[position] for position in by_time],
         guard=guard,
         overlap=resolved.timing_max_overlap_seconds,
     )
+
+    # `placed` is in timeline order; describe the slots back in input order.
+    slots_in_input_order = sorted(range(len(by_time)), key=lambda slot: by_time[slot])
+    return [placed[slot] for slot in slots_in_input_order]
 
 
 def _cascade(
@@ -717,8 +754,7 @@ def _cascade(
     either rushing it past intelligibility or cutting a word off the end. Both were
     tried; both were audible. So the overrun is paid for in position instead: the next
     line waits until this one has finished, except for the configured short handover
-    allowance between different speakers. Originally simultaneous lines are subject to
-    the same cap as any other handover.
+    allowance between different speakers.
 
     ``overlap`` is the concession that keeps the picture: up to this many seconds of the
     previous line may still be sounding when the next one starts, which is what a
@@ -732,6 +768,20 @@ def _cascade(
     to separate the two copies with. So one speaker's speech is never left sounding under
     their own next line.
 
+    Lines that **already overlapped in the source** keep that overlap, up to the same
+    ``overlap`` allowance. Two performances that started together are a line of dialogue
+    and its interruption, and separating them changes the scene rather than repairing it.
+    Two differences from a sequential pair follow from that: the sequential guard is not
+    applied (there was no silence between these lines to respect), and the delivered
+    overlap is measured from the overlap the film had rather than from the allowance
+    alone. Beyond the allowance the usual cap applies, because the allowance is about
+    intelligibility and not about what the source happened to do.
+
+    So the two cases differ in exactly one way: a sequential pair may be given the small
+    hand-over allowance on purpose, because a hand-over is what a conversation sounds
+    like, while a pair the film already overlapped is never given *more* overlap than the
+    film had.
+
     Everything here is measured between *speech* boundaries rather than file boundaries.
     A clip carries its rendered pauses with it, and silence over silence is inaudible, so
     a line is not moved to avoid an overlap nobody can hear.
@@ -742,14 +792,31 @@ def _cascade(
     previous_speech_end = 0.0
     for clip in aligned:
         same_speaker = previous is not None and previous.speaker_id == clip.speaker_id
-        allowed = 0.0 if same_speaker else overlap
+        source_overlap = (
+            max(0.0, previous.source_end - clip.source_start)
+            if previous is not None and not same_speaker
+            else 0.0
+        )
+        if same_speaker:
+            # One voice cannot hand over to itself.
+            floor = previous_speech_end + guard - clip.rendered_pause_before
+        elif source_overlap > 0.0:
+            # Two performances the film itself overlapped. The overlap is the scene, so
+            # it is kept - up to the same `overlap` allowance, because the allowance is
+            # about intelligibility, not about what the source happened to do. The
+            # sequential guard does not apply inside a crosstalk region: there was no
+            # silence between these lines to respect.
+            floor = (
+                previous_speech_end
+                - min(source_overlap, overlap)
+                - clip.rendered_pause_before
+            )
+        else:
+            floor = previous_speech_end + guard - clip.rendered_pause_before - overlap
         # The constraint is on speech, not the files: pauses are inaudible over silence.
-        # Even genuine source crosstalk is capped so translated dialogue stays clear.
-        floor = previous_speech_end + guard - clip.rendered_pause_before - allowed
         start = max(clip.start, floor)
         drift = start - clip.start
         if drift > 1e-6:
-            same_speaker = previous is not None and previous.speaker_id == clip.speaker_id
             why = (
                 "the same character had not finished, and one voice cannot hand over to "
                 "itself"

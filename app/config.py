@@ -57,6 +57,12 @@ Environment variables
                       adaptation. Absent means an empty bible.
 ``VOICE_REFERENCE_MIN_DURATION`` / ``..._TARGET_DURATION`` / ``..._MAX_DURATION``
                       Preferred length of a voice-cloning reference, in seconds.
+``VOICE_BANK_DIR``    A built native-Amharic voice bank. When it holds a
+                      ``manifest.json``, characters are cast from it instead of
+                      cloning the actor's own English reference - the accent
+                      trade-off this project documents. Absent means off.
+``VOICE_BANK_MAP``    Optional ``SPEAKER_00=voice-id`` list pinning specific bank
+                      voices to specific characters.
 ``TTS_MODEL``         Amharic speech adapter used by the TTS stage.``DIARIZATION_MIN_SPEAKERS`` / ``DIARIZATION_MAX_SPEAKERS``
                       Optional bounds on how many speakers diarization may find.
                       A cast list turns these into the strongest single guard
@@ -301,6 +307,18 @@ DEFAULT_VOICE_SAMPLE_DIR = PROJECT_ROOT / "data" / "voice-samples"
 #: Legacy sample mapping, currently unused by the production pipeline.
 DEFAULT_VOICE_SAMPLE_MAP = ""
 
+#: Directory holding a built native-Amharic voice bank: a manifest of curated
+#: human recordings plus their canonical clips. A manifest switches on *casting
+#: mode* - each character is given a native speaker's reference instead of the
+#: actor's English one, which removes the cross-lingual accent at its source and
+#: gives up the actor's identity in exchange. It is opt-in: no manifest, no change.
+DEFAULT_VOICE_BANK_DIR = PROJECT_ROOT / "data" / "voice-bank"
+
+#: Optional ``SPEAKER_00=voice-id`` list pinning bank voices to characters. The
+#: automatic casting is deterministic and good enough to start with; this exists
+#: for the case where someone has listened and wants a particular voice.
+DEFAULT_VOICE_BANK_VOICE_MAP = ""
+
 #: Amharic speech engine consumed by :mod:`app.pipeline.tts`.
 #:
 #: ``"omnivoice"`` is k2-fsa's OmniVoice: a zero-shot model covering hundreds of
@@ -416,6 +434,10 @@ DEFAULT_TIMING_MAX_TEMPO = 1.45
 #: first in a small overlap and only then in position. Measured with the real timing
 #: stage on the failed run's own numbers, the worst line's drift falls from 6.13s to
 #: 4.13s when this goes from 0.30 to 0.45.
+#:
+#: The value is a ceiling in two places, not one: it also caps an overlap the film
+#: itself had, so a source crosstalk region is preserved up to this much and no
+#: further. Below it, the source overlap is kept as it was.
 DEFAULT_TIMING_MAX_OVERLAP_SECONDS = 0.45
 
 #: Silence kept between one dubbed line and the next, in seconds.
@@ -813,6 +835,10 @@ class Settings:
     #: an optional ``SPEAKER=file`` list saying which voice each speaker gets.
     voice_sample_dir: Path = DEFAULT_VOICE_SAMPLE_DIR
     voice_sample_map: str = DEFAULT_VOICE_SAMPLE_MAP
+    #: Built native-Amharic voice bank, and an optional ``SPEAKER=voice-id`` list
+    #: pinning specific voices. A manifest in this directory switches casting on.
+    voice_bank_dir: Path = DEFAULT_VOICE_BANK_DIR
+    voice_bank_voice_map: str = DEFAULT_VOICE_BANK_VOICE_MAP
     #: Persistent character/consistency state handed to dialogue adaptation.
     dialogue_bible_path: Path = DEFAULT_DIALOGUE_BIBLE_PATH
     #: TTS settings for :mod:`app.pipeline.tts`: the Amharic speech adapter and the
@@ -959,6 +985,11 @@ class Settings:
             voice_sample_map=(
                 _read_env("VOICE_SAMPLE_MAP", DEFAULT_VOICE_SAMPLE_MAP)
                 or DEFAULT_VOICE_SAMPLE_MAP
+            ),
+            voice_bank_dir=_read_path("VOICE_BANK_DIR", DEFAULT_VOICE_BANK_DIR),
+            voice_bank_voice_map=(
+                _read_env("VOICE_BANK_MAP", DEFAULT_VOICE_BANK_VOICE_MAP)
+                or DEFAULT_VOICE_BANK_VOICE_MAP
             ),
             dialogue_bible_path=_read_path(
                 "DIALOGUE_BIBLE_PATH", work_dir / DEFAULT_DIALOGUE_BIBLE_FILENAME
@@ -1155,6 +1186,8 @@ class Settings:
             "voice_reference_max_duration": self.voice_reference_max_duration,
             "voice_sample_dir": str(self.voice_sample_dir),
             "voice_sample_map": self.voice_sample_map,
+            "voice_bank_dir": str(self.voice_bank_dir),
+            "voice_bank_voice_map": self.voice_bank_voice_map,
             "dialogue_bible_path": str(self.dialogue_bible_path),
             "tts_model": self.tts_model,
             "tts_engine": self.tts_engine,
@@ -1242,6 +1275,8 @@ __all__ = [
     "DEFAULT_VOICE_REFERENCE_MAX_DURATION",
     "DEFAULT_VOICE_SAMPLE_DIR",
     "DEFAULT_VOICE_SAMPLE_MAP",
+    "DEFAULT_VOICE_BANK_DIR",
+    "DEFAULT_VOICE_BANK_VOICE_MAP",
     "DEFAULT_VOICE_REFERENCE_MIN_DURATION",
     "DEFAULT_VOICE_REFERENCE_TARGET_DURATION",
     "PROJECT_ROOT",

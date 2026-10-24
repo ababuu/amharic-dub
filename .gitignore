@@ -87,6 +87,12 @@ torch_cache/
 !data/voice-samples/*.flac
 !data/voice-samples/*.m4a
 
+# A built voice bank is the opposite: a deterministic artifact of a public corpus, so
+# it is rebuilt rather than committed. Keeping it out of git also keeps dataset audio
+# from being redistributed through this repository; the manifest records the source,
+# revision and licence, and ATTRIBUTION.md carries the credit.
+data/voice-bank/
+
 # ---------------------------------------------------------------------------
 # JSON manifests generated during processing
 # ---------------------------------------------------------------------------
