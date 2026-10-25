@@ -920,11 +920,32 @@ def test_a_lowercase_continuation_joins_even_after_a_full_stop() -> None:
     )
 
 
-def test_two_capitalised_sentences_stay_two() -> None:
+def test_two_sentences_a_beat_apart_become_one_line() -> None:
+    """A pause this short is a beat inside one delivery, not a full stop.
+
+    Whisper punctuates every pause-delimited fragment as a sentence, and speaking
+    each one separately is what makes a dub sound cut together: two clips, two
+    intonation contours, a seam in the middle of one thought. Below
+    ``SENTENCE_BREAK_PAUSE_SECONDS`` the fragments stay one line.
+    """
+
     sentences = transcription.assemble_sentences(
         [
             _segment(0.0, 1.0, "The matrix is everywhere."),
             _segment(1.4, 2.4, "It is all around us."),
+        ]
+    )
+
+    assert [sentence.text for sentence in sentences] == [
+        "The matrix is everywhere. It is all around us.",
+    ]
+
+
+def test_two_sentences_a_real_pause_apart_stay_two() -> None:
+    sentences = transcription.assemble_sentences(
+        [
+            _segment(0.0, 1.0, "The matrix is everywhere."),
+            _segment(2.6, 3.6, "It is all around us."),
         ]
     )
 

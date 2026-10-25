@@ -542,6 +542,20 @@ def transcribe(
 #: swallowed into one run-on utterance.
 MAX_SENTENCE_GAP_SECONDS = 2.0
 
+#: A pause at least this long, *together with* terminal punctuation, is a real
+#: boundary. Below it a full stop is the transcriber's habit rather than the
+#: speaker's intent: Whisper punctuates every pause-delimited fragment, so
+#: punctuation alone split "No, you clearly." from "Don't know who you're talking
+#: to" - one sentence, one emotion, spoken as two clips. Measured on a real scene,
+#: 1.2s turned 41 fragments into 20 lines whose longest is 11.6s (under the cap),
+#: where the old punctuation rule produced 38 lines of which most were fragments.
+SENTENCE_BREAK_PAUSE_SECONDS = 1.2
+
+#: Shortest completed sentence worth breaking on. A fragment shorter than this
+#: absorbs what follows rather than becoming a line of its own, because a
+#: 0.2-second clip cannot carry an intonation contour and is heard as a cut.
+MIN_SENTENCE_SECONDS = 0.8
+
 #: Longest span one assembled sentence may cover, and the largest number of
 #: transcribed segments it may join. Both are safety valves for a transcript with
 #: sparse punctuation: without them a monologue would collapse into one unit that
@@ -731,15 +745,21 @@ def assemble_sentences(
             parts.append(segment)
             continue
         previous = parts[-1]
+        gap = segment.start - previous.end
+        # A boundary needs both signals: the transcriber said the sentence ended
+        # *and* the speaker actually paused, and what has accumulated is already a
+        # sentence rather than a stray fragment.
+        boundary = (
+            _ends_sentence(previous.text)
+            and gap >= SENTENCE_BREAK_PAUSE_SECONDS
+            and previous.end - parts[0].start >= MIN_SENTENCE_SECONDS
+        )
         continues = (
             segment.speaker_id == previous.speaker_id
-            and segment.start - previous.end <= MAX_SENTENCE_GAP_SECONDS
+            and gap <= MAX_SENTENCE_GAP_SECONDS
             and len(parts) < MAX_SENTENCE_PARTS
             and segment.end - parts[0].start <= MAX_SENTENCE_SECONDS
-            and (
-                not _ends_sentence(previous.text)
-                or _starts_mid_sentence(segment.text)
-            )
+            and not boundary
         )
         if continues:
             parts.append(segment)

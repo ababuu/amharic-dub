@@ -251,6 +251,7 @@ class Stages:
         crosstalk: object = (),
         settings: Settings,
         require_reference_transcript: bool = False,
+        registers: object = None,
     ) -> dict[str, VoiceProfile]:
         self._record(
             "voice_profiles",
@@ -261,6 +262,7 @@ class Stages:
             require_reference_transcript,
         )
         self.seen_crosstalk = crosstalk
+        self.seen_registers = registers
         return dict(self.profiles)
 
     def synthesize_dialogue_detailed(

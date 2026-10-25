@@ -902,6 +902,55 @@ re-encoded; pass a `clone_encoder` callable to `build_voice_profiles` if your se
 needs a serialized prompt. The TTS stage does not need one: the cloning engine takes
 reference audio directly, so `clone_prompt_path` may stay `None`.
 
+### Who is speaking (`register.py`)
+
+Diarization clusters turns by speaker embedding. On real film audio it is usually right
+about the *clusters* and wrong about a handful of *turns* — and it only takes one: a
+character's reference recording is cut from a single turn, so a mislabelled turn is
+enough to cast them with the wrong voice for the whole film. On the scene this was built
+from, the two clusters were 200 Hz and 120 Hz apart and seven of forty-one turns sat on
+the wrong side of that gap; the female-voiced character was the male lead.
+
+`register.py` measures the voice itself. It reuses the pitch tracker in
+`prosody.py`, so it needs no model, no GPU and no network, and it:
+
+* **aggregates every turn a speaker has**, weighted by voiced audio, instead of reading
+  one 5-second window — one bad window cannot move a weighted median of twenty turns;
+* **reassigns only decisive contradictions**: a turn must sit 1.35x (about five
+  semitones) from its speaker's register *and* be twice as close to another speaker's.
+  A turn that sits between two voices is left where diarization put it, because a coin
+  flip is not an improvement;
+* **refuses to guess when the material cannot support a cast**: two registers closer
+  than 1.25x, or too little measurable speech, produce a `cast warning` in the run
+  report and in `manifest.json` under `run.speakers.warning`;
+* **runs before sentence assembly**, because a stretch labelled as one speaker can only
+  split into two sentences once the labels are right.
+
+The register is recorded twice on every profile: `source_*` is what the film contained,
+`estimated_*` is what the character now sounds like. Casting overwrites the latter, so
+without the former a wrong cast could not be audited.
+
+**Two limits worth knowing.** Pitch separates typical male and female voices; it cannot
+separate two similar voices, and it says nothing about children or whispering. When it
+cannot tell, it reports that instead of casting — which is the honest failure, not a
+silent one.
+
+### Sentence assembly (`transcription.py`)
+
+Whisper segments on pauses and punctuates every fragment as a full sentence, so one
+spoken thought routinely arrives as several pieces. Adapting and speaking each piece
+separately is what makes a dub sound cut together: several clips, each with its own
+intonation and its own emotion.
+
+A boundary therefore needs **both** signals — terminal punctuation **and** a pause of at
+least `SENTENCE_BREAK_PAUSE_SECONDS` (1.2 s) — and a fragment shorter than
+`MIN_SENTENCE_SECONDS` (0.8 s) absorbs what follows rather than becoming a line.
+On the scene above this turned 41 fragments into 20 lines (longest 11.6 s, under the
+12 s cap) instead of 38, and it is what lets one utterance carry one emotion.
+
+Back to back sentences a beat apart therefore become one line. That is deliberate: two
+clips with two final cadences and a seam between them is the defect being removed.
+
 ### Speech synthesis (`tts.py`)
 
 OmniVoice speaks each line in the voice cloned from that character's own reference

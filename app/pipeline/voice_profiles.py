@@ -141,6 +141,7 @@ import soundfile as sf
 
 from app.config import PROJECT_ROOT, Settings, get_settings
 from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
+from app.pipeline.register import SpeakerRegister
 from app.pipeline.transcription import TranscriptSegment
 
 #: A voice-clone encoder: ``(reference_audio, destination) -> prompt path``.
@@ -473,6 +474,12 @@ class VoiceProfile:
     selection_reason: str = ""
     estimated_vocal_presentation: str = "unknown"
     estimated_pitch_hz: float | None = None
+    #: The register measured across *every* turn the actor speaks, before any bank
+    #: voice replaced it. Kept separate so a casting decision can always be audited:
+    #: ``estimated_*`` describes what the character now sounds like, these describe
+    #: what the film actually contained.
+    source_vocal_presentation: str = "unknown"
+    source_pitch_hz: float | None = None
     #: Where the reference came from: ``film`` for a window cut from the actor's
     #: own dialogue, ``voice_bank`` for a native-speaker recording the character
     #: was cast with. Recorded so a run can never be mistaken for the other.
@@ -552,6 +559,29 @@ class VoiceProfile:
                 )
         object.__setattr__(self, "estimated_pitch_hz", pitch)
 
+        source_presentation = self.source_vocal_presentation
+        if not isinstance(source_presentation, str) or source_presentation not in {
+            "unknown",
+            "uncertain",
+            "masculine",
+            "feminine",
+        }:
+            raise InvalidProfileError(
+                "source_vocal_presentation must be unknown, uncertain, "
+                "masculine, or feminine"
+            )
+
+        source_pitch = self.source_pitch_hz
+        if source_pitch is not None:
+            source_pitch = _finite_number(
+                "source_pitch_hz", source_pitch, InvalidProfileError
+            )
+            if source_pitch <= 0:
+                raise InvalidProfileError(
+                    f"source_pitch_hz must be positive, got {source_pitch}"
+                )
+        object.__setattr__(self, "source_pitch_hz", source_pitch)
+
         if self.reference_source not in {"film", "voice_bank"}:
             raise InvalidProfileError(
                 "reference_source must be film or voice_bank, got "
@@ -611,6 +641,8 @@ class VoiceProfile:
             "selection_reason": self.selection_reason,
             "estimated_vocal_presentation": self.estimated_vocal_presentation,
             "estimated_pitch_hz": self.estimated_pitch_hz,
+            "source_vocal_presentation": self.source_vocal_presentation,
+            "source_pitch_hz": self.source_pitch_hz,
             "reference_source": self.reference_source,
             "reference_voice_id": self.reference_voice_id,
         }
@@ -650,6 +682,8 @@ class VoiceProfile:
                 "estimated_vocal_presentation", "unknown"
             ),  # type: ignore[arg-type]
             estimated_pitch_hz=payload.get("estimated_pitch_hz"),  # type: ignore[arg-type]
+            source_vocal_presentation=str(payload.get("source_vocal_presentation", "unknown")),
+            source_pitch_hz=payload.get("source_pitch_hz"),  # type: ignore[arg-type]
             reference_source=str(payload.get("reference_source", "film")),
             reference_voice_id=payload.get("reference_voice_id"),  # type: ignore[arg-type]
         )
@@ -1738,6 +1772,7 @@ def _build_profile(
     directory: Path,
     target: float,
     clone_encoder: ClonePromptEncoder | None,
+    register: SpeakerRegister | None = None,
 ) -> VoiceProfile:
     """Extract the reference, cache its clone prompt, and describe the profile."""
 
@@ -1752,8 +1787,24 @@ def _build_profile(
 
     reference = speaker_dir / REFERENCE_FILENAME
     _extract_reference(source, candidate, destination=reference)
-    pitch_hz, vocal_presentation = _estimate_vocal_presentation(reference)
+    window_pitch, window_presentation = _estimate_vocal_presentation(reference)
 
+    # The aggregate wins when it exists: one window can be an expressive outlier or a
+    # misattributed turn, while the weighted median of every turn the speaker has
+    # cannot. The window is only the fallback for a speaker with too little
+    # measurable speech to aggregate.
+    if register is not None and register.confident and register.median_hz is not None:
+        pitch_hz = register.median_hz
+        vocal_presentation = register.presentation
+        measured = (
+            f"{register.median_hz:.0f} Hz over {register.measured_turns} turn(s)"
+        )
+    else:
+        pitch_hz = window_pitch
+        vocal_presentation = window_presentation
+        measured = "measured from this window only"
+
+    reason = candidate.selection_reason()
     return VoiceProfile(
         speaker_id=speaker_id,
         reference_audio=reference,
@@ -1767,9 +1818,11 @@ def _build_profile(
             encoder=clone_encoder,
         ),
         quality_score=candidate.quality_score(target),
-        selection_reason=candidate.selection_reason(),
+        selection_reason=f"{reason}; register {measured}",
         estimated_vocal_presentation=vocal_presentation,
         estimated_pitch_hz=pitch_hz,
+        source_vocal_presentation=vocal_presentation,
+        source_pitch_hz=pitch_hz,
     )
 
 
@@ -1782,6 +1835,7 @@ def build_voice_profiles(
     settings: Settings | None = None,
     clone_encoder: ClonePromptEncoder | None = None,
     require_reference_transcript: bool = False,
+    registers: Mapping[str, SpeakerRegister] | None = None,
 ) -> dict[str, VoiceProfile]:
     """Build one voice identity per diarized speaker.
 
@@ -1982,6 +2036,7 @@ def build_voice_profiles(
                 directory=directory,
                 target=target,
                 clone_encoder=clone_encoder,
+                register=(registers or {}).get(speaker_id),
             )
 
     return profiles

@@ -61,6 +61,12 @@ ALIGNED_DIRECTORY_NAME = "aligned"
 #: of lip-sync and FFmpeg's own rounding of a tempo change.
 EXACT_FIT_TOLERANCE_SECONDS = 0.03
 
+#: A tempo difference between one character's consecutive lines that is large enough
+#: to be heard as a change of pace rather than as expressive variation. Roughly a
+#: semitone-and-a-half of speaking rate; below it the ear reads the two lines as one
+#: performance, above it as two takes.
+TEMPO_SEAM_LIMIT = 0.20
+
 #: ``atempo`` only accepts factors inside this range, so a configuration outside
 #: it is rejected instead of producing an unusable filter argument.
 ATEMPO_MIN = 0.5
@@ -739,10 +745,42 @@ def align_dialogue(
         guard=guard,
         overlap=resolved.timing_max_overlap_seconds,
     )
+    placed = _report_tempo_seams(placed)
 
     # `placed` is in timeline order; describe the slots back in input order.
     slots_in_input_order = sorted(range(len(by_time)), key=lambda slot: by_time[slot])
     return [placed[slot] for slot in slots_in_input_order]
+
+
+def _report_tempo_seams(aligned: list[AlignedClip]) -> list[AlignedClip]:
+    """Note where one character's adjacent lines are delivered at different speeds.
+
+    After the segmentation fix a line is a whole utterance, so this is the seam that
+    remains: an overlong line is sped up and the next one is not, and the same voice
+    audibly changes pace between two sentences. Nothing is re-rendered here - a tempo
+    is what made the line fit, and silently trading fit for smoothness would put the
+    line back over its neighbour - but the seam is measured and attached to the later
+    clip, so a report can show a reader where the remaining unevenness is.
+    """
+
+    out = list(aligned)
+    for index in range(1, len(out)):
+        previous, current = out[index - 1], out[index]
+        if previous.speaker_id != current.speaker_id:
+            continue
+        jump = abs(current.tempo - previous.tempo)
+        if jump < TEMPO_SEAM_LIMIT:
+            continue
+        out[index] = replace(
+            current,
+            notes=current.notes
+            + (
+                f"delivery speed differs from this character's previous line by "
+                f"{jump:.2f}x ({previous.tempo:.2f} -> {current.tempo:.2f}), which can "
+                "be heard as a cut",
+            ),
+        )
+    return out
 
 
 def _cascade(
@@ -847,6 +885,7 @@ __all__ = [
     "ATEMPO_MIN",
     "EXACT_FIT_TOLERANCE_SECONDS",
     "PIPELINE_SAMPLE_RATE",
+    "TEMPO_SEAM_LIMIT",
     "TIMING_DIRECTORY_NAME",
     "AlignedClip",
     "ConfigurationError",

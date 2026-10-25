@@ -253,6 +253,40 @@ def test_a_later_line_is_not_pushed_by_one_that_started_after_it(tmp_path: Path)
     assert later.start >= earlier.end - DEFAULT_TIMING_MAX_OVERLAP_SECONDS - 1e-6
 
 
+def test_a_change_of_pace_between_one_characters_lines_is_noted(tmp_path: Path) -> None:
+    """The remaining seam after segmentation: the same voice changing speed.
+
+    A line that has to be sped up to fit, followed by one that does not, is heard as
+    two takes. Nothing is re-rendered - the tempo is what made the line fit - but the
+    seam is measured so a report can show where the unevenness is.
+    """
+
+    clips = [
+        # 0.4s of room for 1.6s of speech: clamped hard.
+        _clip(tmp_path, index=0, start=5.0, end=5.4, speech=1.6),
+        # Comfortable window: no tempo change at all.
+        _clip(tmp_path, index=1, start=5.8, end=8.0, speech=1.0),
+    ]
+
+    aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
+
+    first, second = aligned
+    assert abs(second.tempo - first.tempo) > timing.TEMPO_SEAM_LIMIT
+    assert any("delivery speed differs" in note for note in second.notes)
+    assert not any("delivery speed differs" in note for note in first.notes)
+
+
+def test_a_change_of_speaker_is_not_a_tempo_seam(tmp_path: Path) -> None:
+    clips = [
+        _clip(tmp_path, index=0, start=5.0, end=5.4, speech=1.6, speaker_id="SPEAKER_00"),
+        _clip(tmp_path, index=1, start=5.8, end=8.0, speech=1.0, speaker_id="SPEAKER_01"),
+    ]
+
+    aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
+
+    assert not any("delivery speed differs" in note for note in aligned[1].notes)
+
+
 def test_a_moved_line_says_so_on_the_clip(tmp_path: Path) -> None:
     clips = [
         _clip(tmp_path, index=0, start=5.0, end=5.4, speech=1.6),

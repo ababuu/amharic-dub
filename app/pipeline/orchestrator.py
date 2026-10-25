@@ -57,6 +57,7 @@ from app.pipeline import (
     evaluation,
     mixing,
     qc,
+    register,
     separation,
     timing,
     transcription,
@@ -144,6 +145,10 @@ class PipelineResult:
     #: Anything the TTS stage wanted the run to know without treating it as a failure.
     notes: tuple[str, ...] = ()
     speaker_corrections: tuple[diarization.SpeakerAttributionCorrection, ...] = ()
+    #: Per-speaker register measured from the voice itself, and the turns whose
+    #: label it contradicted. The audit trail for "why was this character cast with
+    #: this voice?".
+    attribution: register.AttributionReport | None = None
 
     @property
     def final_video(self) -> Path:
@@ -162,6 +167,44 @@ class PipelineResult:
         """Lines whose delivery could not be fitted to their original window."""
 
         return tuple(line for line in self.alignment if not line.fits)
+
+    def _attribution_dict(self) -> dict[str, Any]:
+        """Return the register audit: what each voice measured, and what moved."""
+
+        if self.attribution is None:
+            return {}
+
+        def registers(items: Mapping[str, register.SpeakerRegister]) -> dict[str, Any]:
+            return {
+                speaker_id: {
+                    "median_hz": measured.median_hz,
+                    "low_hz": measured.low_hz,
+                    "high_hz": measured.high_hz,
+                    "presentation": measured.presentation,
+                    "turns": measured.turns,
+                    "measured_turns": measured.measured_turns,
+                    "speech_seconds": round(measured.speech_seconds, 3),
+                    "confident": measured.confident,
+                }
+                for speaker_id, measured in items.items()
+            }
+
+        return {
+            "before": registers(self.attribution.before),
+            "after": registers(self.attribution.after),
+            "reassigned_fraction": round(self.attribution.reassigned_fraction, 4),
+            "corrections": [
+                {
+                    "start": correction.start,
+                    "end": correction.end,
+                    "from": correction.from_speaker,
+                    "to": correction.to_speaker,
+                    "median_hz": correction.median_hz,
+                }
+                for correction in self.attribution.corrections
+            ],
+            "warning": register.disagreement(self.attribution),
+        }
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe view of the run, for a manifest or a report."""
@@ -220,7 +263,8 @@ class PipelineResult:
                 "lines": len(self.dialogue),
                 "segments": [_dialogue_dict(line) for line in self.dialogue],
             },
-            "voice_profiles": {                speaker_id: {
+            "voice_profiles": {
+                speaker_id: {
                     "reference_audio": portable_path(profile.reference_audio),
                     "reference_start": profile.reference_start,
                     "reference_end": profile.reference_end,
@@ -235,11 +279,16 @@ class PipelineResult:
                     "selection_reason": profile.selection_reason,
                     "estimated_vocal_presentation": profile.estimated_vocal_presentation,
                     "estimated_pitch_hz": profile.estimated_pitch_hz,
+                    # What the film itself contained, kept even after a bank voice
+                    # replaced it, so a casting decision can be audited.
+                    "source_vocal_presentation": profile.source_vocal_presentation,
+                    "source_pitch_hz": profile.source_pitch_hz,
                     "reference_source": profile.reference_source,
                     "reference_voice_id": profile.reference_voice_id,
                 }
                 for speaker_id, profile in self.profiles.items()
             },
+            "speakers": self._attribution_dict(),
             "tts": {
                 "clips": [clip.to_dict() for clip in self.clips],
                 # Lines the stage could not voice. Recorded because a line missing
@@ -544,6 +593,36 @@ def run_pipeline(
     if not lines:
         raise EmptyStageError("transcription produced no lines; nothing to adapt")
 
+    # Who is speaking, measured from the voice itself. Diarization usually gets the
+    # clusters right and a handful of turns wrong, and one wrong turn is enough to
+    # hand a character the wrong voice for the whole film - the reference recording
+    # is cut from a single turn. It also has to run *before* sentences are assembled:
+    # a stretch where two people were labelled as one speaker can only split into
+    # two sentences once the labels are right.
+    try:
+        lines, attribution = register.repair_attribution(lines, stems.speech)
+    except register.RegisterError as exc:
+        # Loud, never silent: this stage is what stops a character being cast with the
+        # wrong gender, so a run that loses it has to say so rather than quietly
+        # falling back to raw diarization labels.
+        report(f"  register: unavailable ({exc}); keeping diarization labels")
+        lines, attribution = list(lines), None
+
+    if attribution is not None:
+        for speaker_id, measured in attribution.after.items():
+            report(f"  register: {measured.describe()}")
+        if attribution.corrections:
+            report(
+                f"  speaker verification: reassigned {len(attribution.corrections)} "
+                f"turn(s) whose pitch contradicted their label "
+                f"({attribution.reassigned_fraction:.0%} of the transcript)"
+            )
+        untrustworthy = register.disagreement(attribution)
+        if untrustworthy:
+            report(f"  cast warning: {untrustworthy}")
+
+    lines = tuple(lines)
+
     # A transcriber segments on pauses, not on grammar, so one spoken sentence
     # routinely arrives as several segments. Adapting and speaking each of them
     # separately produces exactly what a listener hears as broken delivery: the
@@ -634,6 +713,13 @@ def run_pipeline(
                 f"{resolved.tts_engine} speaks every character in one voice)"
             )
     else:
+        # Runs measured from the repaired transcript rather than from the raw
+        # diarization: a turn that contains two people cannot describe one voice, and
+        # the transcript's own word timings are the more precise boundary.
+        profile_turns = [
+            SpeakerSegment(speaker_id, start, end)
+            for speaker_id, start, end in register.contiguous_turns(lines)
+        ]
         # Built from every transcribed line, not from a shortened run: a profile is a
         # character's identity and is reused across runs, so it is never truncated.
         profiles = _stage(
@@ -641,7 +727,7 @@ def run_pipeline(
             seconds,
             report,
             voice_profiles.build_voice_profiles,
-            turns,
+            profile_turns,
             stems.speech,
             # Simultaneous speech is passed in because it is the one thing the
             # per-line overlap check cannot see: the turns it compares are exclusive,
@@ -652,6 +738,7 @@ def run_pipeline(
             # Casting replaces the film reference, so its transcript no longer has
             # to be exact - the bank clip brings its own.
             require_reference_transcript=bank is None,
+            registers=attribution.after if attribution is not None else None,
         )
         if not profiles:
             raise EmptyStageError(
@@ -823,6 +910,7 @@ def run_pipeline(
         lines=lines,
         crosstalk=crosstalk,
         speaker_corrections=speaker_corrections,
+        attribution=attribution,
         dialogue=dialogue,
         profiles=dict(profiles),
         clips=clips,
