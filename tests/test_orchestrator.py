@@ -688,6 +688,28 @@ def test_without_samples_the_films_own_references_are_used(
     assert profile.reference_text != "ሰላም"
 
 
+def _write_local_samples(directory: Path) -> Path:
+    """Write one compliant recording/transcript pair, in the operator's convention."""
+
+    import numpy as np
+    import soundfile as sf
+
+    directory.mkdir(parents=True, exist_ok=True)
+    rate = 48_000
+    seconds = 6.0
+    time = np.arange(int(seconds * rate)) / rate
+    sf.write(
+        str(directory / "male-01.wav"),
+        (0.3 * np.sin(2 * np.pi * 120.0 * time)).astype(np.float32),
+        rate,
+    )
+    word = "\u123b\u122d"
+    (directory / "male-01.txt").write_text(
+        " ".join([word] * 16) + "\u1362", encoding="utf-8"
+    )
+    return directory
+
+
 def _write_bank(root: Path) -> Path:
     """Build a one-voice bank so the casting path runs without the network."""
 
@@ -1147,9 +1169,35 @@ def test_cast_from_bank_builds_a_missing_bank_before_the_run(
     assert profile.reference_source == "voice_bank"
 
 
-def test_cast_from_bank_reuses_an_existing_bank(
+def test_cast_from_bank_prefers_the_operators_own_samples(
     tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Supplied recordings beat a corpus download, which would replace them."""
+
+    from app.pipeline import voice_bank as vb
+
+    samples = tmp_path / "voice-samples"
+    _write_local_samples(samples)
+    settings = _settings(tmp_path, voice_sample_dir=samples)
+    monkeypatch.setattr(orchestrator, "get_settings", lambda: settings)
+
+    def no_corpus(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("the corpus must not be used when samples are supplied")
+
+    monkeypatch.setattr(orchestrator.voice_bank, "build_voice_bank", no_corpus)
+
+    code = orchestrator.main(
+        [str(_source(tmp_path)), "--out", str(tmp_path / "run"), "--cast-from-bank"]
+    )
+
+    assert code == 0
+    assert (tmp_path / "voice-bank" / vb.BANK_MANIFEST_FILENAME).is_file()
+    (_dialogue, _speech, received, _passed) = stages.received["tts"]
+    (profile,) = received.values()
+    assert profile.reference_source == "voice_bank"
+
+
+def test_cast_from_bank_reuses_an_existing_bank(tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch) -> None:
     """An already-built bank is not rebuilt: the build is network work, not a no-op."""
 
     bank_dir = _write_bank(tmp_path)

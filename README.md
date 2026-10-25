@@ -262,6 +262,34 @@ VOICE_BANK_DIR=data/voice-bank              # already the default; delete the
                                             # manifest to switch casting off
 ```
 
+**Or build from your own recordings** instead of a public corpus, which needs no network
+at all:
+
+```bash
+# data/voice-samples/male-01.wav + male-01.txt, female-01.wav + female-01.txt, ...
+python scripts/build_voice_bank.py --from-dir data/voice-samples
+```
+
+Each pair is `<name>.<audio>` beside `<name>.txt`, the name starting `male`/`female`
+(`man`/`woman` also accepted), the audio **4-10 seconds of one voice**, and the text the
+exact words in that clip in Fidel — no Latin, no numerals. `wav`, `flac`, `ogg`, `opus`
+and `mp3` are read; `m4a`/`aac` are not, because libsndfile has no MP4 support, so
+convert those first. Gender comes from the name; duration, pitch and the canonical 24 kHz
+mono clip are measured, so nothing else has to be declared. A validation pass reports
+**every** problem in one go — too long, too short, empty or mismatched transcript,
+missing pair — rather than stopping at the first, because otherwise fixing eighteen
+recordings would take eighteen runs.
+
+Nothing is trimmed on the way in. Cutting a clip in half would leave its transcript
+describing audio that is no longer there, and that mismatch is what makes the model speak
+the reference before the line; a recording that is too long is refused with that
+explanation instead.
+
+A bank is a build artifact and is not committed, so a fresh checkout has none. On the
+command line, `--cast-from-bank` builds one before the run if the bank directory is
+empty — **from `VOICE_SAMPLE_DIR` when that holds recording/transcript pairs**, and only
+from the public corpus when it does not:
+
 With a bank present, each character is given a human Amharic recording as its cloning
 reference instead of a window cut from the film. The reference audio, its transcript and
 the line are then all Amharic, which removes the cross-lingual mismatch at its source

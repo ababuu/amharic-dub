@@ -1185,6 +1185,371 @@ def _voice_id(gender: str, speaker: str, taken: set[str]) -> str:
     return candidate
 
 
+#: Audio extensions an operator's own recordings may arrive in. MP3 is the common one,
+#: and ``soundfile`` reads it through libsndfile 1.2. ``m4a``/``aac`` are deliberately
+#: absent: libsndfile has no MP4 container support, so accepting them would fail later
+#: with a decode error instead of here with an explanation.
+SAMPLE_AUDIO_SUFFIXES: tuple[str, ...] = (
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".ogg",
+    ".opus",
+)
+
+#: Prefixes that declare a recording's gender. Accepted from the file name because that
+#: is the one piece of metadata an operator can supply by renaming a file, and gender is
+#: the only attribute casting can act on.
+_GENDER_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("female", "female"),
+    ("woman", "female"),
+    ("male", "male"),
+    ("man", "male"),
+)
+
+#: Peak a local recording must stay below to be trusted. Above full scale, the MP3
+#: decoder is reporting a compressed source that was already distorting, and a clone
+#: learns that distortion along with the voice.
+_SAMPLE_CLIP_CEILING = 0.999
+
+#: Delivery rates beyond these, in syllables per second, cannot describe real speech at
+#: all - so a transcript there is describing different audio. Inside them, a transcript
+#: may still be slightly off, but genuine delivery varies enough (measured 6.2 to 9.3
+#: syllables/second across one operator's eighteen recordings) that a tight bound would
+#: reject good files on a coin flip. So only a gross mismatch is refused; a merely fast
+#: or slow reading is reported and kept.
+_SAMPLE_RATE_CEILING = 13.0
+_SAMPLE_RATE_FLOOR = 1.5
+
+
+@dataclass(frozen=True, slots=True)
+class SampleProblem:
+    """One reason a supplied recording cannot be banked, named for its file."""
+
+    name: str
+    reason: str
+
+
+def sample_gender(stem: str) -> str | None:
+    """Return the gender a file name declares, or ``None``.
+
+    ``male-01``, ``Female_3`` and ``woman07`` all declare one. Anything else does not -
+    a name is not evidence, and guessing a gender for a voice would put a character in
+    the wrong register for a whole film.
+    """
+
+    lowered = stem.strip().lower()
+    for prefix, gender in _GENDER_PREFIXES:
+        if lowered.startswith(prefix):
+            return gender
+    return None
+
+
+def _sample_voice_id(stem: str, gender: str, taken: set[str]) -> str:
+    """Return ``am-m-01``-style ids from an operator's file name.
+
+    The number is taken from the name when it has one, so ``male-07`` stays voice 7 and
+    an operator's notes about a file keep matching the bank.
+    """
+
+    marker = "m" if gender == "male" else "f"
+    match = re.search(r"(\d+)\s*$", stem)
+    if match:
+        base = f"am-{marker}-{match.group(1).zfill(2)}"
+    else:
+        slug = re.sub(r"[^0-9a-zA-Z]+", "", stem)[-12:] or "voice"
+        base = f"am-{marker}-{slug}"
+
+    candidate = base
+    counter = 2
+    while candidate in taken:
+        candidate = f"{base}-{counter}"
+        counter += 1
+    return candidate
+
+
+def _audio_bytes_peak(path: Path) -> float:
+    """Return a recording's peak sample without keeping it in memory."""
+
+    samples, _rate = _read_reference(path)
+    return float(np.abs(samples).max()) if samples.size else 0.0
+
+
+def build_voice_bank_from_samples(
+    source: str | Path,
+    *,
+    destination: str | Path | None = None,
+    settings: Settings | None = None,
+    filters: BankFilters | None = None,
+    report: Callable[[str], None] | None = None,
+) -> VoiceBank:
+    """Build a bank from an operator's own recordings and transcripts.
+
+    The corpus builder in :func:`build_voice_bank` filters rows it did not record; this
+    one validates files someone chose deliberately, so it is strict where that one is
+    selective, and it reports **every** problem in one pass rather than stopping at the
+    first. An operator with eighteen files should learn about all of them at once.
+
+    Each recording is expected as ``<stem>.<audio>`` beside ``<stem>.txt``, with the
+    name starting ``male``/``female`` (or ``man``/``woman``):
+
+    * the **audio** is kept whole and must already be a cloning-length clip - 4 to 10
+      seconds of one voice. Nothing is trimmed here: cutting a clip in half would leave
+      its transcript describing audio that is no longer there, which is exactly the
+      mismatch that makes the model speak the reference before the line.
+    * the **text** is the exact words in that clip, Fidel only, no numerals.
+
+    Parameters
+    ----------
+    source:
+        Directory holding the recording/transcript pairs.
+    destination:
+        Where to write the bank. Defaults to ``settings.voice_bank_dir``.
+    filters:
+        Supplies the duration bounds. Defaults to :class:`BankFilters`.
+
+    Raises
+    ------
+    BankBuildError
+        A pair is invalid, or nothing usable was found. The message lists every problem.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    base = Path(source)
+    if not base.is_dir():
+        raise BankBuildError(f"no sample directory at {base}")
+
+    directory = Path(destination) if destination is not None else Path(resolved.voice_bank_dir)
+    rules = filters if filters is not None else BankFilters()
+    say = report if report is not None else (lambda _message: None)
+
+    recordings = sorted(
+        path
+        for path in base.iterdir()
+        if path.is_file() and path.suffix.lower() in SAMPLE_AUDIO_SUFFIXES
+    )
+    if not recordings:
+        raise BankBuildError(
+            f"no {'/'.join(SAMPLE_AUDIO_SUFFIXES)} recordings in {base}"
+        )
+
+    say(f"reading {len(recordings)} recording(s) from {base}")
+
+    problems: list[SampleProblem] = []
+    warnings: list[str] = []
+    accepted: list[tuple[Path, str, str, float, str]] = []
+
+    for path in recordings:
+        # Every reason this file is unusable, not just the first: an operator fixing
+        # eighteen recordings should not have to fix one problem per round trip.
+        reasons: list[str] = []
+        gender = sample_gender(path.stem)
+        if gender is None:
+            problems.append(
+                SampleProblem(path.name, "name does not start with male/female")
+            )
+            continue
+
+        text = ""
+        transcript = path.with_suffix(".txt")
+        if not transcript.is_file():
+            reasons.append(f"no {transcript.name} beside it")
+        else:
+            try:
+                text = _normalise_text(transcript.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError) as exc:
+                reasons.append(f"could not read {transcript.name}: {exc}")
+            else:
+                if not text:
+                    reasons.append(f"{transcript.name} is empty")
+                elif has_latin(text):
+                    reasons.append("transcript contains Latin script; write it in Fidel")
+                elif any(character.isdigit() for character in text):
+                    reasons.append("transcript contains numerals; spell them out")
+
+        samples: np.ndarray | None = None
+        rate = 0
+        try:
+            samples, rate = _read_reference(path)
+        except MissingBankError as exc:
+            reasons.append(str(exc))
+
+        duration = samples.size / float(rate) if samples is not None else 0.0
+        if samples is not None:
+            if duration < rules.min_clip_seconds:
+                reasons.append(
+                    f"is {duration:.2f}s; a cloning reference needs "
+                    f"{rules.min_clip_seconds:g}-{rules.max_clip_seconds:g}s"
+                )
+            elif duration > rules.max_clip_seconds:
+                reasons.append(
+                    f"is {duration:.2f}s; cut it to "
+                    f"{rules.min_clip_seconds:g}-{rules.max_clip_seconds:g}s and make the "
+                    "transcript match the trimmed audio"
+                )
+
+            peak = float(np.abs(samples).max())
+            if peak >= _SAMPLE_CLIP_CEILING:
+                warnings.append(
+                    f"{path.name}: peaks at {peak:.2f} (full scale is 1.00); if it sounds "
+                    "distorted, re-record - a clone learns the distortion too"
+                )
+
+        syllables = count_syllables(text) if text else 0
+        if text:
+            if syllables < rules.min_syllables:
+                reasons.append(
+                    f"transcript has {syllables} syllable(s); too little to identify a voice"
+                )
+            elif duration > 0:
+                syllables_per_second = syllables / duration
+                # Two tiers on purpose: only a rate no human could produce means the
+                # transcript is describing different audio. A merely brisk or slow
+                # reading is reported and kept, because rejecting on it would turn a
+                # 0.2 syllable/second difference into a failed build.
+                if not (
+                    _SAMPLE_RATE_FLOOR
+                    <= syllables_per_second
+                    <= _SAMPLE_RATE_CEILING
+                ):
+                    reasons.append(
+                        f"transcript is {syllables_per_second:.1f} syllables/second "
+                        f"against {duration:.1f}s of audio, which no speaker could "
+                        "produce - the text does not match this recording"
+                    )
+                elif not (
+                    rules.min_syllables_per_second
+                    <= syllables_per_second
+                    <= rules.max_syllables_per_second
+                ):
+                    warnings.append(
+                        f"{path.name}: {syllables_per_second:.1f} syllables/second is "
+                        "outside the usual band; fine if the delivery really is that "
+                        "fast or slow, worth a listen if it should not be"
+                    )
+
+        if reasons:
+            problems.extend(SampleProblem(path.name, reason) for reason in reasons)
+            continue
+
+        accepted.append((path, gender, text, duration, transcript.name))
+
+    for warning in warnings:
+        say(f"  warning: {warning}")
+
+    if problems:
+        affected = len({problem.name for problem in problems})
+        lines = [
+            f"{affected} of {len(recordings)} recording(s) cannot be banked "
+            f"({len(problems)} problem(s)):"
+        ]
+        lines += [f"  {problem.name}: {problem.reason}" for problem in problems]
+        raise BankBuildError("\n".join(lines))
+
+    if not accepted:
+        raise BankBuildError(f"no usable recording/transcript pair in {base}")
+
+    clip_directory = directory / BANK_CLIP_DIRNAME
+    try:
+        clip_directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BankBuildError(f"could not create {clip_directory}: {exc}") from exc
+
+    built: list[BankVoice] = []
+    taken: set[str] = set()
+    for path, gender, text, _duration, transcript_name in accepted:
+        samples, rate = _read_reference(path)
+        canonical = _canonical_reference(samples, rate)
+        voice_id = _sample_voice_id(path.stem, gender, taken)
+        taken.add(voice_id)
+
+        destination_path = clip_directory / f"{voice_id}.wav"
+        try:
+            sf.write(
+                str(destination_path), canonical, REFERENCE_SAMPLE_RATE, subtype="PCM_16"
+            )
+        except (OSError, RuntimeError) as exc:
+            raise BankBuildError(f"could not write the clip {destination_path}: {exc}") from exc
+
+        pitch_hz, _estimate = estimate_vocal_presentation(destination_path)
+        seconds = canonical.size / float(REFERENCE_SAMPLE_RATE)
+
+        built.append(
+            BankVoice(
+                voice_id=voice_id,
+                audio=destination_path,
+                text=text,
+                duration=seconds,
+                gender=gender,
+                presentation=_GENDER_TO_PRESENTATION[gender],
+                pitch_hz=pitch_hz,
+                source_speaker=path.stem,
+                source_clip_id=transcript_name,
+            )
+        )
+        pitch = f"{pitch_hz:.0f} Hz" if pitch_hz else "pitch unmeasured"
+        say(f"  {voice_id}: {gender}, {seconds:.2f}s, {pitch}, {text[:38]!r}")
+
+    bank = VoiceBank(
+        directory=directory,
+        voices=tuple(built),
+        dataset="local/native-speakers",
+        split="all",
+        revision="",
+        license="operator-supplied",
+    )
+
+    manifest = directory / BANK_MANIFEST_FILENAME
+    payload = bank.to_dict()
+    payload["filters"] = asdict(rules)
+    try:
+        manifest.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        raise BankBuildError(f"could not write {manifest}: {exc}") from exc
+
+    _write_local_attribution(directory, bank, source=base)
+    removed = _prune_orphan_clips(clip_directory, {voice.voice_id for voice in bank})
+    if removed:
+        say(f"removed {len(removed)} clip(s) this build does not use")
+    say(f"wrote {len(bank)} voice(s) to {manifest}")
+    return bank
+
+
+def _write_local_attribution(bank_directory: Path, bank: VoiceBank, *, source: Path) -> Path:
+    """Write a provenance note for a bank built from the operator's own recordings."""
+
+    path = bank_directory / BANK_ATTRIBUTION_FILENAME
+    lines = [
+        "# Voice bank provenance",
+        "",
+        f"This bank was built from **operator-supplied recordings** in `{source.name}/` "
+        f"({len(bank)} voice(s)), not from a public corpus.",
+        "",
+        "Unlike a bank built from a published dataset, there is no upstream licence to "
+        "honour here - but that also means no upstream clear: whoever recorded or "
+        "supplied these voices owns them, and using them as TTS references should rest "
+        "on their consent.",
+        "",
+        "The corpus builder's filters never ran on these files, so nothing here was "
+        "screened for background noise, crosstalk or distortion beyond duration, "
+        "transcript script and speech rate. Listen to the clips before trusting a film "
+        "to them.",
+        "",
+        "Rebuild with:",
+        "",
+        "    python scripts/build_voice_bank.py --from-dir "
+        f"{source.as_posix()}",
+        "",
+    ]
+    try:
+        path.write_text("\n".join(lines), encoding="utf-8")
+    except OSError as exc:
+        raise BankBuildError(f"could not write {path}: {exc}") from exc
+    return path
+
+
 def _balance_unmet(best: Mapping[str, _Candidate], balance: bool) -> bool:
     """Return whether a bank would still be one-sided with the speakers found so far."""
 
@@ -1222,6 +1587,32 @@ def _select_cast(
             if pool:
                 chosen.append(pool.pop(0))
     return chosen
+
+
+def _prune_orphan_clips(clip_directory: Path, keep: set[str]) -> list[str]:
+    """Delete clips the current manifest does not name, and return what went.
+
+    A bank directory outlives the build that made it: rebuilding from a different corpus
+    or a different sample folder leaves the previous build's clips behind. The manifest
+    is what a reader trusts, so orphans are invisible to the pipeline - but they double
+    the size of a committed bank and invite the reader to trust a file that is not a
+    voice, so a rebuild cleans up after itself.
+    """
+
+    removed: list[str] = []
+    if not clip_directory.is_dir():
+        return removed
+    for path in sorted(clip_directory.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in SAMPLE_AUDIO_SUFFIXES:
+            continue
+        if path.stem in keep:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed.append(path.name)
+    return removed
 
 
 def _write_attribution(bank_directory: Path, bank: VoiceBank) -> Path:
@@ -1473,6 +1864,9 @@ def build_voice_bank(
         raise BankBuildError(f"could not write {manifest}: {exc}") from exc
 
     _write_attribution(directory, bank)
+    removed = _prune_orphan_clips(clip_directory, {voice.voice_id for voice in bank})
+    if removed:
+        say(f"removed {len(removed)} clip(s) this build does not use")
     say(f"wrote {len(bank)} voice(s) to {manifest}")
     return bank
 
@@ -1493,11 +1887,15 @@ __all__ = [
     "InvalidBankError",
     "MissingBankError",
     "RowSource",
+    "SAMPLE_AUDIO_SUFFIXES",
+    "SampleProblem",
     "VoiceBank",
     "VoiceBankError",
     "VoiceRequest",
     "apply_voice_bank",
     "assign_bank_voices",
     "build_voice_bank",
+    "build_voice_bank_from_samples",
     "load_voice_bank",
+    "sample_gender",
 ]

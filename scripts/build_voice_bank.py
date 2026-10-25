@@ -49,6 +49,7 @@ from app.pipeline.voice_bank import (  # noqa: E402
     BankFilters,
     HuggingFaceRowSource,
     build_voice_bank,
+    build_voice_bank_from_samples,
 )
 
 
@@ -62,6 +63,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="directory to write the manifest and clips to (default: VOICE_BANK_DIR)",
+    )
+    parser.add_argument(
+        "--from-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "build the bank from your own recordings and transcripts in DIR instead of "
+            "a public corpus. Expects <name>.wav/.mp3 beside <name>.txt, with the name "
+            "starting male/female, and 4-10 second clips."
+        ),
     )
     parser.add_argument(
         "--voices", type=int, default=12, help="how many voices to keep"
@@ -128,18 +140,30 @@ def main(argv: list[str] | None = None) -> int:
             print(message, flush=True)
 
     try:
-        bank = build_voice_bank(
-            destination=args.out,
-            settings=settings,
-            voices=args.voices,
-            filters=filters,
-            source=HuggingFaceRowSource(
-                args.dataset, split=args.split, token=settings.huggingface_token
-            ),
-            balance_genders=not args.no_gender_balance,
-            max_pages=args.max_pages,
-            report=report,
-        )
+        if args.from_dir is not None:
+            # The operator's own recordings: no corpus, no network, no row filters. The
+            # duration bounds do apply, because a clip that is too long cannot be used
+            # without cutting the audio away from its transcript.
+            bank = build_voice_bank_from_samples(
+                args.from_dir,
+                destination=args.out,
+                settings=settings,
+                filters=filters,
+                report=report,
+            )
+        else:
+            bank = build_voice_bank(
+                destination=args.out,
+                settings=settings,
+                voices=args.voices,
+                filters=filters,
+                source=HuggingFaceRowSource(
+                    args.dataset, split=args.split, token=settings.huggingface_token
+                ),
+                balance_genders=not args.no_gender_balance,
+                max_pages=args.max_pages,
+                report=report,
+            )
     except BankBuildError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -33,6 +33,7 @@ from app.pipeline.voice_bank import (
     apply_voice_bank,
     assign_bank_voices,
     build_voice_bank,
+    build_voice_bank_from_samples,
     load_voice_bank,
 )
 from app.pipeline.voice_profiles import VoiceProfile, save_voice_profiles
@@ -625,3 +626,276 @@ def test_building_refuses_a_useless_voice_count(tmp_path) -> None:
             voices=0,
             source=_FakeSource([_row()]),
         )
+
+
+# ---------------------------------------------------------------------------
+# An operator's own recordings
+# ---------------------------------------------------------------------------
+
+FIDEL_WORD = "\u123b\u122d"  # ሻር
+
+
+def _sample(
+    directory: Path,
+    stem: str,
+    *,
+    seconds: float = 6.0,
+    text: str | None = None,
+    suffix: str = ".wav",
+    frequency: float = 150.0,
+    rate: int = 48_000,
+) -> Path:
+    """Write a compliant recording and its transcript, returning the audio path."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    time = np.arange(int(seconds * rate)) / rate
+    path = directory / f"{stem}{suffix}"
+    sf.write(
+        str(path),
+        (0.3 * np.sin(2 * np.pi * frequency * time)).astype(np.float32),
+        rate,
+    )
+    if text is None:
+        # ~5 syllables per second, inside the accepted band.
+        text = " ".join([FIDEL_WORD] * max(8, int(seconds * 5 / 2))) + "\u1362"
+    (directory / f"{stem}.txt").write_text(text, encoding="utf-8")
+    return path
+
+
+def test_a_local_sample_reads_as_a_voice_with_derived_metadata(tmp_path) -> None:
+    samples = tmp_path / "samples"
+    _sample(samples, "male-01", seconds=6.0, frequency=120.0)
+    _sample(samples, "female-07", seconds=5.0, frequency=210.0, suffix=".mp3")
+
+    bank = build_voice_bank_from_samples(
+        samples, destination=tmp_path / "bank", settings=_settings(tmp_path)
+    )
+
+    voices = {voice.voice_id: voice for voice in bank}
+    assert set(voices) == {"am-m-01", "am-f-07"}
+    assert voices["am-m-01"].gender == "male"
+    assert voices["am-m-01"].presentation == "masculine"
+    assert voices["am-f-07"].gender == "female"
+    assert voices["am-f-07"].presentation == "feminine"
+    # Duration, pitch and the clip itself are measured, never taken from the operator.
+    assert voices["am-m-01"].duration == pytest.approx(6.0, abs=0.02)
+    assert voices["am-m-01"].pitch_hz == pytest.approx(120.0, abs=8.0)
+    assert voices["am-f-07"].pitch_hz == pytest.approx(210.0, abs=8.0)
+
+    for voice in bank:
+        info = sf.info(str(voice.audio))
+        assert info.samplerate == 24_000
+        assert info.channels == 1
+        assert " ".join(voice.text.split())[:0] == ""
+
+    assert bank.dataset == "local/native-speakers"
+    assert (tmp_path / "bank" / BANK_MANIFEST_FILENAME).is_file()
+    assert (tmp_path / "bank" / vb.BANK_ATTRIBUTION_FILENAME).is_file()
+    reloaded = load_voice_bank(directory=tmp_path / "bank")
+    assert reloaded is not None and len(reloaded) == 2
+
+
+def test_a_local_sample_that_is_too_long_is_refused_with_advice(tmp_path) -> None:
+    samples = tmp_path / "samples"
+    _sample(samples, "male-01", seconds=25.0)
+
+    with pytest.raises(BankBuildError) as info:
+        build_voice_bank_from_samples(
+            samples, destination=tmp_path / "bank", settings=_settings(tmp_path)
+        )
+
+    message = str(info.value)
+    assert "male-01.wav" in message
+    assert "25.00s" in message
+    assert "make the transcript match the trimmed audio" in message
+    assert "4-10s" in message
+    assert not (tmp_path / "bank" / BANK_MANIFEST_FILENAME).exists()
+
+
+def test_every_problem_is_reported_at_once(tmp_path) -> None:
+    """One round trip per operator, not one per file."""
+
+    samples = tmp_path / "samples"
+    _sample(samples, "male-01", seconds=20.0)
+    # Two problems in one file: too long *and* an empty transcript.
+    audio = _sample(samples, "female-01", seconds=30.0)
+    (samples / "female-01.txt").write_text("   ", encoding="utf-8")
+    _sample(samples, "voice-01", seconds=6.0)  # no gender in the name
+
+    with pytest.raises(BankBuildError) as info:
+        build_voice_bank_from_samples(
+            samples, destination=tmp_path / "bank", settings=_settings(tmp_path)
+        )
+
+    message = str(info.value)
+    assert "3 of 3 recording(s)" in message
+    assert "4 problem(s)" in message
+    assert "female-01.txt is empty" in message
+    assert "female-01.wav: is 30.00s" in message
+    assert "voice-01.wav: name does not start with male/female" in message
+    assert audio.is_file()
+
+
+@pytest.mark.parametrize(
+    ("text", "fragment"),
+    [
+        ("\u123b\u122d Bole", "Latin script"),
+        ("\u123b\u122d 19", "numerals"),
+    ],
+)
+def test_a_transcript_that_is_not_fidel_is_refused(tmp_path, text, fragment) -> None:
+    samples = tmp_path / "samples"
+    _sample(samples, "male-01", text=text)
+
+    with pytest.raises(BankBuildError) as info:
+        build_voice_bank_from_samples(
+            samples, destination=tmp_path / "bank", settings=_settings(tmp_path)
+        )
+
+    assert fragment in str(info.value)
+
+
+def test_a_transcript_that_cannot_fit_its_audio_is_refused(tmp_path) -> None:
+    samples = tmp_path / "samples"
+    _sample(samples, "male-01", seconds=6.0, text=" ".join([FIDEL_WORD] * 120))
+
+    with pytest.raises(BankBuildError) as info:
+        build_voice_bank_from_samples(
+            samples, destination=tmp_path / "bank", settings=_settings(tmp_path)
+        )
+
+    assert "no speaker could produce" in str(info.value)
+
+
+def test_a_recording_without_a_transcript_is_refused(tmp_path) -> None:
+    samples = tmp_path / "samples"
+    audio = _sample(samples, "male-01")
+    (samples / "male-01.txt").unlink()
+
+    with pytest.raises(BankBuildError) as info:
+        build_voice_bank_from_samples(
+            samples, destination=tmp_path / "bank", settings=_settings(tmp_path)
+        )
+
+    assert "no male-01.txt beside it" in str(info.value)
+    assert audio.is_file()
+
+
+def test_a_hot_recording_is_reported_but_still_banked(tmp_path) -> None:
+    """Above full scale is a warning, not a rejection: only a listen can judge it."""
+
+    samples = tmp_path / "samples"
+    path = _sample(samples, "male-01")
+    # A float WAV, because PCM_16 clamps at full scale: the overshoot that makes a
+    # recording "hot" only survives in a float container (or across an MP3 decode).
+    samples_out, rate = sf.read(str(path), dtype="float32")
+    sf.write(str(path), (samples_out * 4.0).astype(np.float32), rate, subtype="FLOAT")
+
+    lines: list[str] = []
+    bank = build_voice_bank_from_samples(
+        samples,
+        destination=tmp_path / "bank",
+        settings=_settings(tmp_path),
+        report=lines.append,
+    )
+
+    assert len(bank) == 1
+    assert any("peaks at" in line for line in lines)
+    # Attenuated to the reference peak on the way in, so the bank clip itself is safe.
+    peak = float(np.abs(sf.read(str(bank.voices[0].audio), dtype="float32")[0]).max())
+    assert peak <= 1.0
+
+
+def test_an_empty_sample_directory_is_refused(tmp_path) -> None:
+    empty = tmp_path / "samples"
+    empty.mkdir()
+    with pytest.raises(BankBuildError, match="no"):
+        build_voice_bank_from_samples(
+            empty, destination=tmp_path / "bank", settings=_settings(tmp_path)
+        )
+
+
+def test_a_rebuild_prunes_clips_it_no_longer_uses(tmp_path) -> None:
+    """A bank directory outlives the build that made it."""
+
+    samples = tmp_path / "samples"
+    _sample(samples, "male-01", seconds=6.0)
+    _sample(samples, "female-01", seconds=6.0)
+    bank_dir = tmp_path / "bank"
+    build_voice_bank_from_samples(
+        samples, destination=bank_dir, settings=_settings(tmp_path)
+    )
+    assert len(list((bank_dir / "clips").glob("*.wav"))) == 2
+
+    (samples / "female-01.wav").unlink()
+    (samples / "female-01.txt").unlink()
+    lines: list[str] = []
+    bank = build_voice_bank_from_samples(
+        samples,
+        destination=bank_dir,
+        settings=_settings(tmp_path),
+        report=lines.append,
+    )
+
+    assert [voice.voice_id for voice in bank] == ["am-m-01"]
+    assert [path.stem for path in (bank_dir / "clips").glob("*.wav")] == ["am-m-01"]
+    assert any("removed 1 clip" in line for line in lines)
+
+
+def test_a_mildly_unusual_delivery_rate_is_warned_about_not_refused(tmp_path) -> None:
+    """A fast speaker is not a mismatched transcript.
+
+    Measured delivery across one operator's eighteen recordings ran 6.2-9.3
+    syllables/second, so a bound tight enough to reject 9.3 would reject good files on a
+    coin flip. Only a rate no speaker could produce means the text describes other audio.
+    """
+
+    samples = tmp_path / "samples"
+    # 32 syllables over 3.2s = 10 syllables/second: brisk, but a real delivery.
+    _sample(
+        samples,
+        "female-07",
+        seconds=3.2,
+        text=" ".join([FIDEL_WORD] * 16) + "\u1362",
+    )
+    lines: list[str] = []
+
+    bank = build_voice_bank_from_samples(
+        samples,
+        destination=tmp_path / "bank",
+        settings=_settings(tmp_path),
+        report=lines.append,
+        filters=BankFilters(min_clip_seconds=3.0),
+    )
+
+    assert len(bank) == 1
+    assert any("outside the usual band" in line for line in lines)
+
+
+def test_an_impossible_delivery_rate_is_refused(tmp_path) -> None:
+    samples = tmp_path / "samples"
+    # A whole paragraph claimed against six seconds: ~25 syllables/second.
+    _sample(samples, "male-01", seconds=6.0, text=" ".join([FIDEL_WORD] * 150))
+
+    with pytest.raises(BankBuildError) as info:
+        build_voice_bank_from_samples(
+            samples, destination=tmp_path / "bank", settings=_settings(tmp_path)
+        )
+
+    assert "no speaker could produce" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("stem", "gender"),
+    [
+        ("male-01", "male"),
+        ("Female_3", "female"),
+        ("woman07", "female"),
+        ("MAN-2", "male"),
+        ("voice-01", None),
+        ("-01", None),
+    ],
+)
+def test_a_file_name_declares_a_gender_or_it_does_not(stem, gender) -> None:
+    assert vb.sample_gender(stem) == gender
+

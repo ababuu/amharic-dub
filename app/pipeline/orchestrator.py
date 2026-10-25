@@ -1012,10 +1012,14 @@ def ensure_voice_bank(
     """Return the bank in ``directory``, building one there first if it is empty.
 
     Casting needs a bank, and a bank is a build artifact rather than a committed file,
-    so a fresh checkout has nothing to cast from. Building it is cheap (metadata plus a
-    dozen short clips - no model, no GPU) but it is not free and it needs the network,
-    which is why the orchestrator never does it implicitly: this is only reached when
-    the caller asked for casting on the command line.
+    so a fresh checkout has nothing to cast from. Building it is cheap (no model, no GPU)
+    and is the only step the pipeline does implicitly - and only because the caller asked
+    for casting on the command line.
+
+    **Own recordings win over a public corpus.** When ``voice_sample_dir`` holds
+    recording/transcript pairs, the bank is built from those: an operator who took the
+    trouble to supply voices does not want a download to replace them. The corpus is the
+    fallback for an installation that supplied nothing.
 
     Raises
     ------
@@ -1031,14 +1035,37 @@ def ensure_voice_bank(
         say(f"voice bank: using the {len(existing)} voice(s) already in {base}")
         return existing
 
-    say(f"voice bank: none in {base}; building one before the run")
-    built = voice_bank.build_voice_bank(
-        destination=base,
-        settings=settings,
-        voices=voices,
-        max_pages=max_pages,
-        report=say,
+    samples = Path(settings.voice_sample_dir)
+    supplied = (
+        sorted(
+            path
+            for path in samples.iterdir()
+            if path.is_file() and path.suffix.lower() in voice_bank.SAMPLE_AUDIO_SUFFIXES
+        )
+        if samples.is_dir()
+        else []
     )
+
+    if supplied:
+        say(
+            f"voice bank: none in {base}; building one from the {len(supplied)} "
+            f"recording(s) in {samples}"
+        )
+        built = voice_bank.build_voice_bank_from_samples(
+            samples,
+            destination=base,
+            settings=settings,
+            report=say,
+        )
+    else:
+        say(f"voice bank: none in {base}; building one from the public corpus")
+        built = voice_bank.build_voice_bank(
+            destination=base,
+            settings=settings,
+            voices=voices,
+            max_pages=max_pages,
+            report=say,
+        )
     say(f"voice bank: built {len(built)} voice(s) in {base}")
     return built
 
