@@ -109,6 +109,20 @@ from app.pipeline.voice_profiles import (
 #: Stage directory inside ``WORK_DIR``; every path this module writes lives here.
 TTS_DIRECTORY_NAME = "tts"
 
+#: Frame used to decide whether a take is sounding, in seconds. Short enough that the
+#: attack of a consonant is not missed, long enough that one sample cannot decide it.
+SPEECH_GATE_FRAME_SECONDS = 0.01
+
+#: How far above a take's own quietest level a frame must sit to count as speech. A
+#: relative gate, not an absolute one: a line the model rendered quietly keeps all of
+#: its speech, where an absolute threshold deletes it (OmniVoice's own output cleaning
+#: used -50 dBFS and emptied a whole word).
+SPEECH_GATE_FRACTION = 0.06
+
+#: Silence kept either side of the detected speech, in seconds, so the trim never
+#: clips an attack or a decay.
+SPEECH_GATE_GUARD_SECONDS = 0.03
+
 #: Sub-directory holding the takes an engine produced, before pauses are rendered.
 TAKE_DIRECTORY_NAME = "takes"
 
@@ -1224,11 +1238,25 @@ class OmniVoiceEngine(VoiceCloningEngine):
         # Keep token selection greedy, but leave position selection at OmniVoice's
         # recommended default. Greedy position selection can produce unnatural,
         # repeated openings in cloned speech.
+        fields = _config_fields(config_class)
+        extra: dict[str, Any] = {}
+        if "postprocess_output" in fields:
+            # The engine's own output cleaning is destructive: it removes silence at an
+            # *absolute* -50 dBFS threshold measured on audio that has already been
+            # rounded to PCM16, so a quiet but real phoneme is indistinguishable from
+            # silence and a short line can come back as nothing at all. It emptied a
+            # four-syllable word ("ይጠፋል።") and stopped a whole run. Trimming is done in
+            # this module instead, against each take's own peak - see
+            # ``_trim_to_speech``. Fades and edge padding, which only prevent clicks,
+            # are still applied by the engine.
+            extra["postprocess_output"] = False
+
         config = config_class(
             num_step=self._steps,
             guidance_scale=self._guidance_scale,
             position_temperature=5.0,
             class_temperature=0.0,
+            **extra,
         )
         # ``instruct`` is OmniVoice's *voice-design* control: it accepts only a closed
         # vocabulary of accent/age/style words and rejects free-form instructions.
@@ -1251,6 +1279,24 @@ class OmniVoiceEngine(VoiceCloningEngine):
 
         samples = _first_waveform(produced, engine="OmniVoice", text=text)
         return _write_mono(target, samples, self.sample_rate, label="OmniVoice take")
+
+
+def _config_fields(config_class: Any) -> frozenset[str]:
+    """Return the field names a generation-config class accepts.
+
+    OmniVoice's config is a dataclass; the names are inspected rather than tried so an
+    installation whose version predates a field keeps working instead of failing on
+    every line.
+    """
+
+    fields = getattr(config_class, "__dataclass_fields__", None)
+    if isinstance(fields, dict):
+        return frozenset(fields)
+
+    try:
+        return frozenset(inspect.signature(config_class).parameters)
+    except (TypeError, ValueError):
+        return frozenset()
 
 
 def _first_waveform(produced: Any, *, engine: str, text: str) -> np.ndarray:
@@ -1682,6 +1728,51 @@ def _require_output(path: Path, *, what: str, engine: str) -> Path:
     return path
 
 
+def _trim_to_speech(samples: np.ndarray, sample_rate: int) -> tuple[np.ndarray, float]:
+    """Trim leading and trailing silence, keeping a small guard, and say how much.
+
+    The engine's own trimming is absolute (-50 dBFS) and is applied to audio that has
+    already been rounded to PCM16, which is how a quiet phoneme gets deleted along with
+    the silence. This gate is *relative* to the clip's own peak, so it adapts to
+    however loudly the model happened to speak: a line rendered quietly keeps all of
+    its speech.
+
+    Returns
+    -------
+    tuple[np.ndarray, float]
+        The trimmed samples and the number of seconds removed in total. A clip with no
+        speech above the gate is returned unchanged rather than emptied - an all-silent
+        take is a defect worth reporting, not worth hiding.
+    """
+
+    if samples.size == 0:
+        return samples, 0.0
+
+    frame = max(1, int(round(SPEECH_GATE_FRAME_SECONDS * sample_rate)))
+    usable = (samples.size // frame) * frame
+    if usable < frame:
+        return samples, 0.0
+
+    blocks = np.abs(samples[:usable]).reshape(-1, frame)
+    levels = blocks.max(axis=1)
+    peak = float(levels.max())
+    if peak <= 0.0:
+        return samples, 0.0
+
+    active = np.flatnonzero(levels >= peak * SPEECH_GATE_FRACTION)
+    if active.size == 0:
+        return samples, 0.0
+
+    guard = int(round(SPEECH_GATE_GUARD_SECONDS * sample_rate))
+    first = max(0, int(active[0]) * frame - guard)
+    last = min(samples.size, (int(active[-1]) + 1) * frame + guard)
+    if last <= first:
+        return samples, 0.0
+
+    removed = (first + (samples.size - last)) / float(sample_rate)
+    return np.ascontiguousarray(samples[first:last]), removed
+
+
 def _render_clip(
     source: Path,
     destination: Path,
@@ -1690,14 +1781,19 @@ def _render_clip(
     pause_after: float,
     max_pause: float,
 ) -> tuple[float, float, float]:
-    """Write the delivered clip: the take with its pauses around it.
+    """Write the delivered clip: the take trimmed to speech, with its pauses around it.
 
     Returns ``(speech_duration, rendered_pause_before, rendered_pause_after)``.
     The pauses are capped at ``max_pause``; the dialogue's own estimate is kept
     untouched in the clip metadata, so a cap never hides what was asked for.
+
+    Trimming happens here rather than in the engine because a clip's *speech* is what
+    the timing stage must fit - silence counted as speech would be stretched as though
+    it were dialogue.
     """
 
     samples, sample_rate = _read_mono(source, label="the take")
+    samples, _removed = _trim_to_speech(samples, sample_rate)
     speech_duration = samples.shape[0] / sample_rate
 
     lead = min(max(pause_before, 0.0), max_pause)

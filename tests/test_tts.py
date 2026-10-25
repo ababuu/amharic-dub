@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -868,6 +869,99 @@ def test_an_engine_that_writes_nothing_is_reported(rig: Rig) -> None:
 
     with pytest.raises(MissingOutputError, match="fake-omnivoice reported success"):
         rig.run()
+
+
+def test_a_quiet_take_keeps_its_speech_when_trimmed(rig: Rig) -> None:
+    """The defect that stopped a run: post-processing deleted a real word.
+
+    OmniVoice's own output cleaning removes silence below an *absolute* -50 dBFS,
+    measured on audio already rounded to PCM16. A short line rendered quietly fell
+    entirely below that line and came back empty. The trim is relative to the take's
+    own peak, so a quiet word survives at any level.
+    """
+
+    import numpy as np
+
+    class Quiet(FakeOmnivoice):
+        def synthesize(self, *, text, voice_reference, destination, speaking_rate=None, reference_text=None):
+            self.calls.append({"text": text, "speaking_rate": speaking_rate})
+            rate = self.rate
+            # 0.6s of speech at -60 dBFS, i.e. well under the engine's absolute gate.
+            speech = 0.001 * np.sin(2.0 * np.pi * 180.0 * np.arange(int(0.6 * rate)) / rate)
+            silence = np.zeros(int(0.4 * rate))
+            data = np.concatenate([silence, speech.astype(np.float32), silence])
+            return _write_wav(Path(destination), data.astype(np.float32), rate)
+
+    rig.engine = Quiet()
+
+    clips = rig.run()
+
+    assert len(clips) == 1
+    clip = clips[0]
+    # The take was 1.4s including silence; the delivered speech is the 0.6s of speech
+    # plus the guard, not the silence and not nothing.
+    assert 0.55 <= clip.speech_duration <= 0.75
+    peak = float(np.abs(sf.read(str(clip.audio_path), dtype="float32")[0]).max())
+    assert peak > 0.0
+
+
+def test_a_take_with_no_speech_is_not_silently_emptied(rig: Rig) -> None:
+    """An all-silent take is a defect worth reporting, not something to trim away."""
+
+    import numpy as np
+
+    class Silent(FakeOmnivoice):
+        def synthesize(self, *, text, voice_reference, destination, speaking_rate=None, reference_text=None):
+            rate = self.rate
+            return _write_wav(
+                Path(destination), np.zeros(int(0.5 * rate), dtype=np.float32), rate
+            )
+
+    rig.engine = Silent()
+
+    clips = rig.run()
+
+    assert len(clips) == 1
+    # Nothing was trimmed to nothingness: the silence is still there, at full length.
+    assert clips[0].speech_duration == pytest.approx(0.5, abs=0.02)
+
+
+def test_the_engine_is_told_not_to_clean_its_own_output(tmp_path, monkeypatch) -> None:
+    """Trimming is ours: the engine's version is absolute and destructive."""
+
+    captured: dict[str, object] = {}
+
+    @dataclass
+    class Config:
+        num_step: int = 32
+        guidance_scale: float = 2.0
+        position_temperature: float = 5.0
+        class_temperature: float = 0.0
+        postprocess_output: bool = True
+
+        def __post_init__(self) -> None:
+            captured.update(self.__dict__)
+
+    engine = tts.OmniVoiceEngine(model="fake/omnivoice")
+    engine._network = types.SimpleNamespace(
+        generate=lambda **kwargs: [
+            np.zeros(int(0.2 * engine.sample_rate), dtype=np.float32) + 0.05
+        ],
+        create_voice_clone_prompt=lambda **kwargs: "prompt",
+    )
+    engine._torch = types.SimpleNamespace(inference_mode=lambda: __import__("contextlib").nullcontext())
+    engine._config_class = Config
+    engine._loaded = True
+
+    reference = tmp_path / "ref.wav"
+    _write_wav(
+        reference,
+        (0.2 * np.sin(2 * np.pi * 150 * np.arange(24000) / 24000)).astype(np.float32),
+        24000,
+    )
+    engine.synthesize(text="\u12ed\u1320\u134b\u120d\u1362", voice_reference=reference, destination=tmp_path / "out.wav")
+
+    assert captured.get("postprocess_output") is False
 
 
 def test_unexpected_engine_errors_propagate_unchanged(rig: Rig) -> None:

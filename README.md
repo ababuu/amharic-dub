@@ -953,6 +953,24 @@ clips with two final cadences and a seam between them is the defect being remove
 
 ### Speech synthesis (`tts.py`)
 
+**Trimming is ours, not the engine's.** OmniVoice's output cleaning removes silence below
+an *absolute* −50 dBFS threshold, measured on audio that has already been rounded to
+PCM16 — so a quiet but real phoneme is indistinguishable from silence. On a real run that
+emptied a four-syllable word (`ይጠፋል።`) and stopped the whole film at line 15 of 20. The
+engine is therefore asked not to clean its own output (`postprocess_output=False`; the
+flag is passed only when the installed version accepts it), and this module trims each
+take against **its own peak** instead: a frame counts as speech at 6% of that take's
+loudest frame, with 30 ms of guard either side. Measured across five levels from −6 dBFS
+to −80 dBFS, the same 0.6 s of speech is kept exactly. Fades and edge padding, which only
+prevent clicks, are still the engine's.
+
+That also removed a systematic error: the engine pads 0.1 s of silence on each side, and
+the pipeline used to count it as speech, so every line looked 0.2 s longer than it was and
+the timing stage stretched accordingly.
+
+An all-silent take is left at full length rather than trimmed to nothing — it is a defect
+worth reporting, not something to hide.
+
 OmniVoice speaks each line in the voice cloned from that character's own reference
 recording, so there is no conversion step - see
 [Choosing a speech engine](#choosing-a-speech-engine).
