@@ -1251,11 +1251,29 @@ def transcribe_detailed(
             backend_name, model_name = target_extraction.resolve_backend_model(
                 settings
             )
+            # The model failed before it could run, but the regions that *needed*
+            # it are known. Record them with the reason so a manifest does not
+            # claim there was nothing to separate.
+            unavailable_regions = []
+            for request in requests:
+                missing, _present = _dropped_speakers(
+                    request.region, transcribed
+                )
+                unavailable_regions.append(
+                    target_extraction.RegionExtraction(
+                        region=request.region,
+                        refusals=tuple(
+                            target_extraction.Refusal(speaker_id, unavailable)
+                            for speaker_id in missing
+                        ),
+                    )
+                )
             extraction = target_extraction.ExtractionReport(
                 backend=backend_name,
                 model=model_name,
                 available=False,
                 unavailable_reason=unavailable,
+                regions=tuple(unavailable_regions),
             )
         elif backend is not None:
             try:

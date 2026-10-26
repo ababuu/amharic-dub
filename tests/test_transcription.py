@@ -1520,6 +1520,9 @@ def test_the_disabled_stage_never_separates_and_keeps_refusing(
     assert result.separation is not None
     assert result.separation.available is False
     assert "disabled" in (result.separation.unavailable_reason or "")
+    # The region still had a dropped speaker, even though the stage could not run.
+    assert result.separation.as_dict()["regions_requested"] == 1
+    assert result.separation.refused_tracks == 1
     assert result.separated_lines == 0
     assert any("disabled" in note for note in notes)
     # The previous path refuses on the mixture's measured pitch before decoding it,
@@ -1566,6 +1569,8 @@ def test_an_unavailable_checkpoint_falls_back_to_the_refusal_path(
     assert result.separation is not None
     assert result.separation.available is False
     assert "gated" in (result.separation.unavailable_reason or "")
+    assert result.separation.as_dict()["regions_requested"] == 1
+    assert result.separation.regions[0].refusals[0].speaker_id == "SPEAKER_01"
     assert any("gated" in note for note in notes)
     assert any("the mixture measured" in note for note in notes)
     assert len(FakeWhisperModel.calls) == 1
