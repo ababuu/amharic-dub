@@ -543,10 +543,36 @@ DEFAULT_MIN_LINE_GAP = 0.12
 MINIMUM_PLACEMENT_WINDOW = 0.05
 
 
+def simultaneous_lines(
+    spans: Sequence[tuple[float, float]],
+) -> tuple[bool, ...]:
+    """Return, per line, whether it shares time with another line.
+
+    Two lines overlap when their windows do - which the source only does when two
+    characters are talking at once, because a single speaker's turns are cut apart
+    before they get here. On a film that is the argument, the interruption and the
+    backchannel; in a dub it is the one case where a line is heard against another
+    voice instead of against silence, so it needs to be written and placed
+    differently from a line that has the scene to itself.
+    """
+
+    spans = tuple(spans)
+    shared = [False] * len(spans)
+    for index, (start, end) in enumerate(spans):
+        for other_index, (other_start, other_end) in enumerate(spans):
+            if other_index == index:
+                continue
+            if min(end, other_end) - max(start, other_start) > MINIMUM_PLACEMENT_WINDOW:
+                shared[index] = True
+                break
+    return tuple(shared)
+
+
 def placement_windows(
     spans: Sequence[tuple[float, float]],
     *,
     gap: float = DEFAULT_MIN_LINE_GAP,
+    overlap_aware: bool = False,
 ) -> tuple[float, ...]:
     """Return how long each line's speech may run before the next line starts.
 
@@ -561,6 +587,13 @@ def placement_windows(
     *next* line, because that is two voices at once. The silence between lines is spare
     room that a dub is entitled to use: it is already empty, and using it is what lets a
     longer language keep its natural pace instead of being squashed to fit.
+
+    ``overlap_aware`` changes what "the next line" means. A line that begins *before*
+    this one ends was already simultaneous with it in the film, so it is not a boundary
+    this line has to stop short of - it is the other half of the same exchange. Skipping
+    it keeps the room the earlier line actually needs, where counting it would squeeze a
+    7-second line to the half-second gap before its interruption and force the dialogue
+    model to throw most of the sentence away.
     """
 
     if not math.isfinite(gap) or gap < 0:
@@ -581,10 +614,13 @@ def placement_windows(
     windows: list[float] = []
     for index, (begin, finish) in enumerate(ordered):
         own = finish - begin
-        if index + 1 < len(ordered):
-            room = ordered[index + 1][0] - begin - gap
-        else:
-            room = own
+        room = own
+        for following_start, _following_end in ordered[index + 1 :]:
+            if overlap_aware and following_start < finish:
+                # Already simultaneous in the film: an exchange, not a boundary.
+                continue
+            room = following_start - begin - gap
+            break
         windows.append(max(room, MINIMUM_PLACEMENT_WINDOW))
     return tuple(windows)
 
@@ -821,6 +857,7 @@ __all__ = [
     "InvalidSceneError",
     "PacingPlan",
     "placement_windows",
+    "simultaneous_lines",
     "plan_pacing",
     "Scene",
     "SyllableBudget",

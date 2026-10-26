@@ -714,15 +714,23 @@ def test_lines_never_overlap_when_trimming_is_asked_for(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("second_start", "speaker_id", "expected_start"),
+    ("second_start", "speaker_id", "second_end", "expected_start"),
     [
-        (5.75, "SPEAKER_01", 5.75),
-        (5.1, "SPEAKER_01", 5.7),
-        (5.1, "SPEAKER_00", 6.0),
+        # Sequential, different speakers: the hand-over allowance is the only overlap.
+        (6.0, "SPEAKER_01", 7.0, 6.0),
+        # The film overlapped these two by 0.9s, so the dub keeps all of it instead of
+        # being pushed to the allowance: the overlap is the scene, not a defect.
+        (5.1, "SPEAKER_01", 7.0, 5.1),
+        # The same character never overlays themselves, however close the windows are.
+        (5.1, "SPEAKER_00", 7.0, 6.0),
     ],
 )
-def test_cascade_caps_source_overlap_and_prevents_same_speaker_overlap(
-    tmp_path: Path, second_start: float, speaker_id: str, expected_start: float
+def test_cascade_preserves_source_overlap_and_prevents_same_speaker_overlap(
+    tmp_path: Path,
+    second_start: float,
+    speaker_id: str,
+    second_end: float,
+    expected_start: float,
 ) -> None:
     first_clip = _clip(
         tmp_path, index=0, start=5.0, end=6.0, speech=1.0, lead=0.0, trail=0.0
@@ -731,7 +739,7 @@ def test_cascade_caps_source_overlap_and_prevents_same_speaker_overlap(
         tmp_path,
         index=1,
         start=second_start,
-        end=second_start + 1.0,
+        end=second_end,
         speaker_id=speaker_id,
         speech=1.0,
         lead=0.0,

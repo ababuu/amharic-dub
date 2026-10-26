@@ -57,15 +57,17 @@ Deliberate non-goals
 
 from __future__ import annotations
 
+import difflib
+import io
 import math
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from app.config import Settings, get_settings
-from app.pipeline.diarization import SpeakerSegment
+from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
 
 try:  # Heavy runtime dependency. Guarded so that this module stays importable
     # (and testable) where the CUDA/PyTorch stack is not installed.
@@ -92,6 +94,22 @@ WORD_TIMESTAMPS = True
 #: indexes an empty timestamp array and raises ``IndexError``, taking the whole
 #: film down with it.
 MIN_REGION_SECONDS = 0.1
+
+#: Shortest stretch of a crosstalk region that is worth listening to for the speaker
+#: the exclusive view dropped. Below this the audio is a syllable or two of a
+#: mixture: no word fits, and any text a decoder produces there is invented.
+MIN_RECOVERED_OVERLAP_SECONDS = 0.30
+
+#: How much of the recovered text has to match text already credited to another
+#: speaker in the same crosstalk region before it is treated as *the same speech
+#: heard twice*. A crosstalk region is one mixture, so a word-level assignment can
+#: legitimately recover only part of it; anything the other speaker already has is
+#: a duplicate, and emitting it again would have two characters say one line.
+RECOVERED_DUPLICATE_RATIO = 0.6
+
+#: Words from the recovered stretch shorter than this carry no evidence on their own
+#: (a stray token Whisper emits between two real words).
+MIN_RECOVERED_WORD_SECONDS = 0.02
 
 
 class TranscriptionError(RuntimeError):
@@ -221,6 +239,53 @@ def _validate_speaker_segments(speaker_segments: Iterable[SpeakerSegment]) -> li
             )
 
     return sorted(segments, key=lambda item: (item.start, item.end, item.speaker_id))
+
+
+def _validate_crosstalk(crosstalk: Iterable[CrosstalkRegion]) -> list[CrosstalkRegion]:
+    """Return the crosstalk regions as a chronological list, validated.
+
+    An empty input is normal: a pyannote result without an overlap-aware annotation
+    reports no crosstalk, and a run then behaves exactly as it did before recovery
+    existed.
+    """
+
+    if isinstance(crosstalk, (str, bytes)) or not isinstance(crosstalk, Iterable):
+        raise InvalidSpeakerSegmentsError(
+            "crosstalk must be an iterable of CrosstalkRegion objects, got "
+            f"{type(crosstalk).__name__}"
+        )
+
+    regions = list(crosstalk)
+    for index, region in enumerate(regions):
+        if not isinstance(region, CrosstalkRegion):
+            raise InvalidSpeakerSegmentsError(
+                f"crosstalk[{index}] is {type(region).__name__}, "
+                "expected a CrosstalkRegion"
+            )
+    return sorted(regions, key=lambda item: (item.start, item.end))
+
+
+def _validate_overlap_turns(
+    overlap_turns: Iterable[SpeakerSegment],
+) -> list[SpeakerSegment]:
+    """Return the overlap-aware turns as a chronological list, validated."""
+
+    if isinstance(overlap_turns, (str, bytes)) or not isinstance(
+        overlap_turns, Iterable
+    ):
+        raise InvalidSpeakerSegmentsError(
+            "overlap_turns must be an iterable of SpeakerSegment objects, got "
+            f"{type(overlap_turns).__name__}"
+        )
+
+    turns = list(overlap_turns)
+    for index, turn in enumerate(turns):
+        if not isinstance(turn, SpeakerSegment):
+            raise InvalidSpeakerSegmentsError(
+                f"overlap_turns[{index}] is {type(turn).__name__}, "
+                "expected a SpeakerSegment"
+            )
+    return sorted(turns, key=lambda item: (item.start, item.end, item.speaker_id))
 
 
 def _require_runtime() -> None:
@@ -390,23 +455,363 @@ def _transcribe_region(
 ) -> list[TranscriptSegment]:
     """Transcribe one diarized region and return absolute transcript segments."""
 
+    return _convert(_decode(model, samples, region, language), region)
+
+
+# ---------------------------------------------------------------------------
+# Speech the exclusive view dropped
+# ---------------------------------------------------------------------------
+
+
+def _overlap_seconds(
+    start: float, end: float, other_start: float, other_end: float
+) -> float:
+    """Return how much of ``start``..``end`` falls inside another interval."""
+
+    return max(0.0, min(end, other_end) - max(start, other_start))
+
+
+def _clip_span(
+    start: float, end: float, lower: float, upper: float
+) -> tuple[float, float] | None:
+    """Return ``start``..``end`` intersected with ``lower``..``upper``, or ``None``."""
+
+    clipped_start = max(start, lower)
+    clipped_end = min(end, upper)
+    if clipped_end <= clipped_start:
+        return None
+    return clipped_start, clipped_end
+
+
+def _subtract_spans(
+    spans: Iterable[tuple[float, float]],
+    covered: Iterable[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Return the parts of ``spans`` that no interval in ``covered`` covers.
+
+    Used to find the audio of a dropped speaker that the exclusive view did not
+    already transcribe for them: a speaker can be missing from *part* of a
+    crosstalk while having a turn of their own elsewhere in it.
+    """
+
+    remaining: list[tuple[float, float]] = []
+    covered_list = list(covered)
+    for start, end in spans:
+        pieces = [(start, end)]
+        for cover_start, cover_end in covered_list:
+            next_pieces: list[tuple[float, float]] = []
+            for piece_start, piece_end in pieces:
+                if cover_end <= piece_start or cover_start >= piece_end:
+                    next_pieces.append((piece_start, piece_end))
+                    continue
+                if piece_start < cover_start:
+                    next_pieces.append((piece_start, cover_start))
+                if cover_end < piece_end:
+                    next_pieces.append((cover_end, piece_end))
+            pieces = next_pieces
+        remaining.extend(pieces)
+    remaining.sort()
+    return remaining
+
+
+def _speaker_spans(
+    speaker_id: str,
+    region: CrosstalkRegion,
+    overlap_turns: Iterable[SpeakerSegment],
+) -> list[tuple[float, float]]:
+    """Return when ``speaker_id`` was speaking inside ``region``.
+
+    The overlap-aware turns are the only place this is recorded: the exclusive
+    turns cannot say it, because that view had to give the instant to someone
+    else. When the annotation has no turn for the speaker inside this region the
+    whole region is used, because the region itself already asserts they were
+    talking - refusing to look would lose the words the region exists to find.
+    """
+
+    spans: list[tuple[float, float]] = []
+    for turn in overlap_turns:
+        if turn.speaker_id != speaker_id:
+            continue
+        clipped = _clip_span(turn.start, turn.end, region.start, region.end)
+        if clipped is not None:
+            spans.append(clipped)
+    if not spans:
+        return [(region.start, region.end)]
+    return spans
+
+
+def _timed_words(
+    raw_segments: Iterable[Any], region: SpeakerSegment
+) -> list[tuple[str, float, float]]:
+    """Return ``(word, start, end)`` on the movie timeline for one decode.
+
+    Word timings are what make a mixture separable: two speakers inside one
+    crosstalk can only be told apart by *when* each word was spoken. A segment that
+    carries no words falls back to its own text over its own span, so a decoder
+    configured without word timestamps still contributes something.
+    """
+
+    words: list[tuple[str, float, float]] = []
+    for raw in raw_segments:
+        entries = getattr(raw, "words", None)
+        if entries:
+            for entry in entries:
+                text = getattr(entry, "word", "")
+                text = text.strip() if isinstance(text, str) else ""
+                if not text:
+                    continue
+                local_start = _whisper_timestamp(getattr(entry, "start", None), "start")
+                local_end = _whisper_timestamp(getattr(entry, "end", None), "end")
+                start = _clamp(region.start + local_start, region.start, region.end)
+                end = _clamp(region.start + local_end, region.start, region.end)
+                if end - start < MIN_RECOVERED_WORD_SECONDS:
+                    continue
+                words.append((text, start, end))
+            continue
+
+        text = raw.text if isinstance(raw.text, str) else ""
+        text = text.strip()
+        if not text:
+            continue
+        local_start = _whisper_timestamp(raw.start, "start")
+        local_end = _whisper_timestamp(raw.end, "end")
+        start = _clamp(region.start + local_start, region.start, region.end)
+        end = _clamp(region.start + local_end, region.start, region.end)
+        if end <= start:
+            continue
+        words.append((text, start, end))
+    return words
+
+
+def _assign_words(
+    words: Iterable[tuple[str, float, float]],
+    spans: dict[str, list[tuple[float, float]]],
+) -> dict[str, list[tuple[str, float, float]]]:
+    """Give every word to the speaker whose own turns cover most of it.
+
+    ``spans`` holds only the speakers being recovered. That is deliberate: the
+    speaker the exclusive view kept already has a text that came from a clean decode
+    of their own turn, so a word in the mixture belongs to them only if their own
+    line does not already contain it - which the caller checks, because comparing
+    words is more reliable than comparing spans inside one region, where every span
+    covers the whole region by construction.
+
+    A word is short, so its span is the strongest evidence available about who said
+    it: the speaker diarization recorded as active through it. Ties - a boundary
+    where both were talking - are broken by speaker id, so the same input always
+    produces the same assignment.
+    """
+
+    assigned: dict[str, list[tuple[str, float, float]]] = {name: [] for name in spans}
+    for text, start, end in words:
+        best_speaker: str | None = None
+        best_cover = 0.0
+        for speaker_id in sorted(spans):
+            cover = sum(
+                _overlap_seconds(start, end, span_start, span_end)
+                for span_start, span_end in spans[speaker_id]
+            )
+            if cover > best_cover:
+                best_speaker, best_cover = speaker_id, cover
+        if best_speaker is not None and best_cover > 0.0:
+            assigned[best_speaker].append((text, start, end))
+    return assigned
+
+
+def _words_to_segments(
+    speaker_id: str, words: Sequence[tuple[str, float, float]]
+) -> list[TranscriptSegment]:
+    """Join one speaker's recovered words into contiguous transcript segments."""
+
+    segments: list[TranscriptSegment] = []
+    run: list[tuple[str, float, float]] = []
+    for entry in words:
+        if run and entry[1] - run[-1][2] > MAX_SENTENCE_GAP_SECONDS:
+            segments.append(_run_to_segment(speaker_id, run))
+            run = []
+        run.append(entry)
+    if run:
+        segments.append(_run_to_segment(speaker_id, run))
+    return [segment for segment in segments if segment is not None]
+
+
+def _run_to_segment(
+    speaker_id: str, run: Sequence[tuple[str, float, float]]
+) -> TranscriptSegment | None:
+    """Return one transcript segment for a run of recovered words, or ``None``."""
+
+    text = " ".join(word for word, _start, _end in run).strip()
+    if not text:
+        return None
+    start = min(entry[1] for entry in run)
+    end = max(entry[2] for entry in run)
+    if end <= start:
+        return None
     try:
-        # ``transcribe`` is lazy, so the iterator is materialised inside the try
-        # to make sure inference failures surface here and are wrapped.
+        return TranscriptSegment(speaker_id=speaker_id, start=start, end=end, text=text)
+    except InvalidSegmentError:
+        return None
+
+
+def _normalise_for_comparison(text: str) -> str:
+    """Return ``text`` lowercased with punctuation and spacing reduced to words."""
+
+    letters = "".join(character if character.isalnum() else " " for character in text)
+    return " ".join(letters.lower().split())
+
+
+def _duplicates(candidate: str, existing: Iterable[str]) -> bool:
+    """Return whether ``candidate`` restates text already credited in the region."""
+
+    normalised = _normalise_for_comparison(candidate)
+    if not normalised:
+        return True
+
+    for text in existing:
+        other = _normalise_for_comparison(text)
+        if not other:
+            continue
+        if normalised == other:
+            return True
+        # One line wholly inside the other is the same speech, not new speech.
+        if normalised in other or other in normalised:
+            return True
+        if difflib.SequenceMatcher(None, normalised, other).ratio() >= RECOVERED_DUPLICATE_RATIO:
+            return True
+    return False
+
+
+def _recover_dropped_speakers(
+    model: Any,
+    audio: Any,
+    regions: Sequence[SpeakerSegment],
+    crosstalk: Sequence[CrosstalkRegion],
+    overlap_turns: Sequence[SpeakerSegment],
+    language: str | None,
+    transcribed: Sequence[TranscriptSegment],
+) -> list[TranscriptSegment]:
+    """Return lines for speakers the exclusive view dropped inside crosstalk.
+
+    The exclusive diarization gives every instant to exactly one speaker, so when
+    two people talk at once one of them loses the turn entirely - and with it
+    everything they said. Downstream that is heard as a scene where only one
+    character ever speaks, which is precisely the defect this function removes.
+
+    Only the *missing* speaker is recovered. The speaker the exclusive view kept
+    already has text that came from a clean, single-voice decode of their own turn,
+    and re-deriving it here would risk replacing good text with a mixture's. The
+    recovered stretch is decoded once, with word timings, and each word is given to
+    the speaker diarization recorded as active through it - so both characters come
+    out of one decode rather than two guesses.
+
+    A recovered line is dropped when it restates what the other speaker already has
+    in the region: a mixture transcribed twice tends to reproduce the dominant
+    voice, and two characters saying one line is a worse defect than one of them
+    saying nothing. A region the exclusive view did not fill at all is skipped
+    entirely - with no authoritative text there is nothing to check a recovery
+    against, and inventing dialogue is not a repair.
+    """
+
+    if not overlap_turns:
+        return []
+
+    recovered: list[TranscriptSegment] = []
+    for region in crosstalk:
+        if region.duration < MIN_RECOVERED_OVERLAP_SECONDS:
+            continue
+
+        inside = [
+            segment
+            for segment in transcribed
+            if _overlap_seconds(
+                segment.start, segment.end, region.start, region.end
+            )
+            > 0.0
+        ]
+        if not inside:
+            # The exclusive view produced nothing here at all, so there is no
+            # authoritative text to compare a recovery against and no evidence about
+            # which of the two speakers a word belongs to. Guessing would invent
+            # dialogue; the gap is reported instead by the quality report.
+            continue
+        present = {segment.speaker_id for segment in inside}
+        missing = [
+            speaker_id
+            for speaker_id in region.speaker_ids
+            if speaker_id not in present
+        ]
+        if not missing:
+            continue
+        spans = {
+            speaker_id: _speaker_spans(speaker_id, region, overlap_turns)
+            for speaker_id in region.speaker_ids
+        }
+        # What is left of the missing speakers' own activity after removing the
+        # part their own exclusive turns already cover - a speaker can be missing
+        # from one stretch of a crosstalk and present in another.
+        already_theirs = [
+            clipped
+            for turn in regions
+            if turn.speaker_id in missing
+            for clipped in [_clip_span(turn.start, turn.end, region.start, region.end)]
+            if clipped is not None
+        ]
+        uncovered = _subtract_spans(
+            [span for speaker_id in missing for span in spans[speaker_id]],
+            already_theirs,
+        )
+        if not uncovered:
+            continue
+
+        window = SpeakerSegment(
+            speaker_id=missing[0],
+            start=min(start for start, _end in uncovered),
+            end=max(end for _start, end in uncovered),
+        )
+        if window.end - window.start < MIN_REGION_SECONDS:
+            continue
+
+        samples = _region_samples(audio, window)
+        if len(samples) == 0:
+            continue
+        words = _timed_words(_decode(model, samples, window, language), window)
+        if not words:
+            continue
+        assignment = _assign_words(
+            words, {speaker_id: spans[speaker_id] for speaker_id in missing}
+        )
+        # Compared against this region only. The same short interjection is a normal
+        # thing for one character to say twice in a film, so a line recovered in one
+        # crosstalk must not veto an identical one recovered in another.
+        region_text = [segment.text for segment in inside]
+        for speaker_id in missing:
+            for segment in _words_to_segments(speaker_id, assignment.get(speaker_id, [])):
+                if _duplicates(segment.text, region_text):
+                    continue
+                recovered.append(segment)
+                region_text.append(segment.text)
+
+    return recovered
+
+
+def _decode(
+    model: Any, samples: Any, region: SpeakerSegment, language: str | None
+) -> list[Any]:
+    """Run one faster-whisper decode and materialise its segments."""
+
+    try:
         raw_segments, _info = model.transcribe(
             samples,
             language=language,
-            task="transcribe",  # this stage never translates
+            task="transcribe",
             word_timestamps=WORD_TIMESTAMPS,
         )
-        raw_segments = list(raw_segments)
+        return list(raw_segments)
     except Exception as exc:
         raise TranscriptionInferenceError(
             f"faster-whisper failed for speaker {region.speaker_id} "
             f"[{region.start:.2f}s - {region.end:.2f}s]: {type(exc).__name__}: {exc}"
         ) from exc
-
-    return _convert(raw_segments, region)
 
 
 def build_amharic_transcriber(
@@ -461,6 +866,8 @@ def transcribe(
     speaker_segments: Iterable[SpeakerSegment],
     *,
     settings: Settings | None = None,
+    crosstalk: Iterable[CrosstalkRegion] = (),
+    overlap_turns: Iterable[SpeakerSegment] = (),
 ) -> list[TranscriptSegment]:
     """Transcribe the speech of each diarized region of ``audio_path``.
 
@@ -476,12 +883,28 @@ def transcribe(
         Project settings override; defaults to :func:`app.config.get_settings`.
         The model, compute type, device, model cache, and language all come from
         here - nothing is hard-coded in this module.
+    crosstalk:
+        Regions where two or more speakers talk at once, from
+        :func:`app.pipeline.diarization.diarize_detailed`. Inside one, the
+        *exclusive* turn list can only hold one speaker, so the other speaker's
+        words are absent from the transcript entirely - and a dub built from that
+        transcript has one character talking while another one visibly is. Each
+        region is therefore re-listened to once for the speakers the exclusive
+        view dropped; see :func:`_recover_dropped_speakers`.
+    overlap_turns:
+        The overlap-aware turns from the same call. They say *when* each speaker
+        was talking inside a crosstalk, which is the only way to tell two voices in
+        one mixture apart. Without them nothing can be recovered, so a result that
+        carries no overlap-aware annotation simply never recovers anything - it is
+        not an error.
 
     Returns
     -------
     list[TranscriptSegment]
         Chronologically sorted utterances. An empty list means either nothing was
-        diarized or nothing intelligible was found.
+        diarized or nothing intelligible was found. Recovered simultaneous speech
+        is included, attributed to the speaker who was actually saying it, so the
+        timeline downstream holds two characters where the film had two.
 
     Raises
     ------
@@ -526,6 +949,21 @@ def transcribe(
         transcribed.extend(_transcribe_region(model, samples, region, language))
 
     transcribed.sort(key=lambda segment: (segment.start, segment.end, segment.speaker_id))
+
+    recovered = _recover_dropped_speakers(
+        model,
+        audio,
+        regions,
+        _validate_crosstalk(crosstalk),
+        _validate_overlap_turns(overlap_turns),
+        language,
+        transcribed,
+    )
+    if recovered:
+        transcribed.extend(recovered)
+        transcribed.sort(
+            key=lambda segment: (segment.start, segment.end, segment.speaker_id)
+        )
     return transcribed
 
 

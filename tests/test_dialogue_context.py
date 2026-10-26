@@ -25,6 +25,7 @@ from app.pipeline.dialogue_context import (
     PacingPlan,
     SyllableBudget,
     placement_windows,
+    simultaneous_lines,
     plan_pacing,
     segment_scenes,
     syllable_budget,
@@ -544,3 +545,52 @@ def test_the_gap_is_configurable() -> None:
     loose = placement_windows([(5.0, 5.8), (9.0, 9.8)], gap=1.0)
 
     assert tight[0] > loose[0]
+
+
+def test_a_line_talked_over_keeps_its_own_window() -> None:
+    """The other character's line is not spare room to fill.
+
+    A line that begins inside this one was already simultaneous with it in the film.
+    Counting it as the boundary would squeeze a 7-second line to the half-second gap
+    before its interruption, and the dialogue model would throw the sentence away.
+    """
+
+    windows = placement_windows([(5.0, 13.0), (12.2, 12.9)], gap=0.12)
+    shared = placement_windows(
+        [(5.0, 13.0), (12.2, 12.9)], gap=0.12, overlap_aware=True
+    )
+
+    # The old rule: stop 0.12s before the other voice starts.
+    assert windows[0] == pytest.approx(12.2 - 5.0 - 0.12)
+    # Overlap-aware: the interruption is not a boundary, so the line keeps its window.
+    assert shared[0] == pytest.approx(8.0)
+
+
+def test_overlap_awareness_still_stops_before_the_next_line_after_the_interruption() -> None:
+    """An interruption inside a line does not make everything after it free."""
+
+    windows = placement_windows(
+        [(5.0, 13.0), (12.2, 12.9), (20.0, 21.0)], gap=0.12, overlap_aware=True
+    )
+
+    assert windows[0] == pytest.approx(20.0 - 5.0 - 0.12)
+
+
+def test_lines_that_share_time_are_reported_as_simultaneous() -> None:
+    shared = simultaneous_lines([(5.0, 12.0), (12.2, 12.9), (20.0, 21.0)])
+
+    assert shared == (False, False, False)
+
+
+def test_an_interruption_is_simultaneous_for_both_lines() -> None:
+    shared = simultaneous_lines([(5.0, 6.0), (5.6, 6.6), (9.0, 9.5)])
+
+    assert shared == (True, True, False)
+
+
+def test_no_lines_are_simultaneous_in_a_turn_taking_script() -> None:
+    assert simultaneous_lines([(1.0, 2.0), (2.1, 3.0), (3.2, 4.0)]) == (
+        False,
+        False,
+        False,
+    )

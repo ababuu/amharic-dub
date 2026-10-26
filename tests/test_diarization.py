@@ -663,6 +663,75 @@ def test_diarize_detailed_reports_both_turns_and_crosstalk(monkeypatch, tmp_path
     assert result.crosstalk_seconds == 1.0
 
 
+def test_the_overlap_aware_turns_keep_both_speakers(monkeypatch, tmp_path):
+    """The separate speaker behind a crosstalk must remain addressable.
+
+    ``turns`` is exclusive and had to give the shared instant to one speaker, so the
+    other one's words would be lost with it. ``overlap_turns`` is the same audio seen
+    without that choice, which is what lets transcription re-listen for them.
+    """
+
+    _patch(monkeypatch)
+    FakePipeline.result = _crosstalk_output(
+        exclusive=[(0.0, 2.0, "SPEAKER_00"), (2.0, 4.0, "SPEAKER_01")],
+        overlapping=[(0.0, 2.0, "SPEAKER_00"), (1.0, 3.0, "SPEAKER_01")],
+    )
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.overlap_turns == (
+        SpeakerSegment("SPEAKER_00", 0.0, 2.0),
+        SpeakerSegment("SPEAKER_01", 1.0, 3.0),
+    )
+    # The two views disagree by exactly the point of the module: attribution stays
+    # exclusive, and the overlap is still visible.
+    assert result.overlap_turns != result.turns
+
+
+def test_the_overlap_aware_turns_merge_one_utterance_split_by_the_other_speaker(
+    monkeypatch, tmp_path
+):
+    """pyannote cuts a turn wherever the other voice's boundary crosses it.
+
+    Keeping those cuts would fragment a six-second sentence into pieces shorter than
+    a word each, which no decoder can transcribe; they are the same utterance.
+    """
+
+    _patch(monkeypatch)
+    FakePipeline.result = _crosstalk_output(
+        exclusive=[(0.0, 6.0, "SPEAKER_00")],
+        overlapping=[
+            (0.0, 2.0, "SPEAKER_00"),
+            (1.0, 1.5, "SPEAKER_01"),
+            (2.0, 6.0, "SPEAKER_00"),
+        ],
+    )
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.overlap_turns == (
+        SpeakerSegment("SPEAKER_00", 0.0, 6.0),
+        SpeakerSegment("SPEAKER_01", 1.0, 1.5),
+    )
+    # One turn for the speaker whose utterance was split, not two.
+    assert sum(
+        1 for turn in result.overlap_turns if turn.speaker_id == "SPEAKER_00"
+    ) == 1
+
+
+def test_no_overlap_annotation_means_no_overlap_turns(monkeypatch, tmp_path):
+    """A result without the overlap view must not fabricate one."""
+
+    _patch(monkeypatch)
+    FakePipeline.result = FakeDiarizeOutput(
+        exclusive_speaker_diarization=FakeAnnotation([(0.0, 2.0, "SPEAKER_00")])
+    )
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.overlap_turns == ()
+
+
 def test_confident_clean_turns_are_reassigned_but_short_and_overlapping_turns_are_not(
     monkeypatch, tmp_path
 ):

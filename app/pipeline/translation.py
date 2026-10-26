@@ -80,6 +80,7 @@ from app.pipeline.dialogue_context import (
     SyllableBudget,
     placement_windows,
     segment_scenes,
+    simultaneous_lines,
     syllable_budget,
 )
 from app.pipeline.transcription import DialogueSentence, TranscriptSegment
@@ -286,6 +287,15 @@ that budget while sounding natural. Use compact Amharic grammar; remove filler,
 repetition, recoverable pronouns, obvious vocatives, and details already conveyed by
 the scene. Merge clauses or omit nonessential asides. Never remove plot-critical
 names, numbers, threats, promises, reveals, or other facts. Do not pad short lines.
+
+A line marked "simultaneous": true is heard AT THE SAME TIME as another character's
+line, the way two people interrupt and talk over each other. It is not a line with
+the scene to itself. Write it the way a person actually speaks while being spoken
+over: short, immediate and complete in its own right - a protest, an answer, a name,
+a warning. No run-up, no subordinate clause, no recap of what the other character
+just said, and no closing phrase added to fill the time. Its syllable_budget is the
+budget of a line competing with another voice, so treat going over it as a real
+error: anything longer is heard as two voices covering each other up.
 
 Use ordinary spoken loanwords and names when appropriate. Write all words in Fidel,
 never Latin script. For example, Walt -> ዋልት and computer -> ኮምፒውተር. Keep recurring
@@ -730,6 +740,7 @@ def _request_kwargs(
     *,
     context: str | None = None,
     budgets: Sequence[SyllableBudget] | None = None,
+    shared: Sequence[bool] | None = None,
     rewrite: str | None = None,
 ) -> dict[str, Any]:
     """Build the ``chat.completions.create`` arguments for one batch.
@@ -738,6 +749,11 @@ def _request_kwargs(
     supplied, the number of syllables it may use: a faithful translation of an
     English line routinely needs more time than the original took, so the line is
     asked to fit *before* it is synthesized rather than stretched afterwards.
+
+    ``shared`` marks the lines the film played *over* another character's. They carry
+    ``simultaneous: true`` so the model writes them as something said into another
+    voice - short, direct, without a run-up - rather than as a line with the scene to
+    itself.
 
     A sentence that was assembled from several transcribed segments also carries
     those segments as ``parts``. They are not translation units - the whole line is
@@ -756,10 +772,14 @@ def _request_kwargs(
                     if budgets is not None
                     else {}
                 ),
+                **({"simultaneous": True} if is_shared else {}),
                 **_parts_payload(segment),
             }
-            for segment, line_id, budget in zip(
-                batch, ids, budgets if budgets is not None else (None,) * len(batch)
+            for segment, line_id, budget, is_shared in zip(
+                batch,
+                ids,
+                budgets if budgets is not None else (None,) * len(batch),
+                shared if shared is not None else (False,) * len(batch),
             )
         ]
     }
@@ -1164,6 +1184,7 @@ def _adapt_batch(
     *,
     context: str | None = None,
     budgets: Sequence[SyllableBudget] | None = None,
+    shared: Sequence[bool] | None = None,
     rewrite: str | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> list[AdaptedDialogue]:
@@ -1180,7 +1201,13 @@ def _adapt_batch(
     try:
         response = failover.send(
             lambda settings: _request_kwargs(
-                settings, batch, ids, context=context, budgets=budgets, rewrite=rewrite
+                settings,
+                batch,
+                ids,
+                context=context,
+                budgets=budgets,
+                shared=shared,
+                rewrite=rewrite,
             )
         )
     except Exception:
@@ -1720,10 +1747,18 @@ def adapt_dialogue(
     # silence after it up to the next line - not from the original English window. The
     # window is where the *actor* spoke; the room is what a dub may use, and asking for
     # the window alone would demand a compression no natural delivery can reach.
+    #
+    # Lines the film played at the same time are the exception to "the next line". A
+    # character talking over another one has to stop where the film stopped them,
+    # because every extra syllable is competing with the other voice rather than
+    # filling silence: their budget is their own window, and they are told so.
+    spans = [(line.start, line.end) for line in transcript]
     rooms = placement_windows(
-        [(line.start, line.end) for line in transcript],
+        spans,
         gap=settings.timing_min_line_gap,
+        overlap_aware=True,
     )
+    shared = simultaneous_lines(spans)
 
     adapted: list[AdaptedDialogue] = []
     position = 1
@@ -1739,9 +1774,23 @@ def adapt_dialogue(
                 f"lines {first_position}-{batch_last_position} started"
             )
         ids = [_dialogue_id(first_position + offset) for offset in range(len(batch))]
+        batch_shared = [
+            shared[first_position + offset - 1] for offset in range(len(batch))
+        ]
         budgets = [
             syllable_budget(
-                rooms[first_position + offset - 1], rate=syllables_per_second
+                (
+                    # A line spoken over another one keeps its own window and never
+                    # borrows the other character's time: the two are heard together,
+                    # so every extra syllable makes both harder to follow.
+                    min(
+                        rooms[first_position + offset - 1],
+                        batch[offset].duration,
+                    )
+                    if batch_shared[offset]
+                    else rooms[first_position + offset - 1]
+                ),
+                rate=syllables_per_second,
             )
             for offset in range(len(batch))
         ]
@@ -1755,7 +1804,12 @@ def adapt_dialogue(
         )
 
         produced = _adapt_batch(
-            single_request, batch, ids, context=context, budgets=budgets,
+            single_request,
+            batch,
+            ids,
+            context=context,
+            budgets=budgets,
+            shared=batch_shared,
             on_progress=on_progress,
         )
         if enforce_budget or enforce_fidel_loanwords:

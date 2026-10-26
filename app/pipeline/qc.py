@@ -274,6 +274,74 @@ class DurationFitReport:
 
 
 @dataclass(frozen=True, slots=True)
+class OverlapReport:
+    """What the dub did with the speech the film played simultaneously.
+
+    A film where two characters talk over each other is the case a dub most easily
+    gets wrong: hand the lines to a sequential timeline and the exchange becomes two
+    monologues, one character visibly silent while the other speaks. So the overlap
+    is measured rather than assumed - how many pairs of lines overlapped *in the
+    film*, and how many still overlap in the delivered mix, which is the difference
+    between a conversation and an edit.
+    """
+
+    #: Pairs of lines whose windows overlapped in the source, i.e. two characters
+    #: talking at once.
+    source_pairs: int
+    #: Source pairs that are still simultaneous after placement.
+    preserved_pairs: int
+    #: Total seconds delivered while two characters were both speaking.
+    preserved_seconds: float
+    #: Pairs that the film overlapped but the dub separates.
+    lost_pairs: int
+    #: Line indexes that had no counterpart: a crosstalk region with only one
+    #: character's line in it, so someone the film had talking when the dub is silent.
+    unpaired: tuple[int, ...] = ()
+
+    @property
+    def preserved_ratio(self) -> float:
+        """Share of the film's simultaneous pairs the dub keeps simultaneous."""
+
+        if not self.source_pairs:
+            return 1.0
+        return self.preserved_pairs / self.source_pairs
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe view of the measurement."""
+
+        return {
+            "source_pairs": self.source_pairs,
+            "preserved_pairs": self.preserved_pairs,
+            "preserved_seconds": round(self.preserved_seconds, 3),
+            "lost_pairs": self.lost_pairs,
+            "preserved_ratio": round(self.preserved_ratio, 4),
+            "unpaired": list(self.unpaired),
+        }
+
+    def summary(self) -> str:
+        """Return the one-line summary a run prints."""
+
+        if not self.source_pairs:
+            parts = []
+        else:
+            parts = [
+                f"{self.preserved_pairs}/{self.source_pairs} simultaneous pair(s) "
+                f"kept ({self.preserved_seconds:.2f}s of two voices at once)"
+            ]
+            if self.lost_pairs:
+                parts.append(f"{self.lost_pairs} serialized")
+        if self.unpaired:
+            shown = ", ".join(str(index) for index in self.unpaired[:8])
+            if len(self.unpaired) > 8:
+                shown += f", and {len(self.unpaired) - 8} more"
+            parts.append(
+                f"{len(self.unpaired)} line(s) whose crosstalk has no counterpart "
+                f"from the other character ({shown})"
+            )
+        return ", ".join(parts) if parts else "no simultaneous speech in the source"
+
+
+@dataclass(frozen=True, slots=True)
 class PronunciationReport:
     """How intelligible the dubbed lines are, judged by an ASR round trip."""
 
@@ -312,6 +380,8 @@ class QcReport:
     #: exclusive view had to arbitrate. Reported rather than acted on: a dub must still
     #: say the line, and dropping it would leave a hole in the dialogue.
     attribution_uncertain: tuple[int, ...] = ()
+    #: How the dub handled the speech the film played at once.
+    overlap: OverlapReport | None = None
 
     @property
     def worst_lines(self) -> tuple[LineMetrics, ...]:
@@ -340,6 +410,7 @@ class QcReport:
                 "seconds": round(self.crosstalk_seconds, 3),
                 "attribution_uncertain": list(self.attribution_uncertain),
             },
+            "overlap": None if self.overlap is None else self.overlap.as_dict(),
             "lines": [line.as_dict() for line in self.lines],
         }
 
@@ -373,6 +444,10 @@ class QcReport:
                 f"{len(self.attribution_uncertain)} line(s) inside simultaneous speech "
                 f"whose speaker cannot be verified from timing alone ({shown})"
             )
+        if self.overlap is not None and (
+            self.overlap.source_pairs or self.overlap.unpaired
+        ):
+            parts.append(self.overlap.summary())
         if self.pronunciation is None:
             parts.append("pronunciation not measured")
         else:
@@ -439,6 +514,98 @@ def summarise_duration(lines: Iterable[LineMetrics]) -> DurationFitReport:
         mean_tempo=fmean(tempos),
         slowest_tempo=min(tempos),
         fastest_tempo=max(tempos),
+    )
+
+
+def measure_overlap(
+    alignment: Iterable[AlignedClip],
+    *,
+    crosstalk: Iterable[CrosstalkRegion] = (),
+) -> OverlapReport:
+    """Measure whether the film's simultaneous speech survived into the dub.
+
+    Two questions, both about the same defect. First, of the pairs of lines the film
+    played *at the same time*, how many are still heard at the same time after
+    placement? A pair that is no longer simultaneous has been serialized: the first
+    character finishes, then the second begins, and the argument reads as two
+    monologues. Second, for every crosstalk region the diarizer reported, does more
+    than one character have a line inside it? A region with one line is a stretch
+    where the film has two people talking and the dub has one, which is the same
+    defect seen from the content side rather than the timeline side.
+
+    Measured on delivered *speech*, not on files: a rendered pause carries silence,
+    and silence over silence is not two voices.
+    """
+
+    placed = [
+        (aligned.index, aligned.clip.dialogue, aligned)
+        for aligned in alignment
+    ]
+
+    source_pairs = 0
+    preserved_pairs = 0
+    preserved_seconds = 0.0
+    for first_position in range(len(placed)):
+        for second_position in range(first_position + 1, len(placed)):
+            _index_a, first, placed_first = placed[first_position]
+            _index_b, second, placed_second = placed[second_position]
+            if first.speaker_id == second.speaker_id:
+                continue
+            source_overlap = min(first.end, second.end) - max(
+                first.start, second.start
+            )
+            if source_overlap <= EXACT_FIT_TOLERANCE_SECONDS:
+                continue
+            source_pairs += 1
+
+            delivered_start = max(placed_first.start, placed_second.start)
+            delivered_end = min(
+                placed_first.start
+                + placed_first.rendered_pause_before
+                + placed_first.speech_duration,
+                placed_second.start
+                + placed_second.rendered_pause_before
+                + placed_second.speech_duration,
+            )
+            delivered = delivered_end - delivered_start
+            if delivered > EXACT_FIT_TOLERANCE_SECONDS:
+                preserved_pairs += 1
+                preserved_seconds += delivered
+
+    regions = tuple(crosstalk)
+    unpaired: list[int] = []
+    if regions:
+        for index, _line, aligned in placed:
+            start = aligned.start
+            end = (
+                aligned.start
+                + aligned.rendered_pause_before
+                + aligned.speech_duration
+            )
+            for region in regions:
+                if min(end, region.end) - max(start, region.start) <= 0.0:
+                    continue
+                others = {
+                    other.speaker_id
+                    for other_index, other, _other_aligned in placed
+                    if other_index != index
+                    and other.speaker_id != aligned.speaker_id
+                    and other.start < region.end
+                    and other.end > region.start
+                }
+                if not others and any(
+                    speaker != aligned.speaker_id for speaker in region.speaker_ids
+                ):
+                    unpaired.append(index)
+                    break
+        unpaired = sorted(set(unpaired))
+
+    return OverlapReport(
+        source_pairs=source_pairs,
+        preserved_pairs=preserved_pairs,
+        preserved_seconds=preserved_seconds,
+        lost_pairs=source_pairs - preserved_pairs,
+        unpaired=tuple(unpaired),
     )
 
 
@@ -544,6 +711,7 @@ def build_qc_report(
         crosstalk_seconds=sum(region.duration for region in regions),
         pronunciation=pronunciation,
         attribution_uncertain=_attribution_uncertain(alignment, regions),
+        overlap=measure_overlap(alignment, crosstalk=regions),
     )
 
 
@@ -585,6 +753,7 @@ __all__ = [
     "PLAUSIBLE_SYLLABLES_PER_SECOND",
     "SYLLABLE_RANGES",
     "DurationFitReport",
+    "OverlapReport",
     "InvalidMeasurementError",
     "InvalidTextError",
     "LineMetrics",
@@ -598,6 +767,7 @@ __all__ = [
     "has_pronounceable_text",
     "latin_spans",
     "measure_lines",
+    "measure_overlap",
     "measure_pronunciation",
     "normalise_for_comparison",
     "summarise_duration",

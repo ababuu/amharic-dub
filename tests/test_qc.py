@@ -7,8 +7,11 @@ the rest of the report is arithmetic over metadata the stages already produced.
 
 from __future__ import annotations
 
+import dataclasses
+
 from pathlib import Path
 
+import dataclasses
 import pytest
 
 from app.pipeline import qc
@@ -22,6 +25,7 @@ from app.pipeline.qc import (
     has_latin,
     has_pronounceable_text,
     latin_spans,
+    measure_overlap,
     measure_pronunciation,
     normalise_for_comparison,
 )
@@ -561,3 +565,111 @@ def test_pronunciation_appears_in_the_assembled_report(tmp_path: Path) -> None:
     assert report.pronunciation.measured == 1
     assert "pronunciation CER 0.000" in report.summary()
     assert report.as_dict()["pronunciation"]["model"] == "fake-asr"
+
+
+# ---------------------------------------------------------------------------
+# Simultaneous speech: does the dub keep both characters talking at once?
+# ---------------------------------------------------------------------------
+
+
+def test_a_sequential_script_has_no_simultaneous_pairs(tmp_path: Path) -> None:
+    report = measure_overlap(
+        [
+            _aligned(tmp_path, index=0, window=2.0),
+            _aligned(tmp_path, index=1, window=2.0, dialogue=_dialogue(start=2.1, end=4.1)),
+        ]
+    )
+
+    assert report.source_pairs == 0
+    assert report.lost_pairs == 0
+    assert "no simultaneous speech" in report.summary()
+
+
+def test_a_pair_the_source_overlapped_is_counted_as_preserved(tmp_path: Path) -> None:
+    """Two characters talking over each other must still be heard together."""
+
+    first = _dialogue(start=5.0, end=7.0, speaker_id="SPEAKER_00")
+    second = _dialogue(start=5.6, end=7.6, speaker_id="SPEAKER_01")
+    report = measure_overlap(
+        [
+            _aligned(tmp_path, index=0, window=2.0, dialogue=first),
+            _aligned(tmp_path, index=1, window=2.0, dialogue=second),
+        ]
+    )
+
+    assert report.source_pairs == 1
+    assert report.preserved_pairs == 1
+    assert report.lost_pairs == 0
+    assert report.preserved_seconds == pytest.approx(1.4)
+    assert report.preserved_ratio == 1.0
+
+
+def test_a_pair_that_was_laid_end_to_end_is_reported_as_serialized(tmp_path: Path) -> None:
+    """The defect this measures: an interruption turned into a hand-over."""
+
+    first = _dialogue(start=5.0, end=7.0, speaker_id="SPEAKER_00")
+    second = _dialogue(start=5.6, end=7.6, speaker_id="SPEAKER_01")
+    first_placed = dataclasses.replace(
+        _aligned(tmp_path, index=0, window=2.0, speech=2.0, dialogue=first),
+        start=5.0,
+    )
+    # The second line was pushed until the first had finished.
+    second_placed = dataclasses.replace(
+        _aligned(tmp_path, index=1, window=2.0, speech=2.0, dialogue=second),
+        start=7.0,
+    )
+
+    report = measure_overlap([first_placed, second_placed])
+
+    assert report.source_pairs == 1
+    assert report.preserved_pairs == 0
+    assert report.lost_pairs == 1
+    assert "1 simultaneous pair(s) kept" in report.summary()
+    assert "1 serialized" in report.summary()
+
+
+def test_a_crosstalk_region_with_only_one_speakers_line_is_named(tmp_path: Path) -> None:
+    """The film has two people talking and the dub has one: that is the defect."""
+
+    line = _dialogue(start=10.0, end=14.0, speaker_id="SPEAKER_00")
+    aligned = _aligned(tmp_path, index=3, window=4.0, speech=4.0, dialogue=line)
+
+    report = measure_overlap(
+        [aligned],
+        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+    )
+
+    assert report.unpaired == (3,)
+    assert "no counterpart" in report.summary()
+
+
+def test_a_crosstalk_region_with_both_speakers_dubbed_is_not_named(
+    tmp_path: Path,
+) -> None:
+    first = _dialogue(start=10.0, end=14.0, speaker_id="SPEAKER_00")
+    second = _dialogue(start=12.2, end=12.9, speaker_id="SPEAKER_01")
+    report = measure_overlap(
+        [
+            _aligned(tmp_path, index=0, window=4.0, speech=4.0, dialogue=first),
+            _aligned(tmp_path, index=1, window=0.7, speech=0.7, dialogue=second),
+        ],
+        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+    )
+
+    assert report.unpaired == ()
+
+
+def test_the_overlap_measurement_reaches_the_report(tmp_path: Path) -> None:
+    first = _dialogue(start=5.0, end=7.0, speaker_id="SPEAKER_00")
+    second = _dialogue(start=5.6, end=7.6, speaker_id="SPEAKER_01")
+    report = qc.build_qc_report(
+        [
+            _aligned(tmp_path, index=0, window=2.0, dialogue=first),
+            _aligned(tmp_path, index=1, window=2.0, dialogue=second),
+        ],
+        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 5.6, 7.0)],
+    )
+
+    assert report.overlap is not None
+    assert report.as_dict()["overlap"]["preserved_pairs"] == 1
+    assert "simultaneous pair(s) kept" in report.summary()

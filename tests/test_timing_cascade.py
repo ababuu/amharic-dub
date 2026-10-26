@@ -215,12 +215,14 @@ def test_genuine_simultaneous_dialogue_is_preserved(tmp_path: Path) -> None:
     assert second.start < first.end  # the overlap the source actually had
 
 
-def test_a_source_overlap_beyond_the_allowance_is_still_capped(tmp_path: Path) -> None:
-    """Preserving the scene is not a licence for two voices over each other.
+def test_a_long_source_overlap_is_preserved_not_capped(tmp_path: Path) -> None:
+    """A long simultaneous exchange stays simultaneous in the dub.
 
-    The allowance is about intelligibility: a film that overlapped its lines by two
-    seconds still gets a comprehensible dub, so the delivered overlap is capped even
-    though the source had more.
+    The allowance exists for lines the film kept *apart*: it lets a natural
+    interruption land without pushing the next line. It is not a cap on what the
+    film itself did, because that overlap is the scene - two characters arguing at
+    once is exactly what a dub must reproduce, and serializing it is heard as two
+    monologues edited together.
     """
 
     clips = [
@@ -231,8 +233,14 @@ def test_a_source_overlap_beyond_the_allowance_is_still_capped(tmp_path: Path) -
     aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
 
     first, second = aligned
-    assert second.drift > 0.0
-    assert first.end - second.start <= DEFAULT_TIMING_MAX_OVERLAP_SECONDS + 1e-6
+    # Neither line is moved: both performances keep the positions the film gave them.
+    assert first.drift == pytest.approx(0.0)
+    assert second.drift == pytest.approx(0.0)
+    assert second.start == pytest.approx(5.2)
+    assert second.start < first.end
+    # And the overlap is the source overlap, which is larger than the allowance.
+    assert first.end - second.start == pytest.approx(1.8)
+    assert first.end - second.start > DEFAULT_TIMING_MAX_OVERLAP_SECONDS
 
 
 def test_a_later_line_is_not_pushed_by_one_that_started_after_it(tmp_path: Path) -> None:
@@ -348,3 +356,108 @@ def test_a_negative_drift_is_rejected() -> None:
             rendered_pause_after=0.0,
             drift=-0.5,
         )
+
+
+# ---------------------------------------------------------------------------
+# Two characters are two tracks, not one queue
+# ---------------------------------------------------------------------------
+
+
+def test_a_third_voice_between_two_lines_does_not_hide_the_first_ones_overrun(
+    tmp_path: Path,
+) -> None:
+    """A speaking turn in between must not let one character talk over themselves.
+
+    One voice handed straight to itself is heard as a stutter, because the ear has
+    nothing to separate the two copies with. The constraint is therefore against the
+    speaker's *own* last line - not against whichever line happens to sit immediately
+    before this one - so a second character speaking in between cannot mask it.
+    """
+
+    clips = [
+        # SPEAKER_00 needs 3s inside a 1s window: it will run long even at the cap.
+        _clip(tmp_path, index=0, start=5.0, end=6.0, speech=3.0, speaker_id="SPEAKER_00"),
+        # SPEAKER_01 speaks inside that window, so they are not in the queue behind it.
+        _clip(tmp_path, index=1, start=5.5, end=5.8, speech=0.3, speaker_id="SPEAKER_01"),
+        # SPEAKER_00's next line starts before their first one has finished.
+        _clip(tmp_path, index=2, start=6.9, end=7.4, speech=0.5, speaker_id="SPEAKER_00"),
+    ]
+
+    aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
+
+    first, second, third = aligned
+    first_speech_end = first.start + first.rendered_pause_before + first.speech_duration
+    assert first_speech_end > 6.9  # it really did run past the next line's start
+    # The character's own next line waits for them, whatever happened in between.
+    assert third.start >= first_speech_end - 1e-6
+    # The other character was not pushed out of the way by a line that was not theirs.
+    assert second.drift == pytest.approx(0.0)
+
+
+def test_an_interruption_inside_a_line_is_not_moved_out_of_it(tmp_path: Path) -> None:
+    """The film put one character's line inside another's; the dub keeps it there.
+
+    This is the shape of the reported defect: an argument where one actor starts
+    before the other has finished. Serializing it makes the scene two monologues, and
+    it also forces the earlier line to be sped up to finish in time - which is heard.
+    """
+
+    clips = [
+        _clip(tmp_path, index=0, start=5.0, end=9.0, speech=4.0, speaker_id="SPEAKER_00"),
+        _clip(tmp_path, index=1, start=7.5, end=8.2, speech=0.7, speaker_id="SPEAKER_01"),
+    ]
+
+    aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
+
+    first, second = aligned
+    # Neither line was accelerated, and neither was moved.
+    assert first.tempo == pytest.approx(1.0)
+    assert first.drift == pytest.approx(0.0)
+    assert second.drift == pytest.approx(0.0)
+    # The interruption still lands inside the line it interrupted.
+    assert second.start < first.start + first.speech_duration
+
+
+def test_a_long_line_does_not_evict_the_interruption_it_covers(tmp_path: Path) -> None:
+    """The earlier line's overrun is its own problem, not the second character's.
+
+    Moving the interruption later would desynchronise that character from the picture
+    for the rest of the scene, which is worse than the overlap the film already had.
+    """
+
+    clips = [
+        # SPEAKER_00 needs 4s inside a 2s window: it will run to about 2.76s.
+        _clip(tmp_path, index=0, start=5.0, end=7.0, speech=4.0, speaker_id="SPEAKER_00"),
+        # SPEAKER_01 interrupts inside that window.
+        _clip(tmp_path, index=1, start=5.5, end=5.8, speech=0.3, speaker_id="SPEAKER_01"),
+    ]
+
+    aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
+
+    first, second = aligned
+    assert first.speech_duration > 2.5  # it really did overrun
+    assert second.drift == pytest.approx(0.0)
+    assert second.start == pytest.approx(5.5)
+
+
+def test_a_characters_own_next_line_still_waits_for_them(tmp_path: Path) -> None:
+    """Keeping the film's overlap is not permission to stutter.
+
+    With a second character talking inside the overrun, the speaker's own next line
+    must still wait for their first one to finish.
+    """
+
+    clips = [
+        _clip(tmp_path, index=0, start=5.0, end=7.0, speech=4.0, speaker_id="SPEAKER_00"),
+        _clip(tmp_path, index=1, start=5.5, end=5.8, speech=0.3, speaker_id="SPEAKER_01"),
+        _clip(tmp_path, index=2, start=7.5, end=7.8, speech=0.3, speaker_id="SPEAKER_00"),
+    ]
+
+    aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))
+
+    first, second, third = aligned
+    first_speech_end = first.start + first.rendered_pause_before + first.speech_duration
+    assert first_speech_end > 7.5
+    assert second.drift == pytest.approx(0.0)
+    assert third.start >= first_speech_end - 1e-6
+    assert "same character had not finished" in " ".join(third.notes)

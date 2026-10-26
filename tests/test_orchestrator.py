@@ -194,6 +194,7 @@ class Stages:
         self.received: dict[str, tuple[object, ...]] = {}
         self.order: list[str] = []
         self.seen_crosstalk: object = ()
+        self.seen_overlap_turns: object = ()
         self.track = root / "stages" / "movie_mix.wav"
 
     def _record(self, name: str, *args: object) -> None:
@@ -231,9 +232,16 @@ class Stages:
         return DiarizationResult(turns=tuple(self.turns), crosstalk=tuple(self.crosstalk))
 
     def transcribe(
-        self, speech: Path, turns: object, *, settings: Settings
+        self,
+        speech: Path,
+        turns: object,
+        *,
+        settings: Settings,
+        crosstalk: object = (),
+        overlap_turns: object = (),
     ) -> list[TranscriptSegment]:
         self._record("transcription", speech, turns, settings)
+        self.seen_overlap_turns = overlap_turns
         return list(self.lines)
 
     def adapt_dialogue(

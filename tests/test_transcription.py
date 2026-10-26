@@ -45,10 +45,27 @@ class FakeSegment:
     segment object than it should.
     """
 
-    def __init__(self, start: object, end: object, text: object) -> None:
+    def __init__(
+        self,
+        start: object,
+        end: object,
+        text: object,
+        *,
+        words: object = None,
+    ) -> None:
         self.start = start
         self.end = end
         self.text = text
+        self.words = words
+
+
+class FakeWord:
+    """Stand-in for ``faster_whisper.transcribe.Word``."""
+
+    def __init__(self, start: object, end: object, word: object) -> None:
+        self.start = start
+        self.end = end
+        self.word = word
 
 
 class FakeWhisperModel:
@@ -721,6 +738,174 @@ def test_whisper_text_is_stripped_in_the_output(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# simultaneous speech: recovering the speaker the exclusive view dropped
+# ---------------------------------------------------------------------------
+
+
+def _crosstalk(speakers, start, end):
+    from app.pipeline.diarization import CrosstalkRegion
+
+    return CrosstalkRegion(speaker_ids=speakers, start=start, end=end)
+
+
+def test_a_speaker_the_exclusive_view_dropped_is_recovered(monkeypatch, tmp_path):
+    """Two people talking at once must both reach the transcript.
+
+    The exclusive diarization gives every instant to one speaker, so the second
+    person's turn - and everything they said - disappears. The overlap-aware turns
+    say who else was there and when, which is enough to re-listen to that stretch and
+    give each word to the speaker who was saying it.
+    """
+
+    _patch(monkeypatch)
+    FakeWhisperModel.responses = [
+        # The exclusive turn: one clean decode, as before.
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        # The re-listened crosstalk: words with their own timings.
+        [
+            FakeSegment(
+                0.0,
+                0.7,
+                "thank you",
+                words=[
+                    FakeWord(0.05, 0.3, " thank"),
+                    FakeWord(0.35, 0.65, " you"),
+                ],
+            )
+        ],
+    ]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path),
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_01", 12.2, 12.9),
+        ],
+    )
+
+    assert _rows(segments) == [
+        ("SPEAKER_00", 10.0, 14.0, "I do not say that lightly."),
+        ("SPEAKER_01", 12.25, 12.85, "thank you"),
+    ]
+
+
+def test_recovery_is_skipped_without_the_overlap_aware_turns(monkeypatch, tmp_path):
+    """No overlap-aware annotation means no evidence, so nothing is invented."""
+
+    _patch(monkeypatch)
+    FakeWhisperModel.segments = [FakeSegment(0.0, 4.0, "I do not say that lightly.")]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path),
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+    )
+
+    assert _rows(segments) == [("SPEAKER_00", 10.0, 14.0, "I do not say that lightly.")]
+    # Exactly one decode: the crosstalk was not re-listened to.
+    assert len(FakeWhisperModel.calls) == 1
+
+
+def test_a_recovered_line_that_restates_the_other_speaker_is_dropped(
+    monkeypatch, tmp_path
+):
+    """One mixture transcribed twice reports the dominant voice twice.
+
+    Two characters saying one line is a worse defect than one of them saying
+    nothing, so text that restates what the region already has is discarded.
+    """
+
+    _patch(monkeypatch)
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [
+            FakeSegment(
+                0.0,
+                2.0,
+                "I do not say that lightly",
+                words=[
+                    FakeWord(0.05, 0.5, " I"),
+                    FakeWord(0.6, 1.0, " do"),
+                    FakeWord(1.1, 1.5, " not"),
+                    FakeWord(1.6, 1.9, " say"),
+                ],
+            )
+        ],
+    ]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path),
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 10.0, 13.0)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 12.0),
+            _region("SPEAKER_01", 12.0, 13.0),
+        ],
+    )
+
+    speakers = {segment.speaker_id for segment in segments}
+    assert speakers == {"SPEAKER_00"}
+
+
+def test_the_kept_speakers_text_is_never_replaced_by_a_mixture(monkeypatch, tmp_path):
+    """The one speaker the exclusive view kept already had a clean decode."""
+
+    _patch(monkeypatch)
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [
+            FakeSegment(
+                0.0,
+                0.6,
+                "we are done",
+                words=[FakeWord(0.05, 0.55, " we are done")],
+            )
+        ],
+    ]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path),
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_01", 12.2, 12.9),
+        ],
+    )
+
+    kept = [segment for segment in segments if segment.speaker_id == "SPEAKER_00"]
+    assert [segment.text for segment in kept] == ["I do not say that lightly."]
+
+
+def test_a_crosstalk_too_short_to_hold_a_word_is_not_re_listened_to(
+    monkeypatch, tmp_path
+):
+    """0.2s of a mixture is a syllable; any text from it would be invented."""
+
+    _patch(monkeypatch)
+    FakeWhisperModel.segments = [FakeSegment(0.0, 4.0, "I do not say that lightly.")]
+
+    transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path),
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.4)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_01", 12.2, 12.4),
+        ],
+    )
+
+    assert len(FakeWhisperModel.calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # language handling
 # ---------------------------------------------------------------------------
 
@@ -1016,3 +1201,61 @@ def test_a_sentence_rejects_parts_from_another_speaker() -> None:
                 _segment(1.0, 2.0, "there", speaker="SPEAKER_01"),
             ),
         )
+
+
+def test_a_crosstalk_the_exclusive_view_left_empty_is_not_guessed_at(
+    monkeypatch, tmp_path
+):
+    """With no authoritative text, a recovery has nothing to check itself against."""
+
+    _patch(monkeypatch)
+    FakeWhisperModel.segments = [FakeSegment(0.0, 1.0, "elsewhere")]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 0.0, 1.0)],
+        settings=_settings(tmp_path),
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 20.0, 21.0)],
+        overlap_turns=[
+            _region("SPEAKER_00", 20.0, 20.5),
+            _region("SPEAKER_01", 20.5, 21.0),
+        ],
+    )
+
+    assert [segment.speaker_id for segment in segments] == ["SPEAKER_00"]
+    assert len(FakeWhisperModel.calls) == 1
+
+
+def test_the_same_interjection_is_recovered_in_two_different_crosstalks(
+    monkeypatch, tmp_path
+):
+    """One region's recovered line must not veto an identical one in another region."""
+
+    _patch(monkeypatch)
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 1.0, "first line")],
+        [FakeSegment(0.0, 1.0, "second line")],
+        [FakeSegment(0.0, 0.6, "no", words=[FakeWord(0.05, 0.45, " no")])],
+        [FakeSegment(0.0, 0.6, "no", words=[FakeWord(0.05, 0.45, " no")])],
+    ]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [
+            _region("SPEAKER_00", 10.0, 11.0),
+            _region("SPEAKER_00", 11.0, 12.0),
+        ],
+        settings=_settings(tmp_path),
+        crosstalk=[
+            _crosstalk(("SPEAKER_00", "SPEAKER_01"), 10.0, 10.6),
+            _crosstalk(("SPEAKER_00", "SPEAKER_01"), 11.0, 11.6),
+        ],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 12.0),
+            _region("SPEAKER_01", 10.0, 10.6),
+            _region("SPEAKER_01", 11.0, 11.6),
+        ],
+    )
+
+    recovered = [segment for segment in segments if segment.speaker_id == "SPEAKER_01"]
+    assert len(recovered) == 2

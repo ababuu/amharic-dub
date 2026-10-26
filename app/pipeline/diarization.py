@@ -13,10 +13,12 @@ Two views of the same pyannote result are used for different purposes:
   a transcribed line can never be attributed to two people. Clean, sufficiently
   long turns are then checked against Community-1's speaker embeddings, and only a
   strong disagreement can change the label.
-* the **overlapping** annotation is used only to *flag* crosstalk, because the
-  exclusive view necessarily hides one of the two speakers when they talk at once.
-  A film is full of simultaneous speech, so :func:`diarize_detailed` reports those
-  regions alongside the turns; overlapping turns are excluded from verification.
+* the **overlapping** annotation is used twice, and never to relabel a turn. It
+  *flags* crosstalk, because the exclusive view necessarily hides one of the two
+  speakers when they talk at once. And its turns are returned as
+  ``overlap_turns``, so the transcription stage can find the words of the speaker
+  the exclusive view dropped: that is the difference between a two-character
+  argument and a monologue. Overlapping turns are excluded from verification.
 
 Transcript text, emotions, character names, and voice-cloning embeddings belong
 to :mod:`app.pipeline.transcription`, :mod:`app.pipeline.voice_profiles`, and
@@ -73,9 +75,11 @@ except ImportError:  # pragma: no cover - only without the AI runtime installed
 #: attributed to two people at once.
 _EXCLUSIVE_ANNOTATION_ATTRIBUTE = "exclusive_speaker_diarization"
 
-#: ``DiarizeOutput`` field holding the overlap-aware annotation. It is read **only**
-#: to flag where two speakers talk at once - information the exclusive view cannot
-#: carry, because it has to drop one of the two. Never used to attribute a line.
+#: ``DiarizeOutput`` field holding the overlap-aware annotation. It is read for two
+#: things the exclusive view cannot provide: *where* two speakers talk at once
+#: (reported as crosstalk), and *which* speaker the exclusive view had to drop
+#: (returned as ``overlap_turns`` so their words can be recovered). It never
+#: relabels a turn.
 #: Unlike the exclusive field this one is optional: a pyannote result without it
 #: simply means "no crosstalk could be reported", not an error.
 _OVERLAPPING_ANNOTATION_ATTRIBUTE = "speaker_diarization"
@@ -86,6 +90,12 @@ _MIN_VERIFICATION_TURN_SECONDS = 1.5
 _MIN_REASSIGNMENT_SIMILARITY = 0.55
 _MIN_REASSIGNMENT_MARGIN = 0.15
 _LOGGER = logging.getLogger(__name__)
+
+#: Two turns of the same speaker separated by at most this long are one utterance
+#: in the overlap-aware view. pyannote splits a turn wherever another speaker's
+#: boundary crosses it, so a 6-second sentence can arrive as five pieces; merging
+#: them back is what makes the recovered stretch long enough to transcribe.
+_OVERLAP_TURN_MERGE_SECONDS = 0.25
 
 
 class DiarizationError(RuntimeError):
@@ -227,14 +237,33 @@ class DiarizationResult:
     """Everything diarization found: attributed turns plus reported crosstalk.
 
     ``turns`` is the exclusive, non-overlapping attribution with high-confidence
-    speaker-embedding corrections applied. ``crosstalk`` is additive information
-    about where speakers overlapped, and is never used to attribute a line.
+    speaker-embedding corrections applied. ``crosstalk`` reports where speakers
+    overlapped. ``overlap_turns`` is the overlap-aware view of the same audio:
+    every speaker's own turn, *allowing* two of them to cover the same instant.
+
+    Why both views are returned
+    ---------------------------
+    The exclusive view is authoritative for *text*: one instant, one speaker, so a
+    transcribed word can only be credited to one character. But it necessarily
+    shortens - sometimes removes entirely - the second speaker's turn, and the
+    words spoken in that lost stretch are heard by nobody downstream. On a film
+    where two characters argue, that is most of a scene collapsing into a
+    monologue. ``overlap_turns`` carries the information needed to recover them:
+    which other speaker was talking, and exactly when. It is never used to
+    *relabel* a turn; only to notice that a speaker the exclusive view dropped was
+    there, so the transcription stage can listen for them.
+
     ``corrections`` records every changed turn and the scores that justified it.
     """
 
     turns: tuple[SpeakerSegment, ...]
     crosstalk: tuple[CrosstalkRegion, ...] = ()
     corrections: tuple["SpeakerAttributionCorrection", ...] = ()
+    #: Speaker turns from the overlap-aware annotation, in chronological order.
+    #: Empty when the pyannote result carries no such annotation; everything
+    #: downstream must keep working in that case.
+    overlap_turns: tuple[SpeakerSegment, ...] = ()
+
 
     @property
     def speaker_ids(self) -> tuple[str, ...]:
@@ -520,6 +549,45 @@ def _to_crosstalk(annotation: Any) -> list[CrosstalkRegion]:
     return regions
 
 
+def _to_overlap_turns(annotation: Any) -> list[SpeakerSegment]:
+    """Return every speaker's turn from the overlap-aware annotation.
+
+    Two speakers' turns may cover the same instant here, which is the whole point:
+    this is the view in which the second person in a crosstalk is still visible.
+    Each speaker's own turns are merged when they touch, because pyannote splits a
+    single utterance wherever the *other* speaker's boundary crosses it - a split
+    that carries no meaning of its own and would otherwise fragment the recovered
+    text into pieces too short to transcribe. Merging is done per speaker, since the
+    turns of two speakers interleave in the annotation.
+    """
+
+    spans: dict[str, list[tuple[float, float]]] = {}
+    for turn, _, label in annotation.itertracks(yield_label=True):
+        speaker = label.strip() if isinstance(label, str) else ""
+        if not speaker:
+            continue
+        start, end = float(turn.start), float(turn.end)
+        if end <= start:
+            continue
+        spans.setdefault(speaker, []).append((start, end))
+
+    turns: list[SpeakerSegment] = []
+    for speaker, intervals in spans.items():
+        merged: list[list[float]] = []
+        for start, end in sorted(intervals):
+            if merged and start - merged[-1][1] <= _OVERLAP_TURN_MERGE_SECONDS:
+                merged[-1][1] = max(merged[-1][1], end)
+                continue
+            merged.append([start, end])
+        turns.extend(
+            SpeakerSegment(speaker_id=speaker, start=start, end=end)
+            for start, end in merged
+        )
+
+    turns.sort(key=lambda segment: (segment.start, segment.end, segment.speaker_id))
+    return turns
+
+
 def _to_segments(result: Any) -> list[SpeakerSegment]:
     """Convert a pyannote result into chronologically sorted segments."""
 
@@ -747,8 +815,9 @@ def diarize_detailed(
 
     Clean, sufficiently long exclusive turns are verified against Community-1's
     speaker embeddings before being returned. The overlap-aware view is also read
-    so simultaneous speech can be reported instead of silently collapsing onto
-    whichever speaker the exclusive view kept.
+    twice: so simultaneous speech can be reported instead of silently collapsing
+    onto whichever speaker the exclusive view kept, and so the speakers it *did*
+    drop are identified - with their exact spans - for transcription to recover.
 
     Speaker-count hints that are left unset fall back to
     ``DIARIZATION_MIN_SPEAKERS`` / ``DIARIZATION_MAX_SPEAKERS``; an explicit
@@ -775,6 +844,9 @@ def diarize_detailed(
 
     overlap_annotation = _extract_overlap_annotation(result)
     crosstalk = () if overlap_annotation is None else tuple(_to_crosstalk(overlap_annotation))
+    overlap_turns = (
+        () if overlap_annotation is None else tuple(_to_overlap_turns(overlap_annotation))
+    )
     turns, corrections = _verify_speaker_attributions(
         pipeline,
         result,
@@ -786,6 +858,7 @@ def diarize_detailed(
         turns=tuple(turns),
         crosstalk=crosstalk,
         corrections=corrections,
+        overlap_turns=overlap_turns,
     )
 
 

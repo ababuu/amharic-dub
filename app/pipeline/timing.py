@@ -452,6 +452,22 @@ def _audio_start(clip: TtsClip) -> float:
     return clip.dialogue.start - lead
 
 
+def _source_overlap(first: TtsClip, second: TtsClip) -> float:
+    """Return how much the two performances overlapped in the film, in seconds.
+
+    Measured on the *source* windows, so it describes the scene rather than anything
+    this stage did: two characters who talked over each other in the film are meant
+    to talk over each other in the dub, and a line is never pushed later to get out
+    of the way of a line that was already simultaneous with it.
+    """
+
+    return max(
+        0.0,
+        min(first.dialogue.end, second.dialogue.end)
+        - max(first.dialogue.start, second.dialogue.start),
+    )
+
+
 def align_clip(
     clip: TtsClip,
     destination: str | Path,
@@ -716,22 +732,31 @@ def align_dialogue(
         key=lambda position: (ordered[position].dialogue.start, position),
     )
 
-    # Each line is told the room it has before the next one begins. The next line's own
-    # leading pause is included, because that pause is part of where its audio starts and
-    # so is the earliest moment two lines could collide. Without this every line is fitted
-    # to its own window alone, and a line that cannot fit - which is most of them in a
-    # language longer than English - simply overruns into its neighbour and two voices
-    # speak at once.
+    # Each line is told the room it has before the next line that must not be spoken
+    # over. "The next line" is not simply the next one on the timeline: when the film
+    # had two characters talking at once, that simultaneity *is* the scene, and
+    # squeezing the first line to finish before the second begins is what turns an
+    # argument into two people taking turns. A line therefore looks forward to the
+    # first following line it was not already simultaneous with - the next line by the
+    # same character, or the next one by anyone else on a timeline that did not
+    # overlap it.
     guard = resolved.timing_min_line_gap
     rooms: dict[int, float | None] = {}
     for slot, position in enumerate(by_time):
         clip = ordered[position]
-        if slot + 1 >= len(by_time):
-            rooms[position] = None
-            continue
-        following = ordered[by_time[slot + 1]]
-        deadline = _audio_start(following) - guard
-        rooms[position] = deadline - clip.dialogue.start - clip.rendered_pause_after
+        deadline: float | None = None
+        for following_position in by_time[slot + 1 :]:
+            following = ordered[following_position]
+            if (
+                following.speaker_id != clip.speaker_id
+                and _source_overlap(clip, following) > 0.0
+            ):
+                continue
+            deadline = _audio_start(following) - guard
+            break
+        rooms[position] = (
+            None if deadline is None else deadline - clip.dialogue.start - clip.rendered_pause_after
+        )
 
     aligned: dict[int, AlignedClip] = {}
     for position, clip in enumerate(ordered):
@@ -786,71 +811,70 @@ def _report_tempo_seams(aligned: list[AlignedClip]) -> list[AlignedClip]:
 def _cascade(
     aligned: list[AlignedClip], *, guard: float, overlap: float = 0.0
 ) -> list[AlignedClip]:
-    """Place lines later so that no two of them are ever *intelligibly* at once.
+    """Place lines so that only the film's own simultaneity survives.
 
     A line whose Amharic needs more time than the film left it cannot be fitted without
     either rushing it past intelligibility or cutting a word off the end. Both were
-    tried; both were audible. So the overrun is paid for in position instead: the next
-    line waits until this one has finished, except for the configured short handover
-    allowance between different speakers.
+    tried; both were audible. So the overrun is paid for in position instead: a line
+    waits until the line before it has finished, except for the configured short
+    handover allowance between different characters.
 
-    ``overlap`` is the concession that keeps the picture: up to this many seconds of the
-    previous line may still be sounding when the next one starts, which is what a
-    conversation already sounds like, before the next line is moved at all. A third of a
-    second of hand-over is heard as a natural interruption; three seconds of it is two
-    people talking at once, which is the thing a dub must never do.
+    Two characters are two tracks, not one queue
+    --------------------------------------------
+    This is the rule that keeps a conversation a conversation. Every placed line is
+    compared against every other placed line, and only a comparison the film itself
+    did not already contain can move anything:
 
-    The allowance is for a change of speaker. The same character never hands over to
-    themselves - their turns do not overlap in the source, and the same voice laid over
-    itself is not heard as an interruption but as a stutter, because the ear has nothing
-    to separate the two copies with. So one speaker's speech is never left sounding under
-    their own next line.
-
-    Lines that **already overlapped in the source** keep that overlap, up to the same
-    ``overlap`` allowance. Two performances that started together are a line of dialogue
-    and its interruption, and separating them changes the scene rather than repairing it.
-    Two differences from a sequential pair follow from that: the sequential guard is not
-    applied (there was no silence between these lines to respect), and the delivered
-    overlap is measured from the overlap the film had rather than from the allowance
-    alone. Beyond the allowance the usual cap applies, because the allowance is about
-    intelligibility and not about what the source happened to do.
-
-    So the two cases differ in exactly one way: a sequential pair may be given the small
-    hand-over allowance on purpose, because a hand-over is what a conversation sounds
-    like, while a pair the film already overlapped is never given *more* overlap than the
-    film had.
+    * **the same character** - always constrained, no matter how far apart. One voice
+      cannot hand over to itself: their turns do not overlap in the source, and the
+      same voice laid over itself is heard as a stutter rather than as an interruption,
+      because the ear has nothing to separate the two copies with. The constraint is
+      against that speaker's own last line, not against the line that happens to sit
+      immediately before this one in the list - so a second character speaking in
+      between cannot hide an unfinished sentence.
+    * **a pair the film already overlapped** - not moved at all. The overlap is the
+      performance: a line and its interruption, and both actors were in the room at that
+      instant. Pushing the later line out of the overlap is what makes a dub sound like
+      two monologues edited together, and it also desynchronises that character from
+      the picture for the rest of the scene. The earlier line may run so long that it
+      covers the later one; that is its own overrun, which is measured and reported per
+      line rather than paid for by moving somebody else's performance.
+    * **a pair the film did not overlap** - the sequential rule applies: the later line
+      starts after the earlier one has finished, less the ``overlap`` hand-over
+      allowance, which is what a natural interruption sounds like and what stops the
+      next line from being pushed needlessly.
 
     Everything here is measured between *speech* boundaries rather than file boundaries.
     A clip carries its rendered pauses with it, and silence over silence is inaudible, so
     a line is not moved to avoid an overlap nobody can hear.
+
+    Lines placed in time order; the caller restores input order.
     """
 
     placed: list[AlignedClip] = []
-    previous: AlignedClip | None = None
-    previous_speech_end = 0.0
+    speech_ends: list[float] = []
     for clip in aligned:
-        same_speaker = previous is not None and previous.speaker_id == clip.speaker_id
-        source_overlap = (
-            max(0.0, previous.source_end - clip.source_start)
-            if previous is not None and not same_speaker
-            else 0.0
-        )
-        if same_speaker:
-            # One voice cannot hand over to itself.
-            floor = previous_speech_end + guard - clip.rendered_pause_before
-        elif source_overlap > 0.0:
-            # Two performances the film itself overlapped. The overlap is the scene, so
-            # it is kept - up to the same `overlap` allowance, because the allowance is
-            # about intelligibility, not about what the source happened to do. The
-            # sequential guard does not apply inside a crosstalk region: there was no
-            # silence between these lines to respect.
-            floor = (
-                previous_speech_end
-                - min(source_overlap, overlap)
-                - clip.rendered_pause_before
+        floor = 0.0
+        moved_by_self = False
+        for index, previous in enumerate(placed):
+            previous_speech_end = speech_ends[index]
+            if previous.speaker_id == clip.speaker_id:
+                candidate = previous_speech_end + guard - clip.rendered_pause_before
+                if candidate > floor:
+                    floor = candidate
+                    moved_by_self = True
+                continue
+            if previous.source_end - clip.source_start > 0.0:
+                # The film had these two at once. Nothing moves: the overlap is the
+                # scene, and the first line's own overrun is reported against that line.
+                continue
+            candidate = (
+                previous_speech_end + guard - clip.rendered_pause_before - overlap
             )
-        else:
-            floor = previous_speech_end + guard - clip.rendered_pause_before - overlap
+            if candidate > floor:
+                floor = candidate
+                moved_by_self = False
+
         # The constraint is on speech, not the files: pauses are inaudible over silence.
         start = max(clip.start, floor)
         drift = start - clip.start
@@ -858,7 +882,7 @@ def _cascade(
             why = (
                 "the same character had not finished, and one voice cannot hand over to "
                 "itself"
-                if same_speaker
+                if moved_by_self
                 else "the line before it ran past its own time"
             )
             clip = replace(
@@ -871,11 +895,10 @@ def _cascade(
                     "spoken over",
                 ),
             )
-        previous_speech_end = (
+        placed.append(clip)
+        speech_ends.append(
             clip.start + clip.rendered_pause_before + clip.speech_duration
         )
-        previous = clip
-        placed.append(clip)
     return placed
 
 

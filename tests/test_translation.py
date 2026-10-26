@@ -1144,6 +1144,62 @@ def test_the_request_carries_the_syllable_budget(monkeypatch):
     assert line["syllable_budget"] == 10
 
 
+def test_a_line_talked_over_is_marked_simultaneous_and_budgeted_to_its_window(
+    monkeypatch,
+):
+    """Two characters at once is not spare time to fill.
+
+    The line that came first must not be handed the other character's speaking time:
+    every extra syllable competes with a voice, not with silence.
+    """
+
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [
+            _segment(speaker_id="SPEAKER_00", start=0.0, end=3.0, text="Wait."),
+            _segment(speaker_id="SPEAKER_01", start=2.0, end=3.0, text="Listen."),
+        ],
+        settings=_settings(),
+        enforce_budget=False,
+    )
+
+    lines = _sent_lines(FakeOpenAI.requests[0])
+    assert lines[0]["simultaneous"] is True
+    assert lines[1]["simultaneous"] is True
+    # Not 3.0s of room and not the other line's time: the line's own window.
+    assert lines[0]["syllable_budget"] == 12
+    assert lines[1]["syllable_budget"] == 4
+
+
+def test_a_turn_taking_script_is_not_marked_simultaneous(monkeypatch):
+    _patch(monkeypatch)
+
+    adapt_dialogue(
+        [
+            _segment(speaker_id="SPEAKER_00", start=0.0, end=1.0),
+            _segment(speaker_id="SPEAKER_01", start=1.1, end=2.1),
+        ],
+        settings=_settings(),
+        enforce_budget=False,
+    )
+
+    lines = _sent_lines(FakeOpenAI.requests[0])
+    assert all("simultaneous" not in line for line in lines)
+    # The room after a line still belongs to it, so the first budget is 1.1s worth.
+    assert lines[0]["syllable_budget"] == 4
+
+
+def test_the_prompt_says_what_a_simultaneous_line_means():
+    """The flag is useless unless the model is told how to write one."""
+
+    prompt = translation.SYSTEM_PROMPT
+
+    assert "simultaneous" in prompt
+    assert "AT THE SAME TIME" in prompt
+    assert "competing with another voice" in prompt
+
+
 def test_a_straddling_batch_is_told_which_scene_it_is_in(monkeypatch):
     _patch(monkeypatch)
     segments = [

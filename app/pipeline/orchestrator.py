@@ -443,7 +443,9 @@ def _report_dialogue_fit(
     spans = [(line.start, line.end) for line in dialogue]
     if not spans:
         return
-    rooms = placement_windows(spans, gap=settings.timing_min_line_gap)
+    # Overlap-aware: a line the film played at the same time as another is not given
+    # the other character's speaking time to fill, because both voices are heard.
+    rooms = placement_windows(spans, gap=settings.timing_min_line_gap, overlap_aware=True)
     rate = settings.translation_syllables_per_second
     needed = sum(count_syllables(line.amharic) / rate for line in dialogue)
     available = sum(rooms)
@@ -589,10 +591,37 @@ def run_pipeline(
             stems.speech,
             turns,
             settings=resolved,
+            # Simultaneous speech is re-listened to for the speaker the exclusive
+            # turn list had to drop: without this, a two-character argument is
+            # transcribed as one character talking and the dub follows it.
+            crosstalk=crosstalk,
+            overlap_turns=diarized.overlap_turns,
         )
     )
     if not lines:
         raise EmptyStageError("transcription produced no lines; nothing to adapt")
+    if crosstalk:
+        # Two voices in the film and one in the transcript is the defect that makes a
+        # dub sound like a monologue, so what matters is not how many lines touch a
+        # crosstalk region but how many *characters* it now has.
+        doubled = sum(
+            1
+            for region in crosstalk
+            if len(
+                {
+                    line.speaker_id
+                    for line in lines
+                    if line.start < region.end and line.end > region.start
+                }
+            )
+            >= 2
+        )
+        report(
+            f"  simultaneous speech: {doubled}/{len(crosstalk)} crosstalk region(s) "
+            "now carry lines for both characters (the exclusive view keeps one "
+            "speaker per instant, so the other is recovered from the overlap-aware "
+            "diarization)"
+        )
 
     # Who is speaking, measured from the voice itself. Diarization usually gets the
     # clusters right and a handful of turns wrong, and one wrong turn is enough to
@@ -1153,7 +1182,14 @@ def _write_manifest(
             "runs of the same lines reuse them instead of re-synthesizing",
             "a line whose Amharic needs more time than the film gave it is moved "
             "later rather than being spoken over the next line, because two voices "
-            "at once cannot be understood; the shift is recorded per line as 'drift'",
+            "at once cannot be understood; the shift is recorded per line as 'drift'. "
+            "The exception is a pair the film itself overlapped: that simultaneity is "
+            "the performance, so it is kept rather than serialized, and "
+            "qc.overlap measures how much of it survived",
+            "speech the film played simultaneously is recovered for the character the "
+            "exclusive diarization had to drop, written as a short competing line, "
+            "and placed at the same instant as the line it overlaps; "
+            "qc.overlap.unpaired names any crosstalk where only one character is heard",
             "the qc block is measured, not assumed; pronunciation is left "
             "unmeasured because it needs an Amharic ASR model, which is injected "
             "by the caller rather than downloaded by a run",

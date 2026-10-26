@@ -976,6 +976,46 @@ On the scene above this turned 41 fragments into 20 lines (longest 11.6 s, under
 Back to back sentences a beat apart therefore become one line. That is deliberate: two
 clips with two final cadences and a seam between them is the defect being removed.
 
+### Simultaneous speech (`diarization.py`, `transcription.py`)
+
+**A two-character argument must reach the transcript as two characters.** pyannote's
+*exclusive* annotation gives every instant of speech to exactly one speaker — which is
+what makes a word attributable to one character, and also what makes the other one
+disappear: their turn is truncated or dropped, and the words spoken inside it are heard
+by nobody downstream. On the shipped test clip that happened in **every one of its 7
+crosstalk regions**: 3.36 s of film with two voices in it, and 7 speakers with no line at
+all inside those stretches. The dub followed the transcript, so a scene of two people
+arguing played as a monologue with one actor visibly silent.
+
+The fix has three parts, and none of them needs a new model:
+
+* **The overlap-aware turns are kept.** `diarize_detailed` already read pyannote's
+  non-exclusive annotation, but only to count crosstalk regions. It now also returns
+  `overlap_turns` — every speaker's own turn in that view, with the meaningless splits
+  pyannote makes where the other voice crosses it merged back together. This is the only
+  record of *who else was talking, and exactly when*.
+* **The dropped speaker is re-listened to, once per crosstalk.** `transcription` decodes
+  the uncovered part of a crosstalk a single time with word timings, and gives each word
+  to the speaker diarization recorded as active through it. Both characters come out of
+  one decode rather than two guesses. What the kept speaker already has is left alone —
+  their text came from a clean, single-voice decode of their own turn — and a recovered
+  line that merely restates it is dropped, because a mixture transcribed twice reports the
+  dominant voice twice, and two characters saying one line is worse than one saying
+  nothing. A region shorter than 0.3 s, or one the exclusive view filled with nothing at
+  all, is skipped: there is no evidence there, and inventing dialogue is not a repair.
+* **It is placed, written and measured as simultaneous.** `dialogue_context
+  .simultaneous_lines` marks the pairs that share time; `translation` passes those lines
+  `"simultaneous": true` and budgets them to their **own window** rather than to the room
+  up to the next line, because their syllables compete with a voice and not with silence;
+  `timing` keeps their real overlap instead of serializing them; and `qc.measure_overlap`
+  reports how many of the film's simultaneous pairs are still simultaneous in the dub and
+  names any line whose crosstalk has no counterpart from the other character.
+
+The limit worth knowing: recovering the words of the quieter voice inside a mixture is a
+word-timing assignment over one decode, not source separation. Ambiguous words at a
+boundary can land on the wrong character, and a line written for 0.6 s of a crosstalk is
+short by design — the film was unintelligible there too.
+
 ### Speech synthesis (`tts.py`)
 
 **Trimming is ours, not the engine's.** OmniVoice's output cleaning removes silence below
@@ -1101,14 +1141,21 @@ Three things happen in order, and only ever as far as needed:
    * **A character never hands over to themselves.** Their turns do not overlap in the
      source, and the same voice laid over itself is not heard as an interruption but as
      a stutter - the ear has nothing to separate the two copies with. So one speaker's
-     speech is never left sounding under their own next line. Between *different*
-     speakers up to `TIMING_MAX_OVERLAP_SECONDS` (default `0.45s`) is allowed, because a
-     small hand-over is what an interruption sounds like.
-   * **An overlap the film had is the overlap the dub keeps.** Two performances the
-     source itself put together are a line and its interruption, so separating them would
-     change the scene rather than repair it. Such a pair keeps its source overlap (still
-     capped at `TIMING_MAX_OVERLAP_SECONDS` for intelligibility) and skips
-     `TIMING_MIN_LINE_GAP`, since there was no silence there to respect. The cascade
+     speech is never left sounding under their own next line. The constraint is against
+     *that speaker's* own last line rather than against whichever line happens to sit
+     immediately before this one, so a second character speaking in between cannot hide
+     an unfinished sentence. Between *different* speakers up to
+     `TIMING_MAX_OVERLAP_SECONDS` (default `0.45s`) is allowed, because a small hand-over
+     is what an interruption sounds like.
+   * **An overlap the film had is the overlap the dub keeps - exactly.** Two performances
+     the source itself put together are a line and its interruption, and both actors were
+     in the room at that instant. Such a pair is not moved by each other at all: not by
+     the hand-over allowance, not by `TIMING_MIN_LINE_GAP`, and not by a cap on the
+     overlap. Capping it (the old rule) is what turned an argument into two monologues:
+     the earlier line was pushed to finish before the interruption and *also* sped up to
+     get there. The earlier line may now run so long that it covers the later one; that
+     is its own overrun, measured and reported against that line, rather than paid for
+     by moving somebody else's performance out of sync with the picture. The cascade
      exists to absorb overruns the *translation* introduced, not to re-time the film.
 
    On the run that prompted this, all 14 remaining speech overlaps were one character
@@ -1338,7 +1385,7 @@ What it reports, and why each figure is there:
   performer could deliver, however well it "fits".
 * **Crosstalk, and the attribution it casts doubt on.** Simultaneous speech is what
   the exclusive diarization cannot describe, so it is reported as a known
-  uncertainty - and now the *lines* it affects are named too
+  uncertainty - and the *lines* it affects are named too
   (`qc.attribution_uncertain`). Attribution is temporal: each diarized turn is
   transcribed on its own and everything it contains is credited to that turn's
   speaker. Clean turns of at least 1.5 seconds are also checked against Community-1's
@@ -1349,6 +1396,15 @@ What it reports, and why each figure is there:
   remain the first place to listen when a character sounds like the wrong one. The
   pipeline never infers a speaker from a character's *name*, so a character saying
   another character's name cannot affect who is credited.
+* **Whether the overlap survived into the dub** (`qc.overlap`). Two numbers, because
+  there are two ways to lose it: how many pairs of lines the film played *at the same
+  time* are still simultaneous after placement (`preserved_pairs` of `source_pairs`,
+  with the seconds of two voices at once), and how many lines sit in a crosstalk region
+  with no counterpart from the other character (`unpaired`). The first catches a
+  timeline that serialized an exchange; the second catches content that was never
+  recovered. On the shipped test clip the delivered run scored `0` source pairs and
+  named 5 unpaired lines - which is exactly the defect described under
+  [Simultaneous speech](#simultaneous-speech-diarizationpy-transcriptionpy).
 * **Pronunciation, when a transcriber is supplied.** A round trip through an
   Amharic ASR model gives a character error rate against the text that was
   synthesized - the only automated check that the dub is *intelligible*, and the
