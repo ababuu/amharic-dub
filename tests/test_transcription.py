@@ -1326,3 +1326,117 @@ def test_a_confident_recovered_line_is_still_kept(monkeypatch, tmp_path):
     )
 
     assert [segment.speaker_id for segment in segments] == ["SPEAKER_00", "SPEAKER_01"]
+
+
+# ---------------------------------------------------------------------------
+# Who is actually audible in the recycled crosstalk audio
+# ---------------------------------------------------------------------------
+
+
+def _tone(seconds: float, hz: float, rate: int = transcription.SAMPLE_RATE):
+    """Return a voiced, harmonic signal at ``hz`` - something the tracker can measure."""
+
+    time = np.arange(int(round(seconds * rate))) / rate
+    signal = np.sin(2 * np.pi * hz * time)
+    signal += 0.5 * np.sin(2 * np.pi * 2 * hz * time)
+    return (0.3 * signal).astype(np.float32)
+
+
+def test_a_mixture_that_sounds_like_the_other_speaker_is_not_recovered(
+    monkeypatch, tmp_path
+):
+    """The defect this gate exists for.
+
+    A crosstalk is decoded, and Whisper returns whichever voice dominates it. Handing
+    that text to the *other* character is heard as one character saying the other's
+    line in the wrong voice. On the real clip three such lines were produced - "Oh,
+    yeah.", "The police." and "RUN!" - and every one measured as the character who was
+    already talking.
+    """
+
+    _patch(monkeypatch)
+    # The decoded audio measures 220 Hz: the kept speaker's register, not the 110 Hz
+    # speaker the line would be credited to.
+    monkeypatch.setattr(
+        transcription,
+        "decode_audio",
+        lambda path, sampling_rate=transcription.SAMPLE_RATE: _tone(120.0, 220.0),
+    )
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [FakeSegment(0.0, 0.4, "Oh, yeah.", words=[FakeWord(0.05, 0.35, " Oh, yeah.")])],
+    ]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path),
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_01", 12.2, 12.9),
+        ],
+        # SPEAKER_00 is the 200 Hz voice; the audio here is 110 Hz, i.e. the other one.
+        registers={"SPEAKER_00": 200.0, "SPEAKER_01": 110.0},
+    )
+
+    assert [segment.speaker_id for segment in segments] == ["SPEAKER_00"]
+
+
+def test_a_mixture_that_sounds_like_the_missing_speaker_is_recovered(
+    monkeypatch, tmp_path
+):
+    """The gate must not disable recovery - only the parts it cannot attribute."""
+
+    _patch(monkeypatch)
+    monkeypatch.setattr(
+        transcription,
+        "decode_audio",
+        lambda path, sampling_rate=transcription.SAMPLE_RATE: _tone(120.0, 110.0),
+    )
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [
+            FakeSegment(
+                0.0, 0.6, "thank you", words=[FakeWord(0.05, 0.55, " thank you")]
+            )
+        ],
+    ]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path),
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_01", 12.2, 12.9),
+        ],
+        registers={"SPEAKER_00": 200.0, "SPEAKER_01": 110.0},
+    )
+
+    assert [segment.speaker_id for segment in segments] == ["SPEAKER_00", "SPEAKER_01"]
+
+
+def test_an_unmeasurable_recovered_stretch_is_refused(monkeypatch, tmp_path):
+    """No pitched speech means no evidence, and a guess is not evidence."""
+
+    _patch(monkeypatch)
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [FakeSegment(0.0, 0.6, "noise", words=[FakeWord(0.05, 0.55, " noise")])],
+    ]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path),
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_01", 12.2, 12.9),
+        ],
+        registers={"SPEAKER_00": 200.0, "SPEAKER_01": 110.0},
+    )
+
+    assert [segment.speaker_id for segment in segments] == ["SPEAKER_00"]

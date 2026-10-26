@@ -61,13 +61,14 @@ import difflib
 import io
 import math
 import threading
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from app.config import Settings, get_settings
 from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
+from app.pipeline.prosody import ProsodyError, estimate_f0
 
 try:  # Heavy runtime dependency. Guarded so that this module stays importable
     # (and testable) where the CUDA/PyTorch stack is not installed.
@@ -124,6 +125,12 @@ MIN_RECOVERED_WORD_SECONDS = 0.02
 MIN_RECOVERED_AVG_LOGPROB = -1.0
 MAX_RECOVERED_NO_SPEECH = 0.6
 MAX_RECOVERED_COMPRESSION = 2.4
+
+#: How much pitched speech a recovered stretch needs before its register can be used to
+#: check *who* is speaking in it. The same floor the register stage uses for a turn:
+#: below it autocorrelation reports the room rather than the speaker, and the check
+#: would be a coin flip. A stretch that cannot be checked is not recovered.
+MIN_RECOVERED_VOICED_FRAMES = 8
 
 
 class TranscriptionError(RuntimeError):
@@ -724,6 +731,63 @@ def _duplicates(candidate: str, existing: Iterable[str]) -> bool:
     return False
 
 
+def _register_of(
+    registers: Mapping[str, float] | None, speaker_id: str
+) -> float | None:
+    """Return a speaker's median pitch in Hz, when it is known."""
+
+    if not registers:
+        return None
+    value = registers.get(speaker_id)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        median = float(value)
+        if math.isfinite(median) and median > 0:
+            return median
+    return None
+
+
+def _sounds_like(
+    samples: Any,
+    rate: int,
+    *,
+    speaker_id: str,
+    other_id: str,
+    registers: Mapping[str, float] | None,
+) -> bool:
+    """Return whether this audio measures as ``speaker_id`` rather than ``other_id``.
+
+    This is the check that stops a recovered line from being voiced by the character
+    who was not talking. Whisper decodes a mixture to whichever voice dominates it, so
+    a re-decode of the overlap usually returns the *kept* speaker's words - and handing
+    those to the other character is heard as one character saying the other's line in
+    the wrong voice, which is the defect this whole pass exists to avoid.
+
+    Decisive means: enough pitched speech to measure, and the measurement falls nearer
+    the missing speaker's own register than the kept speaker's. Anything less - too
+    little voice, or a reading that sits between the two - is *not* evidence, and a
+    line is not created from it. Leaving an unintelligible interjection out is a smaller
+    defect than putting words in the wrong character's mouth, and the quality report
+    names the region either way.
+    """
+
+    wanted = _register_of(registers, speaker_id)
+    avoided = _register_of(registers, other_id)
+    if wanted is None or avoided is None or wanted == avoided:
+        # Without two known registers there is nothing to compare against, so the
+        # acoustic gate cannot add anything and the structural checks stand alone.
+        return True
+
+    try:
+        profile = estimate_f0(samples, rate)
+    except ProsodyError:
+        return False
+    if profile.median_hz is None or profile.voiced_frames < MIN_RECOVERED_VOICED_FRAMES:
+        return False
+
+    measured = float(profile.median_hz)
+    return abs(measured - wanted) < abs(measured - avoided)
+
+
 def _recover_dropped_speakers(
     model: Any,
     audio: Any,
@@ -732,27 +796,35 @@ def _recover_dropped_speakers(
     overlap_turns: Sequence[SpeakerSegment],
     language: str | None,
     transcribed: Sequence[TranscriptSegment],
+    registers: Mapping[str, float] | None = None,
 ) -> list[TranscriptSegment]:
     """Return lines for speakers the exclusive view dropped inside crosstalk.
 
     The exclusive diarization gives every instant to exactly one speaker, so when
-    two people talk at once one of them loses the turn entirely - and with it
-    everything they said. Downstream that is heard as a scene where only one
-    character ever speaks, which is precisely the defect this function removes.
+    two people talk at once one of them loses the turn - and with it everything they
+    said. Downstream that is heard as a scene where only one character ever speaks.
 
-    Only the *missing* speaker is recovered. The speaker the exclusive view kept
-    already has text that came from a clean, single-voice decode of their own turn,
-    and re-deriving it here would risk replacing good text with a mixture's. The
-    recovered stretch is decoded once, with word timings, and each word is given to
-    the speaker diarization recorded as active through it - so both characters come
-    out of one decode rather than two guesses.
+    Recovering it is only worth doing when the recovered words can be *attributed*.
+    A mixture is decoded once, and Whisper returns whichever voice dominates it, so
+    the naive version of this - re-decode the overlap, hand the text to the missing
+    speaker - put the kept speaker's own words into the other character's mouth, in the
+    other character's voice. That is worse than the silence it replaces, so a recovery
+    has to clear three gates:
 
-    A recovered line is dropped when it restates what the other speaker already has
-    in the region: a mixture transcribed twice tends to reproduce the dominant
-    voice, and two characters saying one line is a worse defect than one of them
-    saying nothing. A region the exclusive view did not fill at all is skipped
-    entirely - with no authoritative text there is nothing to check a recovery
-    against, and inventing dialogue is not a repair.
+    1. **Exclusive time.** The missing speaker must have been active inside the region
+       for at least :data:`MIN_RECOVERED_OVERLAP_SECONDS` beyond what their own turns
+       already cover. A region where they had nothing of their own has nothing to
+       recover.
+    2. **The audio belongs to them.** The decoded stretch must measure nearer the
+       missing speaker's register than the kept speaker's, with enough pitched speech
+       for the comparison to mean something. A fragment too short to measure is not
+       evidence, so it is refused rather than guessed at.
+    3. **It is not what the other speaker already said.** A mixture transcribed twice
+       tends to reproduce the dominant voice, and two characters saying one line is
+       also wrong.
+
+    A region the exclusive view did not fill at all is skipped entirely: with no
+    authoritative text there is nothing to check a recovery against.
     """
 
     if not overlap_turns:
@@ -789,9 +861,13 @@ def _recover_dropped_speakers(
             speaker_id: _speaker_spans(speaker_id, region, overlap_turns)
             for speaker_id in region.speaker_ids
         }
-        # What is left of the missing speakers' own activity after removing the
-        # part their own exclusive turns already cover - a speaker can be missing
-        # from one stretch of a crosstalk and present in another.
+        # Gate 1: the missing speaker's own activity, minus the part their *own*
+        # exclusive turns already cover - a speaker can be missing from one stretch of a
+        # crosstalk and present in another. The kept speaker's turn is deliberately not
+        # subtracted: the exclusive view gives them the whole instant by construction, so
+        # subtracting it would leave nothing at every genuine overlap and recovery could
+        # never happen. Whether the decoded audio is really the missing speaker's is
+        # decided by the acoustic gate below instead.
         already_theirs = [
             clipped
             for turn in regions
@@ -806,29 +882,30 @@ def _recover_dropped_speakers(
         if not uncovered:
             continue
 
-        window = SpeakerSegment(
-            speaker_id=missing[0],
-            start=min(start for start, _end in uncovered),
-            end=max(end for _start, end in uncovered),
-        )
-        if window.end - window.start < MIN_REGION_SECONDS:
-            continue
-
-        samples = _region_samples(audio, window)
-        if len(samples) == 0:
-            continue
-        words = _timed_words(_decode(model, samples, window, language), window)
-        if not words:
-            continue
-        assignment = _assign_words(
-            words, {speaker_id: spans[speaker_id] for speaker_id in missing}
-        )
-        # Compared against this region only. The same short interjection is a normal
-        # thing for one character to say twice in a film, so a line recovered in one
-        # crosstalk must not veto an identical one recovered in another.
         region_text = [segment.text for segment in inside]
-        for speaker_id in missing:
-            for segment in _words_to_segments(speaker_id, assignment.get(speaker_id, [])):
+        for start, end in uncovered:
+            if end - start < MIN_RECOVERED_OVERLAP_SECONDS:
+                continue
+            window = SpeakerSegment(
+                speaker_id=missing[0], start=start, end=end
+            )
+            samples = _region_samples(audio, window)
+            if len(samples) == 0:
+                continue
+            if not _sounds_like(
+                samples,
+                SAMPLE_RATE,
+                speaker_id=missing[0],
+                other_id=sorted(present)[0],
+                registers=registers,
+            ):
+                continue
+            words = _timed_words(_decode(model, samples, window, language), window)
+            if not words:
+                continue
+            # Every word in this stretch was spoken while nobody else was, so it is
+            # the missing speaker's by construction - no timing contest is needed.
+            for segment in _words_to_segments(missing[0], words):
                 if _duplicates(segment.text, region_text):
                     continue
                 recovered.append(segment)
@@ -911,6 +988,7 @@ def transcribe(
     settings: Settings | None = None,
     crosstalk: Iterable[CrosstalkRegion] = (),
     overlap_turns: Iterable[SpeakerSegment] = (),
+    registers: Mapping[str, float] | None = None,
 ) -> list[TranscriptSegment]:
     """Transcribe the speech of each diarized region of ``audio_path``.
 
@@ -940,6 +1018,13 @@ def transcribe(
         one mixture apart. Without them nothing can be recovered, so a result that
         carries no overlap-aware annotation simply never recovers anything - it is
         not an error.
+    registers:
+        Each speaker's median pitch in Hz, when it has been measured. Recovery uses it
+        to check that the audio it is about to credit to one character actually sounds
+        like that character: a mixture decoded once returns whichever voice dominates
+        it, and attributing that to the other speaker is heard as one character saying
+        the other's line. Without registers the check cannot run, and the structural
+        checks stand alone.
 
     Returns
     -------
@@ -1001,6 +1086,7 @@ def transcribe(
         _validate_overlap_turns(overlap_turns),
         language,
         transcribed,
+        registers,
     )
     if recovered:
         transcribed.extend(recovered)

@@ -195,6 +195,7 @@ class Stages:
         self.order: list[str] = []
         self.seen_crosstalk: object = ()
         self.seen_overlap_turns: object = ()
+        self.seen_registers_before_transcription: object = None
         self.track = root / "stages" / "movie_mix.wav"
 
     def _record(self, name: str, *args: object) -> None:
@@ -239,9 +240,11 @@ class Stages:
         settings: Settings,
         crosstalk: object = (),
         overlap_turns: object = (),
+        registers: object = None,
     ) -> list[TranscriptSegment]:
         self._record("transcription", speech, turns, settings)
         self.seen_overlap_turns = overlap_turns
+        self.seen_registers_before_transcription = registers
         return list(self.lines)
 
     def adapt_dialogue(
@@ -524,6 +527,47 @@ def test_the_diarizations_crosstalk_reaches_the_voice_profiles(
     run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
 
     assert list(fake.seen_crosstalk) == [region]
+
+
+def test_registers_are_measured_before_the_transcript_is_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The crosstalk gate needs each character's pitch before any text exists.
+
+    A mixture has to be decoded to be heard at all, and the decode returns whichever
+    voice dominates it - so a recovered line can only be trusted if it measures as the
+    character it is about to be credited to. That means the register has to be known
+    *before* the transcript stage runs, not afterwards where it is used to repair
+    attribution.
+    """
+
+    fake = Stages(tmp_path)
+    _wire(monkeypatch, fake)
+    measured = {SPEAKER: 118.0, "SPEAKER_01": 205.0}
+    monkeypatch.setattr(
+        orchestrator.register,
+        "measure_registers",
+        lambda spans, audio: dict(measured),
+    )
+
+    run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    assert fake.seen_registers_before_transcription == measured
+
+
+def test_a_stem_that_cannot_be_measured_still_yields_its_dialogue(
+    stages: Stages, tmp_path: Path
+) -> None:
+    """An unmeasurable stem must not cost the run its dialogue.
+
+    The measurement is evidence, not a prerequisite: without it the recovery falls back
+    to its structural checks, and the run continues with the text it already has.
+    """
+
+    result = run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    assert stages.seen_registers_before_transcription == {}
+    assert result.synthesized_lines == len(stages.dialogue)
 
 
 def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:

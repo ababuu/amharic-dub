@@ -402,3 +402,52 @@ def test_pitch_does_not_overturn_a_label_the_embeddings_confirmed(tmp_path) -> N
     assert [correction.start for correction in report.corrections] == [
         pytest.approx(6.8)
     ]
+
+
+def test_registers_are_measured_before_any_transcript_exists(tmp_path) -> None:
+    """The transcript stage needs them to tell who is audible in a mixture.
+
+    A crosstalk can only be heard by decoding a mixture, and the decode returns
+    whichever voice dominates it - so the check has to be available *before* the
+    transcript exists, which is why it is measured from the diarized turns.
+    """
+
+    turns = [
+        ("SPEAKER_00", 0.0, 1.8, 120.0),
+        ("SPEAKER_00", 1.9, 3.7, 118.0),
+        ("SPEAKER_00", 3.8, 5.6, 122.0),
+        ("SPEAKER_01", 5.7, 7.5, 205.0),
+        ("SPEAKER_01", 7.6, 9.4, 210.0),
+        ("SPEAKER_01", 9.5, 11.3, 208.0),
+    ]
+    stem = tmp_path / "speech.wav"
+    _dialogue(stem, turns)
+
+    from app.pipeline.diarization import SpeakerSegment
+
+    measured = register.measure_registers(
+        [SpeakerSegment(s, a, b) for s, a, b, _hz in turns], stem
+    )
+
+    assert measured["SPEAKER_00"] == pytest.approx(120.0, abs=12.0)
+    assert measured["SPEAKER_01"] == pytest.approx(208.0, abs=15.0)
+
+
+def test_a_short_turn_does_not_define_a_register(tmp_path) -> None:
+    """Same floor as the repair pass: a fragment is not a measurement."""
+
+    turns = [
+        ("SPEAKER_00", 0.0, 1.8, 120.0),
+        ("SPEAKER_00", 1.9, 3.7, 118.0),
+        ("SPEAKER_01", 3.8, 4.1, 260.0),
+    ]
+    stem = tmp_path / "speech.wav"
+    _dialogue(stem, turns)
+
+    from app.pipeline.diarization import SpeakerSegment
+
+    measured = register.measure_registers(
+        [SpeakerSegment(s, a, b) for s, a, b, _hz in turns], stem
+    )
+
+    assert "SPEAKER_01" not in measured

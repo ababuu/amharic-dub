@@ -41,6 +41,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 import soundfile as sf
@@ -320,6 +321,76 @@ def measure_turn_pitch(
                 voiced_frames=profile.voiced_frames,
                 speech_seconds=max(0.0, segment.end - segment.start),
             )
+        )
+    return measured
+
+
+class _Spanned(Protocol):
+    """Anything the pitch measurement needs: who, and when."""
+
+    speaker_id: str
+    start: float
+    end: float
+
+
+def measure_registers(
+    spans: Iterable[_Spanned],
+    audio: str | Path,
+    *,
+    minimum_turn_seconds: float = MIN_REASSIGNMENT_TURN_SECONDS,
+) -> dict[str, float]:
+    """Return each speaker's median pitch in Hz, measured before any transcript exists.
+
+    The transcript stage needs this to tell *who* is talking inside a mixture - a
+    crosstalk has to be decoded to be heard at all, and the decode returns whichever
+    voice dominates it, so a recovered line is only trustworthy if the audio it came
+    from measures as the character it is about to be attributed to. Waiting for the
+    register stage is not possible: that stage needs the transcript this one produces.
+
+    Only turns long enough for their own pitch to mean something are used, which is the
+    same floor the repair pass applies. Unmeasurable speakers simply do not appear in
+    the result, and recovery then falls back to its structural checks alone.
+
+    Parameters
+    ----------
+    spans:
+        Diarized turns: anything carrying ``speaker_id``, ``start`` and ``end``.
+    audio:
+        The dialogue stem the turns were diarized from.
+    """
+
+    ordered = sorted(
+        (turn for turn in spans if getattr(turn, "speaker_id", None)),
+        key=lambda turn: (turn.start, turn.end),
+    )
+    if not ordered:
+        return {}
+
+    samples, rate = _read_speech(audio)
+    pitches = measure_turn_pitch(ordered, samples, rate)  # type: ignore[arg-type]
+    registers = aggregate_registers(
+        [
+            TranscriptSegment(turn.speaker_id, turn.start, turn.end, "-")
+            for turn in ordered
+        ],
+        pitches,
+    )
+
+    by_speaker: dict[str, list[float]] = {}
+    for turn, pitch in zip(ordered, pitches):
+        if not pitch.usable or pitch.median_hz is None:
+            continue
+        if pitch.end - pitch.start < minimum_turn_seconds:
+            continue
+        by_speaker.setdefault(turn.speaker_id, []).append(pitch.median_hz)
+
+    measured: dict[str, float] = {}
+    for speaker_id, values in by_speaker.items():
+        register = registers.get(speaker_id)
+        measured[speaker_id] = (
+            float(register.median_hz)
+            if register is not None and register.median_hz is not None
+            else float(np.median(values))
         )
     return measured
 
@@ -798,6 +869,7 @@ __all__ = [
     "aggregate_registers",
     "contiguous_turns",
     "disagreement",
+    "measure_registers",
     "measure_turn_pitch",
     "presentation_of",
     "register_spread",

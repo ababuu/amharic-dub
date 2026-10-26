@@ -590,6 +590,28 @@ def run_pipeline(
             f"{diarized.crosstalk_seconds:.2f}s of simultaneous speech"
         )
 
+    # Which voice belongs to which cluster, measured before any text exists. Needs the
+    # stem and nothing else, so it is available to the transcription stage - which must
+    # check that a recovered crosstalk line actually sounds like the character it is
+    # about to be credited to. Never fatal: without it the structural checks still run.
+    speaker_registers: dict[str, float] = {}
+    try:
+        speaker_registers = register.measure_registers(turns, stems.speech)
+    except register.RegisterError as exc:
+        report(
+            f"  register: unmeasured before transcription ({exc}); crosstalk "
+            "recovery will rely on timing alone"
+        )
+    else:
+        if speaker_registers:
+            report(
+                "  registers: "
+                + ", ".join(
+                    f"{speaker_id} {median:.0f} Hz"
+                    for speaker_id, median in sorted(speaker_registers.items())
+                )
+            )
+
     lines = tuple(
         _stage(
             "transcription",
@@ -604,6 +626,12 @@ def run_pipeline(
             # transcribed as one character talking and the dub follows it.
             crosstalk=crosstalk,
             overlap_turns=diarized.overlap_turns,
+            # Which voice is which, measured from the diarized turns before any text
+            # exists. A crosstalk can only be heard by decoding a mixture, and the
+            # decode returns whichever voice dominates it - so a recovered line has to
+            # be checked against the register of the character it is about to be given
+            # to, or the other character ends up saying it in the wrong voice.
+            registers=speaker_registers,
         )
     )
     if not lines:
