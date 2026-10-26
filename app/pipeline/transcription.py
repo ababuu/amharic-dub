@@ -140,6 +140,30 @@ MAX_RECOVERED_COMPRESSION = 2.4
 #: would be a coin flip. A stretch that cannot be checked is not recovered.
 MIN_RECOVERED_VOICED_FRAMES = 8
 
+#: Fewest seconds one spoken word can occupy, on average. This is the one check that
+#: catches text nobody could have said: the reference run produced a 0.08-second
+#: segment carrying "Thank you." at the first overlap, and four words in 0.40 s from
+#: a separated track. Both became lines - and, worse, the first one was glued to the
+#: next sentence by :func:`assemble_sentences`, so the dub opened an argument with a
+#: word that was never spoken. 0.11 s is faster than any real delivery (a brisk
+#: speaker lands around 0.18 s) but loose enough that a clipped single word survives.
+MIN_SECONDS_PER_WORD = 0.11
+
+#: The rate above is only meaningful for a line of at least this many words: one
+#: short word ("No.", "RUN!") is a real line, while two words in 80 ms cannot be.
+MIN_WORDS_FOR_RATE_CHECK = 2
+
+#: How far *after* a crosstalk region a kept line is still considered a continuation
+#: of what a recovered fragment says. A speaker whose sentence is cut by the overlap
+#: boundary has the first words inside the region and the rest just outside it, so a
+#: fragment that repeats the start of that line is the same speech, not new speech.
+RECOVERED_CONTINUATION_SECONDS = 2.0
+
+#: How many leading words must match before a recovered fragment counts as the start
+#: of a nearby line. "I don't want it." and "I don't want to hear about the police."
+#: share their first three words; a coincidental match that long is not plausible.
+RECOVERED_CONTINUATION_WORDS = 3
+
 
 class TranscriptionError(RuntimeError):
     """Base class for every error raised by this module."""
@@ -476,14 +500,40 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return min(max(value, lower), upper)
 
 
+def _plausible_line(text: str, start: float, end: float) -> bool:
+    """Return whether ``text`` could physically have been spoken in ``start``..``end``.
+
+    Word timings on a sliver of audio are compressed by the decoder, so a segment
+    can claim several words in a few hundredths of a second. Nothing was said at
+    that rate, and crediting it to a character puts invented words in their mouth.
+    """
+
+    words = len(text.split())
+    if words < MIN_WORDS_FOR_RATE_CHECK:
+        return True
+    return (end - start) / words >= MIN_SECONDS_PER_WORD
+
+
 def _convert(
     raw_segments: Iterable[Any],
     region: SpeakerSegment,
+    *,
+    plausible_only: bool = False,
 ) -> list[TranscriptSegment]:
-    """Turn Whisper's region-local segments into absolute transcript segments."""
+    """Turn Whisper's region-local segments into absolute transcript segments.
+
+    ``plausible_only`` applies Whisper's own non-speech / confidence / repetition
+    heuristics. It is used for decodes of an isolated per-speaker track, where the
+    input is a fraction of a second of separated audio and an invented word costs a
+    character a line they never said. Ordinary turns do not use it: a quiet line in
+    the film is still a line.
+    """
 
     produced: list[TranscriptSegment] = []
     for raw in raw_segments:
+        if plausible_only and not _plausible_speech(raw):
+            continue
+
         text = raw.text if isinstance(raw.text, str) else ""
         text = text.strip()
         if not text:
@@ -498,6 +548,8 @@ def _convert(
         absolute_end = _clamp(region.start + local_end, region.start, region.end)
         if absolute_end <= absolute_start:
             continue  # degenerate turn, nothing usable to keep
+        if not _plausible_line(text, absolute_start, absolute_end):
+            continue
 
         produced.append(
             TranscriptSegment(
@@ -738,7 +790,7 @@ def _run_to_segment(
         return None
     start = min(entry[1] for entry in run)
     end = max(entry[2] for entry in run)
-    if end <= start:
+    if end <= start or not _plausible_line(text, start, end):
         return None
     try:
         return TranscriptSegment(speaker_id=speaker_id, start=start, end=end, text=text)
@@ -753,8 +805,26 @@ def _normalise_for_comparison(text: str) -> str:
     return " ".join(letters.lower().split())
 
 
+def _shares_opening(candidate: str, other: str) -> bool:
+    """Return whether two lines begin with the same
+    :data:`RECOVERED_CONTINUATION_WORDS` words.
+
+    A sentence cut in half by an overlap boundary leaves the first words in the
+    separated track and the rest in the kept line. The fragment is then the *start*
+    of that line - the same speech heard twice - not a second statement.
+    """
+
+    left = _normalise_for_comparison(candidate).split()
+    right = _normalise_for_comparison(other).split()
+    if len(left) < RECOVERED_CONTINUATION_WORDS:
+        return False
+    if len(right) < RECOVERED_CONTINUATION_WORDS:
+        return False
+    return left[:RECOVERED_CONTINUATION_WORDS] == right[:RECOVERED_CONTINUATION_WORDS]
+
+
 def _duplicates(candidate: str, existing: Iterable[str]) -> bool:
-    """Return whether ``candidate`` restates text already credited in the region."""
+    """Return whether ``candidate`` restates text already credited nearby."""
 
     normalised = _normalise_for_comparison(candidate)
     if not normalised:
@@ -769,7 +839,12 @@ def _duplicates(candidate: str, existing: Iterable[str]) -> bool:
         # One line wholly inside the other is the same speech, not new speech.
         if normalised in other or other in normalised:
             return True
-        if difflib.SequenceMatcher(None, normalised, other).ratio() >= RECOVERED_DUPLICATE_RATIO:
+        if _shares_opening(candidate, text):
+            return True
+        if (
+            difflib.SequenceMatcher(None, normalised, other).ratio()
+            >= RECOVERED_DUPLICATE_RATIO
+        ):
             return True
     return False
 
@@ -983,11 +1058,20 @@ def _recover_dropped_speakers(
             if extraction is not None
             else None
         )
+        # What the region already says, plus what starts immediately after it: a
+        # sentence cut by the overlap boundary has its remainder just outside the
+        # region, and a recovered fragment that repeats that line's opening is the
+        # same speech rather than a competing one.
         region_text = [
             segment.text
             for segment in transcribed
             if _overlap_seconds(segment.start, segment.end, region.start, region.end)
             > 0.0
+            or (
+                0.0
+                <= segment.start - region.end
+                <= RECOVERED_CONTINUATION_SECONDS
+            )
         ]
         for start, end in uncovered:
             if end - start < MIN_RECOVERED_OVERLAP_SECONDS:
@@ -1028,12 +1112,20 @@ def _recover_dropped_speakers(
                     f"{present[0]}"
                 )
                 continue
-            words = _timed_words(_decode(model, samples, window, language), window)
-            if not words:
-                continue
+            raw = _decode(model, samples, window, language)
+            if track is not None:
+                # One voice in the track, so Whisper's own segment span is the
+                # honest timing; its word timings on a fraction of a second are
+                # compressed and would put several words in a few hundredths.
+                candidates = _convert(raw, window, plausible_only=True)
+            else:
+                words = _timed_words(raw, window)
+                if not words:
+                    continue
+                candidates = _words_to_segments(missing[0], words)
             # Every word in this stretch was spoken while nobody else was, so it is
             # the missing speaker's by construction - no timing contest is needed.
-            for segment in _words_to_segments(missing[0], words):
+            for segment in candidates:
                 if _duplicates(segment.text, region_text):
                     continue
                 recovered.append(segment)

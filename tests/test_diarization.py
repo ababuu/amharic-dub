@@ -1,4 +1,4 @@
-"""Tests for :mod:`app.pipeline.diarization`.
+﻿"""Tests for :mod:`app.pipeline.diarization`.
 
 ``pyannote.audio`` is never imported or executed here: the pyannote pipeline and
 the ``torch.device`` factory it is moved with are both replaced by in-memory
@@ -754,7 +754,9 @@ def test_confident_clean_turns_are_reassigned_but_short_and_overlapping_turns_ar
     FakePipeline.embedding = lambda _waveform: [[0.1, 1.0]]
     FakePipeline.result = FakeDiarizeOutput(
         speaker_diarization=FakeAnnotation(
-            [(0.0, 2.0, "SPEAKER_00"), (2.0, 5.0, "SPEAKER_00"), (4.0, 4.5, "SPEAKER_01")]
+            # The last turn is 80% simultaneous speech, so it describes two people
+            # and must not be verified; the 0.2 s turn is too short to describe one.
+            [(0.0, 2.0, "SPEAKER_00"), (2.0, 5.0, "SPEAKER_00"), (3.0, 4.6, "SPEAKER_01")]
         ),
         exclusive_speaker_diarization=FakeAnnotation(
             [
@@ -785,6 +787,49 @@ def test_confident_clean_turns_are_reassigned_but_short_and_overlapping_turns_ar
         1.0 / (1.01**0.5) - 0.1 / (1.01**0.5)
     )
     assert FakePipeline.audio.crops == [(0.0, 2.0)]
+
+
+def test_a_short_turn_with_a_little_crosstalk_is_still_verified(monkeypatch, tmp_path):
+    """A 0.7 s line with a 0.14 s interjection in it is still one voice.
+
+    Skipping it (the old rule) left two real lines voiced by the wrong character:
+    their turns were 0.70-0.72 s, so no check ever ran, and pitch alone is an octave
+    out on audio that short.
+    """
+
+    _patch(monkeypatch)
+
+    class FakeWaveform:
+        def unsqueeze(self, _dimension):
+            return self
+
+    class FakeAudio:
+        def __init__(self):
+            self.crops = []
+
+        def crop(self, _audio_file, segment, *, mode):
+            self.crops.append((segment.start, segment.end))
+            return FakeWaveform(), 16000
+
+    FakePipeline.audio = FakeAudio()
+    FakePipeline.embedding = lambda _waveform: [[0.1, 1.0]]
+    FakePipeline.result = FakeDiarizeOutput(
+        speaker_diarization=FakeAnnotation(
+            [(0.0, 0.7, "SPEAKER_00"), (0.5, 0.64, "SPEAKER_01")]
+        ),
+        exclusive_speaker_diarization=FakeAnnotation([(0.0, 0.7, "SPEAKER_00")]),
+        speaker_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    core_module = types.ModuleType("pyannote.core")
+    core_module.Segment = FakeTurn
+    monkeypatch.setitem(sys.modules, "pyannote.core", core_module)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    # 0.14 s of the 0.70 s turn is crosstalk (20%), so the embedding can describe it.
+    assert FakePipeline.audio.crops == [(0.0, 0.7)]
+    assert result.turns == (SpeakerSegment("SPEAKER_01", 0.0, 0.7),)
+    assert len(result.corrections) == 1
 
 
 def test_diarize_returns_only_the_turns(monkeypatch, tmp_path):
@@ -986,3 +1031,39 @@ def test_a_confirmed_turn_is_reported_separately_from_a_correction(
 
     assert result.corrections == ()
     assert result.verified == ()
+
+
+def test_a_corrected_turn_is_published_as_verified(monkeypatch, tmp_path):
+    """A label settled by embeddings must not be reopened by pitch afterwards."""
+
+    _patch(monkeypatch)
+
+    class FakeWaveform:
+        def unsqueeze(self, _dimension):
+            return self
+
+    class FakeAudio:
+        def crop(self, _audio_file, segment, *, mode):
+            return FakeWaveform(), 16000
+
+    FakePipeline.audio = FakeAudio()
+    FakePipeline.embedding = lambda _waveform: [[0.1, 1.0]]
+    FakePipeline.result = FakeDiarizeOutput(
+        # Two labels, so the result publishes two speaker prototypes. The turns are
+        # sequential, so there is no crosstalk to exclude the turn from verification.
+        speaker_diarization=FakeAnnotation(
+            [(0.0, 0.4, "SPEAKER_00"), (0.4, 0.7, "SPEAKER_01")]
+        ),
+        exclusive_speaker_diarization=FakeAnnotation([(0.0, 0.7, "SPEAKER_00")]),
+        speaker_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    core_module = types.ModuleType("pyannote.core")
+    core_module.Segment = FakeTurn
+    monkeypatch.setitem(sys.modules, "pyannote.core", core_module)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.turns == (SpeakerSegment("SPEAKER_01", 0.0, 0.7),)
+    assert len(result.corrections) == 1
+    assert result.verified == (SpeakerSegment("SPEAKER_01", 0.0, 0.7),)
+

@@ -10,9 +10,11 @@ Two views of the same pyannote result are used for different purposes:
 
 * the **exclusive** annotation provides the starting attribution - it carries no
   overlapping turns, so every instant of speech belongs to exactly one speaker and
-  a transcribed line can never be attributed to two people. Clean, sufficiently
-  long turns are then checked against Community-1's speaker embeddings, and only a
-  strong disagreement can change the label.
+  a transcribed line can never be attributed to two people. Turns with enough clean
+  audio to describe one voice (at least 0.6 s, at most 30% covered by crosstalk) are
+  then checked against Community-1's speaker embeddings, and only a strong
+  disagreement can change the label. Checking the short ones matters: a 0.7 s line is
+  exactly where a pitch measurement fails and an embedding still works.
 * the **overlapping** annotation is used twice, and never to relabel a turn. It
   *flags* crosstalk, because the exclusive view necessarily hides one of the two
   speakers when they talk at once. And its turns are returned as
@@ -85,10 +87,41 @@ _EXCLUSIVE_ANNOTATION_ATTRIBUTE = "exclusive_speaker_diarization"
 _OVERLAPPING_ANNOTATION_ATTRIBUTE = "speaker_diarization"
 
 # A turn this short is not reliable material for speaker verification. In
-# particular, pyannote's own embedding backends require at least 0.5 seconds.
-_MIN_VERIFICATION_TURN_SECONDS = 1.5
+# particular, pyannote's own embedding backends require at least 0.5 seconds, so
+# 0.6 is the shortest turn an embedding can honestly describe.
+#
+# It used to be 1.5, on the theory that only a long turn measures a voice. On the
+# reference film that left the shortest lines unchecked - and those are exactly the
+# ones pitch cannot rescue, because a 0.7 s median is easily an octave out. Two real
+# lines ("I've said it before." at 7.5 s and "No, it's not the truth." at 34.7 s)
+# were voiced by the wrong character for that reason: their turns were 0.72 s and
+# 0.70 s, so no check ever ran. An embedding at 0.6 s is still a comparison against
+# the voice itself, which is stronger evidence than a pitch median at any length.
+_MIN_VERIFICATION_TURN_SECONDS = 0.6
+
+# A turn whose audio is mostly a mixture cannot be described by one embedding, so a
+# turn that overlaps another speaker is skipped. "Overlaps" used to mean *any*
+# crosstalk at all, which excluded a 0.7 s line because a 0.14 s interjection sat
+# inside it - and that line was one of the wrong-voice lines above. A turn keeps
+# enough clean audio to describe when at most this fraction of it is simultaneous
+# speech; beyond it the embedding is a measurement of two people and is skipped.
+_MAX_VERIFIABLE_OVERLAP_FRACTION = 0.3
+
+#: Absolute cosine similarity a turn's embedding needs before its label may change.
+#: A short turn produces a noisier embedding than a long one, so the floor scales with
+#: duration: below :data:`_SHORT_TURN_SECONDS` the comparison is still decisive when
+#: the margin is large, even though the two vectors are less alike overall.
 _MIN_REASSIGNMENT_SIMILARITY = 0.55
+_MIN_SHORT_TURN_SIMILARITY = 0.35
+
+#: How much closer the winning speaker's centroid has to be. Short turns need a
+#: wider margin because their embedding is noisier, and a wrong relabel is heard as
+#: one character speaking in the other's voice.
 _MIN_REASSIGNMENT_MARGIN = 0.15
+_MIN_SHORT_TURN_MARGIN = 0.20
+
+#: Turns shorter than this use the short-turn thresholds above.
+_SHORT_TURN_SECONDS = 1.5
 _LOGGER = logging.getLogger(__name__)
 
 #: Two turns of the same speaker separated by at most this long are one utterance
@@ -263,10 +296,10 @@ class DiarizationResult:
     #: Empty when the pyannote result carries no such annotation; everything
     #: downstream must keep working in that case.
     overlap_turns: tuple[SpeakerSegment, ...] = ()
-    #: Turns whose label :func:`_verify_speaker_attributions` actually checked against
-    #: Community-1's speaker embeddings and left as diarization reported them. Not
-    #: "probably right": these were compared with the model-space prototype of every
-    #: speaker and no other one won by a decisive margin.
+    #: Turns whose label :func:`_verify_speaker_attributions` settled with
+    #: Community-1's speaker embeddings - either left as diarization reported them
+    #: or corrected to the speaker whose prototype won decisively. Not "probably
+    #: right": these were compared with the model-space prototype of every speaker.
     #:
     #: This matters because it ranks two kinds of evidence. An embedding compares the
     #: voice itself; a pitch median measures one acoustic dimension of it, and a
@@ -677,12 +710,24 @@ def _speaker_centroids(result: Any) -> dict[str, tuple[float, ...]]:
 def _is_crosstalk_turn(
     segment: SpeakerSegment, crosstalk: tuple[CrosstalkRegion, ...]
 ) -> bool:
-    """Return whether any part of this turn overlaps another speaker."""
+    """Return whether too much of this turn is simultaneous speech to verify.
 
-    return any(
-        segment.start < region.end and segment.end > region.start
+    A short interjection from the other character does not stop the turn from
+    describing this speaker: the embedding still sees mostly one voice. Only when
+    the overlap takes up more than :data:`_MAX_VERIFIABLE_OVERLAP_FRACTION` of the
+    turn does the measurement describe two people at once, and then it is skipped.
+    """
+
+    overlapped = sum(
+        max(
+            0.0,
+            min(segment.end, region.end) - max(segment.start, region.start),
+        )
         for region in crosstalk
     )
+    if overlapped <= 0.0:
+        return False
+    return overlapped / segment.duration > _MAX_VERIFIABLE_OVERLAP_FRACTION
 
 
 def _verify_speaker_attributions(
@@ -776,14 +821,21 @@ def _verify_speaker_attributions(
             continue
         current_score = scores[segment.speaker_id]
         margin = best_score - current_score
+        short = segment.duration < _SHORT_TURN_SECONDS
+        minimum_similarity = (
+            _MIN_SHORT_TURN_SIMILARITY if short else _MIN_REASSIGNMENT_SIMILARITY
+        )
+        minimum_margin = _MIN_SHORT_TURN_MARGIN if short else _MIN_REASSIGNMENT_MARGIN
         if (
             best_speaker != segment.speaker_id
-            and best_score >= _MIN_REASSIGNMENT_SIMILARITY
-            and margin >= _MIN_REASSIGNMENT_MARGIN
+            and best_score >= minimum_similarity
+            and margin >= minimum_margin
         ):
-            verified.append(
-                SpeakerSegment(best_speaker, segment.start, segment.end)
-            )
+            corrected = SpeakerSegment(best_speaker, segment.start, segment.end)
+            # Published as verified too: this label was compared against the model's
+            # own voice prototypes, so a later pitch measurement must not undo it.
+            verified.append(corrected)
+            confirmed.append(corrected)
             corrections.append(
                 SpeakerAttributionCorrection(
                     start=segment.start,

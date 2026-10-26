@@ -146,6 +146,8 @@ class PipelineResult:
     dub_bleed: separation.BleedReport | None = None
     #: Anything the TTS stage wanted the run to know without treating it as a failure.
     notes: tuple[str, ...] = ()
+    #: Turns the diarization model's own speaker embeddings settled.
+    verified: tuple[SpeakerSegment, ...] = ()
     speaker_corrections: tuple[diarization.SpeakerAttributionCorrection, ...] = ()
     #: Per-speaker register measured from the voice itself, and the turns whose
     #: label it contradicted. The audit trail for "why was this character cast with
@@ -238,6 +240,24 @@ class PipelineResult:
             "diarization": {
                 "turns": len(self.turns),
                 "speakers": sorted({turn.speaker_id for turn in self.turns}),
+                # The turns themselves, so a wrong line can be traced to the turn
+                # that produced it without re-running the model.
+                "detail": [
+                    {
+                        "start": turn.start,
+                        "end": turn.end,
+                        "speaker_id": turn.speaker_id,
+                    }
+                    for turn in self.turns
+                ],
+                "verified": [
+                    {
+                        "start": turn.start,
+                        "end": turn.end,
+                        "speaker_id": turn.speaker_id,
+                    }
+                    for turn in self.verified
+                ],
                 "speaker_corrections": [
                     {
                         "start": correction.start,
@@ -611,8 +631,8 @@ def run_pipeline(
         # were compared with the model's own speaker embeddings, so no pitch
         # measurement is allowed to overturn them.
         report(
-            f"  speaker verification: {len(diarized.verified)} turn(s) confirmed "
-            "against the speaker embeddings"
+            f"  speaker verification: {len(diarized.verified)} turn(s) settled by "
+            "the speaker embeddings"
         )
     if crosstalk:
         report(
@@ -1125,6 +1145,7 @@ def run_pipeline(
         turns=turns,
         lines=lines,
         crosstalk=crosstalk,
+        verified=tuple(diarized.verified),
         speaker_corrections=speaker_corrections,
         attribution=attribution,
         dialogue=dialogue,

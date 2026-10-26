@@ -1609,9 +1609,11 @@ def test_a_region_with_both_separated_voices_gets_the_missing_line(
     )
 
     rows = _rows(result.lines)
+    # The recovered line keeps the decoder's own segment span inside the track
+    # rather than its (compressed) word timings.
     assert rows == [
         ("SPEAKER_00", 10.0, 14.0, "I do not say that lightly."),
-        ("SPEAKER_01", 12.25, 12.75, "thank you"),
+        ("SPEAKER_01", 12.2, 12.8, "thank you"),
     ]
     kept = result.lines[0]
     recovered = result.lines[1]
@@ -1725,3 +1727,68 @@ def test_without_registers_a_separated_track_cannot_be_attributed(
     assert any("no registers" in note for note in notes)
     assert [segment.speaker_id for segment in result.lines] == ["SPEAKER_00"]
 
+
+
+def test_a_segment_no_one_could_have_spoken_is_dropped(monkeypatch, tmp_path):
+    """Two words in 80 ms are a decoder artefact, not a line.
+
+    On the reference run this was "Thank you." at the first overlap, and
+    :func:`assemble_sentences` glued it to the next sentence, so the argument opened
+    with a word that was never spoken.
+    """
+
+    _patch(monkeypatch)
+    FakeWhisperModel.segments = [
+        FakeSegment(0.0, 0.08, "Thank you."),
+        FakeSegment(0.2, 0.3, "No."),          # one short word is a real line
+        FakeSegment(0.4, 1.4, "I don't want to hear about"),
+    ]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 0.0, 2.0)],
+        settings=_settings(tmp_path),
+    )
+
+    assert [segment.text for segment in segments] == ["No.", "I don't want to hear about"]
+
+
+def test_a_recovered_fragment_that_opens_a_nearby_line_is_not_repeated(
+    monkeypatch, tmp_path
+):
+    """A sentence cut by the overlap boundary must not be heard twice.
+
+    The separated track carries the first words and the kept line just outside the
+    region carries the rest. Emitting the fragment as well would have the character
+    start the same sentence twice, in two different times.
+    """
+
+    _patch(monkeypatch)
+    FakeWhisperModel.responses = [
+        # The kept turns: one over the region, one starting right after it.
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [FakeSegment(0.0, 1.1, "I don't want to hear about the police.")],
+        # The separated track for the missing speaker.
+        [FakeSegment(0.0, 0.57, "I don't want it.")],
+    ]
+    separator = _FakeSeparator([200.0, 110.0])
+
+    result = transcribe_detailed(
+        _audio(tmp_path),
+        [
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_00", 12.9, 14.0),
+        ],
+        settings=_settings(tmp_path, crosstalk_separation=True),
+        separator=separator,
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_01", 12.2, 12.9),
+        ],
+        registers={"SPEAKER_00": 200.0, "SPEAKER_01": 110.0},
+    )
+
+    assert result.separated_lines == 0
+    assert all(segment.speaker_id == "SPEAKER_00" for segment in result.lines)
+    assert "I don't want it." not in [segment.text for segment in result.lines]

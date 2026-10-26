@@ -595,8 +595,12 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert payload["run"]["diarization"] == {
         "turns": 1,
         "speakers": [SPEAKER],
+        # The turns themselves: a wrong line must be traceable to the turn that
+        # produced it without re-running the model.
+        "detail": [{"start": 1.0, "end": 4.0, "speaker_id": SPEAKER}],
         # Present even when empty: a run that corrected nothing has to be
         # distinguishable from a run whose diarization could not verify attribution.
+        "verified": [],
         "speaker_corrections": [],
         "crosstalk": {"regions": 0, "seconds": 0.0, "detail": []},
     }
