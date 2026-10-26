@@ -2341,3 +2341,103 @@ def test_a_whole_number_part_index_is_accepted(monkeypatch):
     (adapted,) = adapt_dialogue([sentence], settings=_settings())
 
     assert [beat.emotion for beat in adapted.beats] == ["calm", "angry"]
+
+
+# ---------------------------------------------------------------------------
+# Sentence grouping and gender context
+# ---------------------------------------------------------------------------
+
+
+def _grouping_segments():
+    return [
+        _segment(text="Do you know?", start=0.0, end=1.0),
+        _segment(text="how much I make a year.", start=2.5, end=4.0),
+        _segment(text="I am the danger.", start=5.5, end=6.5),
+    ]
+
+
+def test_the_models_sentence_partition_is_returned(monkeypatch):
+    _patch(monkeypatch)
+    FakeOpenAI.raw = '{"sentences": [[0, 1], [2]]}'
+
+    groups = translation.group_transcript_sentences(
+        _grouping_segments(), settings=_settings()
+    )
+
+    assert groups == [[0, 1], [2]]
+    request = FakeOpenAI.requests[0]
+    assert "sentence" in request["messages"][0]["content"].lower()
+    payload = json.loads(request["messages"][1]["content"])
+    assert [line["index"] for line in payload["lines"]] == [0, 1, 2]
+
+
+def test_sentence_grouping_is_skipped_without_a_key(monkeypatch, _clean_env):
+    _patch(monkeypatch)
+
+    groups = translation.group_transcript_sentences(
+        _grouping_segments(),
+        settings=_settings(deepseek_api_key=None, gemini_api_key=None),
+    )
+
+    assert groups is None
+    assert FakeOpenAI.requests == []
+
+
+def test_sentence_grouping_is_skipped_for_the_local_backend(monkeypatch):
+    _patch(monkeypatch)
+
+    groups = translation.group_transcript_sentences(
+        _grouping_segments(), settings=_settings(translation_backend="nllb")
+    )
+
+    assert groups is None
+    assert FakeOpenAI.requests == []
+
+
+def test_a_malformed_grouping_answer_is_not_used(monkeypatch):
+    _patch(monkeypatch)
+    FakeOpenAI.raw = '{"sentences": "not a list"}'
+
+    assert (
+        translation.group_transcript_sentences(
+            _grouping_segments(), settings=_settings()
+        )
+        is None
+    )
+
+
+def test_each_line_carries_the_speakers_measured_gender():
+    segment = _segment(text="You are in danger.", start=0.0, end=2.0)
+
+    kwargs = translation._request_kwargs(
+        _settings(),
+        [segment],
+        ["dialogue_000001"],
+        genders={"SPEAKER_00": "feminine"},
+    )
+
+    payload = json.loads(kwargs["messages"][1]["content"])
+    assert payload["lines"][0]["speaker_gender"] == "feminine"
+
+
+def test_an_unknown_speaker_is_sent_as_unknown_gender():
+    segment = _segment(text="You are in danger.", start=0.0, end=2.0)
+
+    kwargs = translation._request_kwargs(
+        _settings(),
+        [segment],
+        ["dialogue_000001"],
+        genders={},
+    )
+
+    payload = json.loads(kwargs["messages"][1]["content"])
+    assert payload["lines"][0]["speaker_gender"] == "unknown"
+
+
+def test_the_prompt_demands_gender_and_scene_context():
+    prompt = translation.SYSTEM_PROMPT
+
+    assert "GENDER" in prompt
+    assert "speaker_gender" in prompt
+    assert "CONTEXT" in prompt
+    assert "ONE complete spoken sentence" in prompt

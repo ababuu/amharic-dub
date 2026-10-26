@@ -258,9 +258,11 @@ class Stages:
         enforce_budget: bool = True,
         enforce_fidel_loanwords: bool = True,
         maximum_reduction_attempts: int = 3,
+        speaker_genders: object = None,
         on_progress: object = None,
     ) -> list[AdaptedDialogue]:
         self._record("translation", lines, settings, bible)
+        self.seen_speaker_genders = speaker_genders
         return list(self.dialogue)
 
     def build_voice_profiles(
@@ -729,6 +731,22 @@ def test_the_target_extraction_audit_reaches_the_manifest(
     assert payload["legacy_separated_lines"] == 0
     assert payload["refused_recoveries"] == 1
     assert "1/1 crosstalk region(s) separated" in result.report()
+
+
+def test_the_measured_voice_gender_reaches_adaptation(
+    tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Amharic marks gender on the verb, so the prompt gets it from the film."""
+
+    monkeypatch.setattr(
+        orchestrator.register,
+        "measure_registers",
+        lambda turns, audio: {SPEAKER: 200.0},
+    )
+
+    run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    assert stages.seen_speaker_genders == {SPEAKER: "feminine"}
 
 
 def test_the_dialogue_bible_is_handed_to_adaptation(

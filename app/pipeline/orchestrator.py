@@ -767,8 +767,35 @@ def run_pipeline(
     # The sentence is therefore the unit from here on; the raw segments stay the
     # record of what was transcribed, and the clauses inside a sentence stay
     # available as performance beats.
-    sentences = tuple(transcription.assemble_sentences(lines))
-    if sentences and len(sentences) < len(lines):
+    #
+    # Punctuation alone cannot do this reliably - "Do you know?" and "how much I make
+    # a year." are one question - so the adaptation model is asked where the sentences
+    # are. If it is not configured or its answer is unusable, the punctuation rules
+    # decide exactly as before.
+    # What each voice measured as, for the adaptation prompt. Amharic marks gender on
+    # the verb, so a line spoken by Skyler and a line spoken by Walt need different
+    # forms even when the English is identical.
+    speaker_genders: dict[str, str] = {}
+    if attribution is not None:
+        speaker_genders = {
+            speaker_id: measured.presentation
+            for speaker_id, measured in attribution.after.items()
+        }
+    elif speaker_registers:
+        speaker_genders = {
+            speaker_id: register.presentation_of(median)
+            for speaker_id, median in speaker_registers.items()
+        }
+
+    def _group_sentences(fragments):
+        return translation.group_transcript_sentences(
+            fragments, settings=resolved, on_progress=report
+        )
+
+    sentences = tuple(
+        transcription.assemble_sentences(lines, grouper=_group_sentences)
+    )
+    if sentences and len(sentences) != len(lines):
         report(
             f"  dialogue: {len(lines)} transcribed segment(s) assembled into "
             f"{len(sentences)} sentence(s)"
@@ -787,6 +814,9 @@ def run_pipeline(
             sentences,
             settings=resolved,
             bible=bible,
+            # Measured from the film's own voices: Amharic marks gender on verbs and
+            # pronouns, and the model must not have to guess it from a name.
+            speaker_genders=speaker_genders,
             enforce_budget=resolved.translation_enforce_budget,
             enforce_fidel_loanwords=resolved.translation_enforce_fidel_loanwords,
             maximum_reduction_attempts=resolved.translation_max_reduction_attempts,

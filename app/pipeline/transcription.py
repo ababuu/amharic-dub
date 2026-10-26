@@ -1616,13 +1616,101 @@ class DialogueSentence:
         return self.end - self.start
 
 
+#: Longest span a model-provided sentence may cover before it is split. A sentence
+#: is one unit for adaptation and synthesis, but a runaway group would become a
+#: single TTS line minutes long, so it is divided at its own part boundaries.
+MAX_GROUPED_SENTENCE_SECONDS = 20.0
+
+
+def _sentences_from_groups(
+    ordered: Sequence[TranscriptSegment],
+    groups: Sequence[Sequence[int]] | None,
+) -> list[DialogueSentence] | None:
+    """Build sentences from a model-proposed grouping, or return ``None``.
+
+    The grouping is accepted only as a complete, ordered partition of every
+    segment. Anything else - a missing index, a repeat, a crossed speaker - is
+    rejected rather than repaired, because a wrong partition would silently drop or
+    duplicate spoken words. A group that crosses a speaker change is split (that is
+    not a sentence boundary the model is allowed to invent), and one longer than
+    :data:`MAX_GROUPED_SENTENCE_SECONDS` is divided at its own parts.
+    """
+
+    if groups is None:
+        return None
+
+    flat: list[int] = []
+    try:
+        for group in groups:
+            if isinstance(group, (str, bytes)) or not isinstance(group, Iterable):
+                return None
+            members = list(group)
+            if not members:
+                return None
+            for index in members:
+                if isinstance(index, bool) or not isinstance(index, int):
+                    return None
+                flat.append(index)
+    except TypeError:
+        return None
+
+    if flat != list(range(len(ordered))):
+        return None
+
+    sentences: list[DialogueSentence] = []
+    for group in groups:
+        parts: list[TranscriptSegment] = []
+        for index in group:
+            segment = ordered[index]
+            if parts and segment.speaker_id != parts[-1].speaker_id:
+                sentences.append(_sentence_from_parts(parts))
+                parts = []
+            if (
+                parts
+                and segment.end - parts[0].start > MAX_GROUPED_SENTENCE_SECONDS
+            ):
+                sentences.append(_sentence_from_parts(parts))
+                parts = []
+            parts.append(segment)
+        if parts:
+            sentences.append(_sentence_from_parts(parts))
+    return sentences
+
+
+def _sentence_from_parts(parts: Sequence[TranscriptSegment]) -> DialogueSentence:
+    """Return one sentence made of ``parts``, keeping every timestamp."""
+
+    return DialogueSentence(
+        speaker_id=parts[0].speaker_id,
+        start=parts[0].start,
+        end=parts[-1].end,
+        text=_join_sentence_parts(parts),
+        parts=tuple(parts),
+    )
+
+
 def assemble_sentences(
     segments: Iterable[TranscriptSegment],
+    *,
+    grouper: Callable[
+        [Sequence[TranscriptSegment]], Sequence[Sequence[int]] | None
+    ]
+    | None = None,
 ) -> list[DialogueSentence]:
     """Group transcribed segments into complete sentences.
 
-    The rules are deliberately textual first and temporal second, because a pause
-    is a performance choice while a sentence boundary is a grammatical one:
+    A transcriber separates on pauses, not on grammar, so a single sentence
+    routinely arrives as several fragments and two sentences can arrive as one.
+    Punctuation is the only signal this module has, and it is often wrong on
+    speech: "Do you know?" and "how much I make a year." are one question, while
+    "You are in over your head. That's what we tell them." are two statements.
+
+    ``grouper`` lets a language model decide the boundaries from meaning. It is
+    handed the ordered segments and returns groups of their indexes - a complete,
+    ordered partition. That grouping is used when it is valid; otherwise the
+    punctuation-and-pause rules below run, so the stage never fails on a model.
+
+    The heuristic rules are deliberately textual first and temporal second:
 
     * segments of different speakers never join;
     * a segment that does not end with terminal punctuation continues;
@@ -1650,6 +1738,15 @@ def assemble_sentences(
                 f"segments[{index}] is {type(segment).__name__}, expected a TranscriptSegment"
             )
     ordered.sort(key=lambda segment: (segment.start, segment.end, segment.speaker_id))
+
+    if grouper is not None:
+        try:
+            proposed = grouper(tuple(ordered))
+        except Exception:  # an optional model must never break sentence assembly
+            proposed = None
+        grouped = _sentences_from_groups(ordered, proposed)
+        if grouped is not None:
+            return grouped
 
     sentences: list[DialogueSentence] = []
     parts: list[TranscriptSegment] = []

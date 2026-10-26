@@ -1792,3 +1792,93 @@ def test_a_recovered_fragment_that_opens_a_nearby_line_is_not_repeated(
     assert result.separated_lines == 0
     assert all(segment.speaker_id == "SPEAKER_00" for segment in result.lines)
     assert "I don't want it." not in [segment.text for segment in result.lines]
+
+
+# ---------------------------------------------------------------------------
+# Model-proposed sentence boundaries
+# ---------------------------------------------------------------------------
+
+
+def _sentence_parts():
+    """Three fragments where the punctuation rule splits before the second."""
+
+    return [
+        transcription.TranscriptSegment("SPEAKER_01", 0.0, 1.0, "Do you know?"),
+        transcription.TranscriptSegment("SPEAKER_01", 2.5, 4.0, "how much I make a year."),
+        transcription.TranscriptSegment("SPEAKER_01", 5.5, 6.5, "I am the danger."),
+    ]
+
+
+def test_the_heuristic_splits_where_the_model_would_not():
+    """The baseline the grouper has to improve on."""
+
+    sentences = transcription.assemble_sentences(_sentence_parts())
+
+    assert [sentence.text for sentence in sentences] == [
+        "Do you know?",
+        "how much I make a year.",
+        "I am the danger.",
+    ]
+
+
+def test_a_model_grouping_joins_one_sentence_split_by_a_pause():
+    """One question is one sentence even when the actor breathed in the middle."""
+
+    sentences = transcription.assemble_sentences(
+        _sentence_parts(), grouper=lambda _segments: [[0, 1], [2]]
+    )
+
+    assert [sentence.text for sentence in sentences] == [
+        "Do you know? how much I make a year.",
+        "I am the danger.",
+    ]
+    assert len(sentences[0].parts) == 2
+    assert sentences[0].start == 0.0
+    assert sentences[0].end == 4.0
+
+
+@pytest.mark.parametrize(
+    "grouping",
+    [
+        [[0, 1]],             # a segment is missing
+        [[0, 1, 2], [2]],     # a segment is repeated
+        [[1, 0], [2]],        # the order is changed
+        [[0], []],            # an empty group
+        "not a grouping",
+    ],
+)
+def test_an_invalid_grouping_falls_back_to_the_rules(grouping):
+    sentences = transcription.assemble_sentences(
+        _sentence_parts(), grouper=lambda _segments: grouping
+    )
+
+    assert [sentence.text for sentence in sentences] == [
+        "Do you know?",
+        "how much I make a year.",
+        "I am the danger.",
+    ]
+
+
+def test_a_grouping_that_raises_falls_back_to_the_rules():
+    def explode(_segments):
+        raise RuntimeError("model unavailable")
+
+    sentences = transcription.assemble_sentences(_sentence_parts(), grouper=explode)
+
+    assert len(sentences) == 3
+
+
+def test_a_group_that_crosses_a_speaker_change_is_split():
+    """A sentence cannot contain two people, whatever the model returned."""
+
+    parts = [
+        transcription.TranscriptSegment("SPEAKER_00", 0.0, 1.0, "Do you know?"),
+        transcription.TranscriptSegment("SPEAKER_01", 1.1, 2.0, "I do."),
+    ]
+
+    sentences = transcription.assemble_sentences(
+        parts, grouper=lambda _segments: [[0, 1]]
+    )
+
+    assert [sentence.speaker_id for sentence in sentences] == ["SPEAKER_00", "SPEAKER_01"]
+

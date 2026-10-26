@@ -64,7 +64,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -274,7 +274,24 @@ Each input line is ONE complete spoken sentence. Translate it as one continuous
 sentence in the order a speaker would say it, not as clauses joined back together.
 Its "parts" field lists the moments the actor paused inside that sentence: use them
 only to describe how the delivery changes, never as sentence boundaries. Do not end
-the Amharic at a part boundary, and do not give it more than one final stop.
+the Amharic at a part boundary, and do not give it more than one final stop. Never
+translate a clause as if it were its own sentence: the whole line is one utterance,
+with one beginning and one ending.
+
+GENDER. Amharic marks gender on verbs, adjectives and pronouns, and a dubbing line
+is heard in the voice of the character speaking it. Each line carries
+"speaker_gender" (masculine, feminine or unknown) measured from the actor's voice,
+and the character block gives who is being addressed. Use the speaker's gender for
+first-person forms, address the listener in the gender the scene establishes, and
+refer to anyone else in the gender the context gives. Keep a character's gender the
+same across the whole film. If "speaker_gender" is unknown, infer it from the name,
+the character block and what is being said - never guess against a stated gender.
+
+CONTEXT. Read the scene block and the surrounding lines before translating. The same
+English word can need a different Amharic form depending on who is speaking to whom,
+whether they are arguing, pleading or joking, and what was just said. Keep names,
+address forms, pronouns and recurring references consistent with earlier lines of
+the same scene.
 
 Amharic punctuation follows the spoken sentence, not the English source. End a
 sentence with the Ethiopian full stop, use the question mark for questions and the
@@ -742,6 +759,7 @@ def _request_kwargs(
     budgets: Sequence[SyllableBudget] | None = None,
     shared: Sequence[bool] | None = None,
     rewrite: str | None = None,
+    genders: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the ``chat.completions.create`` arguments for one batch.
 
@@ -773,6 +791,15 @@ def _request_kwargs(
                     else {}
                 ),
                 **({"simultaneous": True} if is_shared else {}),
+                **(
+                    {
+                        "speaker_gender": genders[segment.speaker_id]
+                        if segment.speaker_id in genders
+                        else "unknown"
+                    }
+                    if genders is not None
+                    else {}
+                ),
                 **_parts_payload(segment),
             }
             for segment, line_id, budget, is_shared in zip(
@@ -1186,6 +1213,7 @@ def _adapt_batch(
     budgets: Sequence[SyllableBudget] | None = None,
     shared: Sequence[bool] | None = None,
     rewrite: str | None = None,
+    genders: Mapping[str, str] | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> list[AdaptedDialogue]:
     """Adapt one batch of consecutive lines, in order.
@@ -1208,6 +1236,7 @@ def _adapt_batch(
                 budgets=budgets,
                 shared=shared,
                 rewrite=rewrite,
+                genders=genders,
             )
         )
     except Exception:
@@ -1619,6 +1648,7 @@ def adapt_dialogue(
     enforce_fidel_loanwords: bool = True,
     maximum_reduction_attempts: int = MAXIMUM_REDUCTION_ATTEMPTS,
     translator: Any | None = None,
+    speaker_genders: Mapping[str, str] | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> list[AdaptedDialogue]:
     """Adapt transcribed dialogue into dubbing-ready Amharic.
@@ -1666,6 +1696,12 @@ def adapt_dialogue(
     maximum_reduction_attempts:
         Retained for compatibility. Hosted translation is one request per batch;
         this value is ignored and no rewrite request is ever sent.
+    speaker_genders:
+        Each speaker's measured vocal presentation (``masculine``/``feminine``), sent
+        with every line so the model can use gendered Amharic forms instead of
+        guessing from a name. The speaker is still never returned or changed.
+        Measured from the film's own voices before translation, so nothing has to be
+        inferred from a name.
     on_progress:
         Optional callback for batch start and completion updates.
 
@@ -1810,6 +1846,7 @@ def adapt_dialogue(
             context=context,
             budgets=budgets,
             shared=batch_shared,
+            genders=speaker_genders,
             on_progress=on_progress,
         )
         if enforce_budget or enforce_fidel_loanwords:
@@ -1839,6 +1876,126 @@ def adapt_dialogue(
     return adapted
 
 
+#: Prompt for the optional sentence-grouping request. The model is *not* translating
+#: here: it is asked only where sentences begin and end, because a transcriber splits
+#: on breaths and a model reading the words can tell "Do you know?" + "how much I make
+#: a year." from two statements.
+SENTENCE_GROUPING_PROMPT = """\
+You are given the pause-delimited fragments a speech recogniser produced for one
+film, in order. Each fragment has an index, the speaker who said it, and its
+duration. The recogniser splits on breaths, not on grammar: one sentence often
+arrives as several fragments, and two sentences can arrive inside one fragment.
+
+Decide where complete spoken sentences begin and end.
+
+Rules
+-----
+- Return a complete, ordered partition of every index: each index appears exactly
+  once, groups are in order, and no index is skipped, repeated or reordered.
+- Join fragments that belong to the same sentence, even across a long pause. A
+  sentence is one complete thought with its clauses, not one fragment.
+- If a fragment contains the end of one sentence and the start of the next, put it
+  in the group it mostly belongs to. Never invent, split or rewrite text.
+- Never put two different speakers in one group: a change of speaker always ends a
+  sentence.
+- A single short fragment is a sentence when it is a complete utterance ("No.",
+  "Run!", "Thank you."). Do not merge it into a neighbour merely to make it longer.
+- Keep the sentence as long as the language needs: a 10-second sentence with several
+  clauses stays one group.
+
+Reply with a single JSON object and nothing else:
+{"sentences": [[0,1],[2],[3,4,5]]}
+"""
+
+#: Largest transcript sent for grouping in one request. A feature film fits; beyond
+#: this the punctuation rules are used rather than sending an unbounded request.
+MAX_GROUPING_SEGMENTS = 1200
+
+
+def group_transcript_sentences(
+    segments: Sequence[TranscriptSegment | DialogueSentence],
+    *,
+    settings: Settings | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> list[list[int]] | None:
+    """Ask the adaptation model where complete sentences begin and end.
+
+    This is the model half of the optional ``grouper`` accepted by
+    :func:`app.pipeline.transcription.assemble_sentences`. It returns groups of
+    input indexes - a complete, ordered partition - or ``None`` when the model is
+    not configured or the answer is unusable, in which case the punctuation-and-pause
+    rules decide. It never raises: sentence grouping is an improvement, not a
+    prerequisite for a run.
+    """
+
+    resolved = (
+        settings if settings is not None else get_settings()
+    ).with_available_translation_provider()
+    ordered = list(segments)
+    if not ordered or len(ordered) > MAX_GROUPING_SEGMENTS:
+        return None
+    if resolved.translation_backend != "openai":
+        return None
+
+    try:
+        _require_served_endpoint(resolved)
+        api_key = _require_api_key(resolved)
+        client = _build_client(resolved, api_key)
+        payload = {
+            "lines": [
+                {
+                    "index": index,
+                    "speaker": segment.speaker_id,
+                    "duration": round(segment.duration, 3),
+                    "text": segment.text,
+                }
+                for index, segment in enumerate(ordered)
+            ]
+        }
+        kwargs: dict[str, Any] = {
+            "model": resolved.translation_model,
+            "messages": [
+                {"role": "system", "content": SENTENCE_GROUPING_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False),
+                },
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        kwargs.update(_thinking_request(resolved))
+        response = client.chat.completions.create(**kwargs)
+        data = _json_object(_response_content(response))
+        if not isinstance(data, dict):
+            return None
+        groups = data.get("sentences")
+        if not isinstance(groups, list):
+            return None
+        validated: list[list[int]] = []
+        for group in groups:
+            if not isinstance(group, list) or not group:
+                return None
+            indexes: list[int] = []
+            for index in group:
+                if isinstance(index, bool) or not isinstance(index, int):
+                    return None
+                indexes.append(index)
+            validated.append(indexes)
+        if on_progress is not None:
+            on_progress(
+                f"  sentences: the model grouped {len(ordered)} fragment(s) into "
+                f"{len(validated)} sentence(s)"
+            )
+        return validated
+    except Exception as exc:
+        if on_progress is not None:
+            on_progress(
+                "  sentences: model grouping unavailable "
+                f"({type(exc).__name__}: {exc}); using punctuation and pauses"
+            )
+        return None
+
+
 __all__ = [
     "DIALOGUE_ID_PREFIX",
     "NEUTRAL_DELIVERY",
@@ -1860,7 +2017,9 @@ __all__ = [
     "MissingApiKeyError",
     "PerformanceBeat",
     "TranslationError",
+    "SENTENCE_GROUPING_PROMPT",
     "adapt_dialogue",
     "describe_thinking",
     "describe_fallback",
+    "group_transcript_sentences",
 ]
