@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Build a native-Amharic voice bank for casting mode.
+"""Build a native-Amharic voice bank for fallback casting.
 
 The pipeline clones a character from a reference recording. When the film is
 English, that reference carries an English accent into the Amharic line - the
 model documentation says so explicitly - and the only fix is a reference in the
-target language. This script builds one: it filters a human-recorded Amharic
-corpus for clips that are clean, long enough to clone from, exactly transcribed
-and free of Latin script or numerals, then writes them as canonical 24 kHz
-references plus a manifest.
+target language. The actor's own clean window is always preferred, so this bank is
+used only for a character whose film audio cannot supply one that is safe to
+clone. This script builds it: it filters a human-recorded Amharic corpus for clips
+that are clean, long enough to clone from, exactly transcribed and free of Latin
+script or numerals, then writes them as canonical 24 kHz references plus a
+manifest.
 
 Typical use::
 
     python scripts/build_voice_bank.py                 # 12 voices -> data/voice-bank
     python scripts/build_voice_bank.py --voices 8 --out runs/bank-a
 
-Point the pipeline at the result with ``VOICE_BANK_DIR``. A manifest switches
-casting on for every run that sees it; deleting it switches casting off again,
-and no previous run is changed either way.
+Point the pipeline at the result with ``VOICE_BANK_DIR``. A manifest makes the
+fallback available to every run that sees it; deleting it removes the fallback
+again, and no previous run is changed either way.
 
 The corpus is scanned through Hugging Face's dataset server, so the script
 downloads metadata plus a handful of clips rather than the multi-gigabyte

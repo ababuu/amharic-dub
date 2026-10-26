@@ -31,9 +31,10 @@ from app.pipeline.transcription import TranscriptSegment
 from app.pipeline.translation import AdaptedDialogue
 from app.pipeline.tts import PerformanceControls, SkippedLine, TtsClip
 from app.pipeline.video import MuxResult
-from app.pipeline.voice_profiles import VoiceProfile
+from app.pipeline.voice_profiles import NoUsableReferenceError, VoiceProfile
 
 SPEAKER = "SPEAKER_00"
+SECOND_SPEAKER = "SPEAKER_01"
 RATE = 48_000
 
 
@@ -50,8 +51,9 @@ def _settings(root: Path, **overrides: object) -> Settings:
         # native-speaker samples in `data/voice-samples`: those switch the run to a
         # Whisper transcription of each sample, which is not what these tests exercise.
         "voice_sample_dir": root / "voice-samples",
-        # Same reason: a bank built into `data/voice-bank` would switch every run in
-        # this file to casting mode, so the default here is a path that has no manifest.
+        # Same reason: a bank built into `data/voice-bank` would make the fallback
+        # available to every run in this file, so the default here is a path with no
+        # manifest.
         "voice_bank_dir": root / "voice-bank",
         "dialogue_bible_path": root / "work" / "dialogue_bible.json",
         # These tests exercise the per-character path, which needs voice profiles,
@@ -86,14 +88,18 @@ def _dialogue(start: float = 1.0, end: float = 4.0, amharic: str = "እወድሃ
     )
 
 
-def _profile(root: Path) -> VoiceProfile:
+def _profile(root: Path, speaker_id: str = SPEAKER) -> VoiceProfile:
     return VoiceProfile(
-        speaker_id=SPEAKER,
-        reference_audio=root / "voices" / SPEAKER / "reference.wav",
+        speaker_id=speaker_id,
+        reference_audio=root / "voices" / speaker_id / "reference.wav",
         reference_start=0.0,
         reference_end=5.0,
         quality_score=0.9,
         selection_reason="cleanest turn",
+        estimated_vocal_presentation="masculine",
+        estimated_pitch_hz=120.0,
+        source_vocal_presentation="masculine",
+        source_pitch_hz=120.0,
     )
 
 
@@ -173,6 +179,7 @@ class Stages:
         lines: list[TranscriptSegment] | None = None,
         dialogue: list[AdaptedDialogue] | None = None,
         profiles: dict[str, VoiceProfile] | None = None,
+        unusable: dict[str, Exception] | None = None,
         failures: dict[str, Exception] | None = None,
     ) -> None:
         self.root = root
@@ -182,6 +189,7 @@ class Stages:
         self.lines = [_line()] if lines is None else lines
         self.dialogue = [_dialogue()] if dialogue is None else dialogue
         self.profiles = {SPEAKER: _profile(root)} if profiles is None else profiles
+        self.unusable = {} if unusable is None else unusable
         self.failures = failures or {}
         self.received: dict[str, tuple[object, ...]] = {}
         self.order: list[str] = []
@@ -251,6 +259,8 @@ class Stages:
         crosstalk: object = (),
         settings: Settings,
         require_reference_transcript: bool = False,
+        allow_clean_fallback: bool = False,
+        on_unusable: object = None,
         registers: object = None,
     ) -> dict[str, VoiceProfile]:
         self._record(
@@ -260,10 +270,19 @@ class Stages:
             transcript,
             settings,
             require_reference_transcript,
+            allow_clean_fallback,
         )
         self.seen_crosstalk = crosstalk
         self.seen_registers = registers
-        return dict(self.profiles)
+        for speaker_id, error in self.unusable.items():
+            if on_unusable is None:
+                raise error
+            on_unusable(speaker_id, error)  # type: ignore[operator]
+        return {
+            speaker_id: profile
+            for speaker_id, profile in self.profiles.items()
+            if speaker_id not in self.unusable
+        }
 
     def synthesize_dialogue_detailed(
         self,
@@ -367,7 +386,18 @@ def test_omnivoice_profiles_require_clean_matching_actor_transcripts(
 ) -> None:
     run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
 
-    assert stages.received["voice_profiles"][-1] is True
+    (
+        _turns,
+        _speech,
+        _transcript,
+        _passed,
+        require_transcript,
+        clean_fallback,
+    ) = stages.received["voice_profiles"]
+    # The actor stays the identity, so the prompt must be one voice and its text
+    # must describe its audio; an undescribed clean window is the only step down.
+    assert require_transcript is True
+    assert clean_fallback is True
 
 
 def test_every_stage_runs_once_in_order(
@@ -665,7 +695,10 @@ def test_voice_sample_files_do_not_replace_film_actor_references(
     assert "voice samples" not in reported
     # The line names the film-actor path so a run is auditable for which of the two
     # reference sources produced the dub.
-    assert "voice references: using clean, transcript-matched film-actor audio" in reported
+    assert (
+        "voice references: 1 character(s) cloned from the film's own dialogue"
+        in reported
+    )
     assert "voice_samples" not in result.stage_seconds
     (_dialogue, _speech, received, passed_settings) = stages.received["tts"]
     (profile,) = received.values()
@@ -713,7 +746,7 @@ def _write_local_samples(directory: Path) -> Path:
 
 
 def _write_bank(root: Path) -> Path:
-    """Build a one-voice bank so the casting path runs without the network."""
+    """Build a one-voice bank so the fallback path runs without the network."""
 
     import numpy as np
     import soundfile as sf
@@ -752,10 +785,10 @@ def _write_bank(root: Path) -> Path:
     return root / "bank"
 
 
-def test_a_voice_bank_casts_every_character_from_native_recordings(
+def test_a_bank_never_replaces_a_usable_actor_reference(
     tmp_path: Path, stages: Stages
 ) -> None:
-    """A bank before the run is an explicit request to trade identity for accent."""
+    """The actor is the voice identity; a bank exists only for a broken window."""
 
     bank_dir = _write_bank(tmp_path)
     settings = _settings(tmp_path, voice_bank_dir=bank_dir)
@@ -764,24 +797,147 @@ def test_a_voice_bank_casts_every_character_from_native_recordings(
     run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
 
     reported = " ".join(messages)
-    assert "casting from a native-Amharic bank" in reported
-    assert "identity is traded for native pronunciation" in reported
-    assert f"cast: {SPEAKER} -> am-m-test" in reported
+    assert "voice bank: available at" in reported
+    assert "every character kept the actor's own reference" in reported
+    assert "cast:" not in reported
 
-    # The film no longer has to supply an exactly transcribed window: the bank clip
-    # brings its own transcript, so a poorly transcribed film can still be cast.
-    (_turns, _speech, _transcript, _passed, require_transcript) = stages.received[
-        "voice_profiles"
-    ]
-    assert require_transcript is False
+    (_turns, _speech, _transcript, _passed, require_transcript, clean_fallback) = (
+        stages.received["voice_profiles"]
+    )
+    # The bank is not allowed to relax the reference: the actor's window still has
+    # to be one voice whose transcript describes its audio.
+    assert require_transcript is True
+    assert clean_fallback is True
 
-    (_dialogue, _speech_stem, received, _passed_settings) = stages.received["tts"]
-    (profile,) = received.values()
+    for profile in stages.received["tts"][2].values():
+        assert profile.reference_source == "film"
+        assert profile.reference_voice_id is None
+        assert profile.reference_audio == stages.profiles[SPEAKER].reference_audio
+
+
+def test_only_a_character_without_a_usable_film_reference_is_cast(
+    tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One unusable actor window must not cost the rest of the cast their voices."""
+
+    from app.pipeline.register import AttributionReport, SpeakerRegister
+
+    def registers(speaker_id: str, pitch: float) -> SpeakerRegister:
+        return SpeakerRegister(
+            speaker_id=speaker_id,
+            median_hz=pitch,
+            low_hz=pitch - 20.0,
+            high_hz=pitch + 20.0,
+            turns=3,
+            measured_turns=3,
+            speech_seconds=4.0,
+        )
+
+    measured = {
+        SPEAKER: registers(SPEAKER, 118.0),
+        SECOND_SPEAKER: registers(SECOND_SPEAKER, 212.0),
+    }
+    monkeypatch.setattr(
+        orchestrator.register,
+        "repair_attribution",
+        lambda lines, audio: (
+            list(lines),
+            AttributionReport(before=measured, after=measured, corrections=()),
+        ),
+    )
+
+    bank_dir = _write_bank(tmp_path)
+    settings = _settings(tmp_path, voice_bank_dir=bank_dir)
+    stages.profiles[SECOND_SPEAKER] = _profile(tmp_path, SECOND_SPEAKER)
+    stages.unusable[SECOND_SPEAKER] = NoUsableReferenceError(
+        "only simultaneous speech was available"
+    )
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+
+    reported = " ".join(messages)
+    assert "1 of 2 character(s) cast" in reported
+    assert f"cast: {SECOND_SPEAKER} -> am-m-test" in reported
+    assert "only simultaneous speech was available" in reported
+
+    received = stages.received["tts"][2]
+    assert received[SPEAKER].reference_source == "film"
+    assert received[SECOND_SPEAKER].reference_source == "voice_bank"
+    assert received[SECOND_SPEAKER].reference_voice_id == "am-m-test"
+    # The actor's measured register survives the swap, so the fallback voice is
+    # chosen in the same register and stays auditable.
+    assert received[SECOND_SPEAKER].source_pitch_hz == pytest.approx(212.0)
+    assert received[SECOND_SPEAKER].source_vocal_presentation == "feminine"
+    # The manifest records why the film could not serve, not only that it did not.
+    assert (
+        "film reference unusable: only simultaneous speech was available"
+        in received[SECOND_SPEAKER].selection_reason
+    )
+    # The only bank voice is male while the film measured a feminine register, so
+    # the swap is audible and the run has to say so.
+    assert (
+        f"WARNING: {SECOND_SPEAKER} measured feminine in the film but the bank "
+        "supplied a masculine voice"
+    ) in reported
+
+
+def test_a_bad_operator_pin_fails_as_a_voice_profile_stage_error(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """A typo in VOICE_BANK_MAP must name the stage, not escape as a raw error."""
+
+    bank_dir = _write_bank(tmp_path)
+    settings = _settings(
+        tmp_path,
+        voice_bank_dir=bank_dir,
+        voice_bank_voice_map="SPEAKER_09=am-m-test",
+    )
+    stages.unusable[SPEAKER] = NoUsableReferenceError("no clean window")
+
+    with pytest.raises(StageError) as failure:
+        run_pipeline(_source(tmp_path), settings=settings)
+
+    assert "while casting" in str(failure.value)
+    assert "SPEAKER_09" in str(failure.value)
+
+
+def test_a_character_with_no_film_profile_at_all_is_still_cast(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """A speaker with no measurable window is exactly who the bank is for."""
+
+    bank_dir = _write_bank(tmp_path)
+    settings = _settings(tmp_path, voice_bank_dir=bank_dir)
+    stages.profiles = {}
+    stages.unusable[SPEAKER] = NoUsableReferenceError("no speech at all")
+    messages: list[str] = []
+
+    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+
+    assert "1 of 1 character(s) cast" in " ".join(messages)
+    (profile,) = stages.received["tts"][2].values()
     assert profile.reference_source == "voice_bank"
     assert profile.reference_voice_id == "am-m-test"
-    assert profile.reference_audio.name == "bank_reference.wav"
-    assert profile.reference_text == "ዛሬ ጠዋት አዲስ አበባ ውስጥ በጣም ቀዝቃዛ አየር ነበር"
-    assert profile.reference_audio != stages.profiles[SPEAKER].reference_audio
+
+
+def test_an_unusable_reference_without_a_bank_fails_with_guidance(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """Cloning a two-voice window is worse than failing: say so and say how to fix it."""
+
+    settings = _settings(tmp_path, voice_bank_dir=tmp_path / "no-bank")
+    stages.unusable[SPEAKER] = NoUsableReferenceError(
+        "only simultaneous speech was available"
+    )
+
+    with pytest.raises(StageError) as failure:
+        run_pipeline(_source(tmp_path), settings=settings)
+
+    message = str(failure.value)
+    assert "no usable actor reference" in message
+    assert "only simultaneous speech was available" in message
+    assert "build_voice_bank.py" in message
 
 
 def test_a_bank_is_reported_when_the_engine_cannot_use_it(
@@ -803,7 +959,7 @@ def test_a_bank_is_reported_when_the_engine_cannot_use_it(
 
 
 def test_no_bank_keeps_the_films_own_references(tmp_path: Path, stages: Stages) -> None:
-    """Casting is opt-in: no manifest means the run is unchanged."""
+    """No bank and usable actor audio is the normal, unchanged run."""
 
     settings = _settings(tmp_path, voice_bank_dir=tmp_path / "no-bank")
     messages: list[str] = []
@@ -812,15 +968,16 @@ def test_no_bank_keeps_the_films_own_references(tmp_path: Path, stages: Stages) 
 
     reported = " ".join(messages)
     # The absence is stated, with where it looked: the bank is a build artifact, so a
-    # silent fall back to the actor's voice is the likeliest way to think casting ran.
+    # fallback that silently did nothing is the likeliest way to think it ran.
     assert "voice bank: none at" in reported
-    assert "casting from a native-Amharic bank" not in reported
-    (_turns, _speech, _transcript, _passed, require_transcript) = stages.received[
-        "voice_profiles"
-    ]
+    assert "fallback only" in reported
+    (_turns, _speech, _transcript, _passed, require_transcript, clean_fallback) = (
+        stages.received["voice_profiles"]
+    )
     # Without a bank the film reference is still the identity, so it still has to be
     # transcribed exactly.
     assert require_transcript is True
+    assert clean_fallback is True
 
     (_dialogue, _speech_stem, received, _passed) = stages.received["tts"]
     (profile,) = received.values()
@@ -1159,6 +1316,9 @@ def test_cast_from_bank_builds_a_missing_bank_before_the_run(
         return bank
 
     monkeypatch.setattr(orchestrator.voice_bank, "build_voice_bank", fake_build)
+    # The flag makes a bank *available*; it is used only for a character whose own
+    # film audio cannot supply a reference, so this is that character.
+    stages.unusable[SPEAKER] = NoUsableReferenceError("no clean window")
 
     code = orchestrator.main(
         [str(_source(tmp_path)), "--out", str(tmp_path / "run"), "--cast-from-bank"]
@@ -1187,6 +1347,7 @@ def test_cast_from_bank_prefers_the_operators_own_samples(
         raise AssertionError("the corpus must not be used when samples are supplied")
 
     monkeypatch.setattr(orchestrator.voice_bank, "build_voice_bank", no_corpus)
+    stages.unusable[SPEAKER] = NoUsableReferenceError("no clean window")
 
     code = orchestrator.main(
         [str(_source(tmp_path)), "--out", str(tmp_path / "run"), "--cast-from-bank"]
@@ -1212,6 +1373,7 @@ def test_cast_from_bank_reuses_an_existing_bank(tmp_path: Path, stages: Stages, 
         raise AssertionError("an existing bank must not be rebuilt")
 
     monkeypatch.setattr(orchestrator.voice_bank, "build_voice_bank", explode)
+    stages.unusable[SPEAKER] = NoUsableReferenceError("no clean window")
 
     code = orchestrator.main(
         [str(_source(tmp_path)), "--out", str(tmp_path / "run"), "--cast-from-bank"]

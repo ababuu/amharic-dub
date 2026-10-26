@@ -11,8 +11,9 @@ The stage order is the one ``app/pipeline/__init__.py`` documents::
                                         the backend produces it)
       -> voice_profiles.build_voice_profiles   one identity reference per speaker
                                         (per-character engines only)
-      -> voice_bank.apply_voice_bank    opt-in: cast each character from a
-                                        native-Amharic bank instead of the actor
+      -> voice_bank.apply_voice_bank    fallback only: a character whose film
+                                        window cannot supply a clean reference is
+                                        cast from a native-Amharic bank
       -> tts.synthesize_dialogue        Amharic speech clips
       -> timing.align_dialogue          each line fitted to its original window
       -> mixing.mix_track              dialogue over ducked music + effects
@@ -697,9 +698,8 @@ def run_pipeline(
     # TTS stage's own contract, asked rather than assumed here.
     needs_profiles = tts.engine_needs_profiles(resolved.tts_engine)
     profiles: Mapping[str, VoiceProfile] = {}
-    # A built bank switches the run to casting mode: the character's reference is
-    # replaced after this stage, so the film only has to supply who spoke when and
-    # roughly what they sound like - not a clean, transcript-matched window.
+    # A bank is a fallback, never the default: a character keeps the actor's own
+    # voice unless the film cannot supply a reference that is safe to clone.
     bank = voice_bank.load_voice_bank(settings=resolved)
     if not needs_profiles:
         seconds["voice_profiles"] = 0.0
@@ -707,7 +707,7 @@ def run_pipeline(
         if bank is not None:
             # Said rather than silently ignored: a configured bank that changes nothing
             # is the one case where the operator cannot tell from the output that
-            # casting is off.
+            # fallback casting is off.
             report(
                 f"  voice bank: not used ({len(bank)} voice(s) available, but "
                 f"{resolved.tts_engine} speaks every character in one voice)"
@@ -720,6 +720,7 @@ def run_pipeline(
             SpeakerSegment(speaker_id, start, end)
             for speaker_id, start, end in register.contiguous_turns(lines)
         ]
+        unusable: dict[str, voice_profiles.NoUsableReferenceError] = {}
         # Built from every transcribed line, not from a shortened run: a profile is a
         # character's identity and is reused across runs, so it is never truncated.
         profiles = _stage(
@@ -735,57 +736,156 @@ def run_pipeline(
             crosstalk=crosstalk,
             transcript=lines,
             settings=resolved,
-            # Casting replaces the film reference, so its transcript no longer has
-            # to be exact - the bank clip brings its own.
-            require_reference_transcript=bank is None,
+            # The actor is the voice identity, so the reference sent to the engine
+            # must be one voice and its text must describe its audio exactly; that is
+            # what stops the model speaking the English prompt before the Amharic
+            # line. A clean but undescribed window is the one safe step down - the
+            # engine transcribes that window itself, so audio and text stay aligned.
+            require_reference_transcript=True,
+            allow_clean_fallback=True,
+            # A character with no usable window is reported, not given a worse
+            # reference; whether that report becomes a bank fallback or a failure is
+            # decided below, per character.
+            on_unusable=lambda speaker_id, error: unusable.__setitem__(
+                speaker_id, error
+            ),
             registers=attribution.after if attribution is not None else None,
         )
-        if not profiles:
+        if not profiles and not unusable:
             raise EmptyStageError(
                 "no voice profile could be built from the dialogue stem; the TTS stage "
                 "needs one identity reference per speaker"
             )
-        if bank is not None:
-            profiles = voice_bank.apply_voice_bank(
-                profiles, settings=resolved, bank=bank
+        if unusable and bank is None:
+            # Every character has to sound like someone, and an unusable window is
+            # not a voice. Failing here names the character and says how to fix it;
+            # cloning from the bad window instead is how a second person ends up
+            # inside a character's mouth for the whole film.
+            reasons = "; ".join(
+                f"{speaker_id}: {error}"
+                for speaker_id, error in unusable.items()
             )
+            raise StageError(
+                "the voice_profiles stage found no usable actor reference for "
+                f"{len(unusable)} character(s) and no voice bank is configured to "
+                f"fall back to ({reasons}). Build a bank with "
+                "`python scripts/build_voice_bank.py` and point VOICE_BANK_DIR at it, "
+                "or fix the dialogue stem those characters were isolated from."
+            ) from next(iter(unusable.values()))
+        if unusable:
+            assert bank is not None
+            # A character with no usable reference may still have been *measured*:
+            # the register stage aggregates every turn before any window is cut. That
+            # measurement is what keeps a fallback voice in the actor's own register
+            # instead of handing a low-pitched part the highest voice in the bank.
+            measured = attribution.after if attribution is not None else {}
+            try:
+                profiles = voice_bank.apply_voice_bank(
+                    profiles,
+                    settings=resolved,
+                    bank=bank,
+                    requests=[
+                        voice_bank.VoiceRequest(
+                            speaker_id=speaker_id,
+                            presentation=(
+                                measured[speaker_id].presentation
+                                if speaker_id in measured
+                                else "unknown"
+                            ),
+                            pitch_hz=(
+                                measured[speaker_id].median_hz
+                                if speaker_id in measured
+                                else None
+                            ),
+                        )
+                        for speaker_id in unusable
+                    ],
+                    reasons={
+                        speaker_id: str(error)
+                        for speaker_id, error in unusable.items()
+                    },
+                )
+            except voice_bank.VoiceBankError as exc:
+                raise StageError(
+                    "the voice_profiles stage failed while casting "
+                    f"{len(unusable)} character(s) from the voice bank: {exc}"
+                ) from exc
+
+        film_ids = [
+            speaker_id
+            for speaker_id, profile in profiles.items()
+            if profile.reference_source == "film"
+        ]
+        bank_ids = [
+            speaker_id
+            for speaker_id, profile in profiles.items()
+            if profile.reference_source == "voice_bank"
+        ]
+        if film_ids:
             report(
-                f"  voice references: casting from a native-Amharic bank "
-                f"({len(bank)} voice(s), {bank.dataset}"
-                f"{'@' + bank.revision[:8] if bank.revision else ''}); "
-                "the actor's identity is traded for native pronunciation"
+                f"  voice references: {len(film_ids)} character(s) cloned from the "
+                "film's own dialogue (clean, single-voice actor audio; the actor's "
+                "voice is the identity)"
             )
-            for speaker_id, profile in profiles.items():
+        if bank_ids:
+            assert bank is not None
+            report(
+                f"  voice bank: {len(bank_ids)} of {len(profiles)} character(s) cast "
+                f"from the native-Amharic fallback ({len(bank)} voice(s), "
+                f"{bank.dataset}"
+                f"{'@' + bank.revision[:8] if bank.revision else ''}) because the film "
+                "supplied no reference that is safe to clone"
+            )
+            for speaker_id in bank_ids:
+                profile = profiles[speaker_id]
+                reason = unusable.get(speaker_id)
                 report(
                     f"  cast: {speaker_id} -> {profile.reference_voice_id} "
                     f"({profile.estimated_vocal_presentation}, "
                     f"{profile.reference_duration:.1f}s)"
+                    + (f"; {reason}" if reason is not None else "")
                 )
+                film_presentation = profile.source_vocal_presentation
+                if (
+                    film_presentation in {"masculine", "feminine"}
+                    and profile.estimated_vocal_presentation
+                    in {"masculine", "feminine"}
+                    and film_presentation != profile.estimated_vocal_presentation
+                ):
+                    # A fallback in the wrong register is heard as a different
+                    # character, so it is called out rather than left in a manifest.
+                    report(
+                        f"        WARNING: {speaker_id} measured {film_presentation} "
+                        "in the film but the bank supplied a "
+                        f"{profile.estimated_vocal_presentation} voice; the bank has "
+                        "no unused voice in that register"
+                    )
+        elif bank is not None:
+            # Stated so an operator who uploaded a bank can see that it was not
+            # needed, instead of wondering why the actors still have their accents.
+            report(
+                f"  voice bank: available at {resolved.voice_bank_dir} but unused - "
+                "every character kept the actor's own reference"
+            )
         else:
-            # Said out loud, with the directory it looked in: a run that silently keeps the
-            # actor's voice when an operator expected casting is indistinguishable from a
-            # bank that was never uploaded, and that is an easy mistake to make because the
-            # bank is a build artifact rather than a committed file.
             report(
-                "  voice references: using clean, transcript-matched film-actor audio "
-                "(one continuous 4-10 second interval per character; "
-                "Amharic-tuned OmniVoice)"
+                f"  voice bank: none at {resolved.voice_bank_dir} (fallback only; a "
+                f"{voice_bank.BANK_MANIFEST_FILENAME} there would be used for a "
+                "character whose film reference is unusable)"
+            )
+        for speaker_id, profile in profiles.items():
+            if profile.reference_source != "film":
+                continue
+            pitch = (
+                f", median pitch {profile.estimated_pitch_hz:.0f} Hz"
+                if profile.estimated_pitch_hz is not None
+                else ""
             )
             report(
-                f"  voice bank: none at {resolved.voice_bank_dir} "
-                f"(a {voice_bank.BANK_MANIFEST_FILENAME} there switches casting on)"
+                f"  voice presentation estimate: {speaker_id} "
+                f"{profile.estimated_vocal_presentation}{pitch}; actor reference "
+                "is the voice identity"
             )
-            for speaker_id, profile in profiles.items():
-                pitch = (
-                    f", median pitch {profile.estimated_pitch_hz:.0f} Hz"
-                    if profile.estimated_pitch_hz is not None
-                    else ""
-                )
-                report(
-                    f"  voice presentation estimate: {speaker_id} "
-                    f"{profile.estimated_vocal_presentation}{pitch}; actor reference "
-                    "is the voice identity"
-                )
 
     spoken = dialogue
     if max_lines is not None and max_lines < len(dialogue):
@@ -1006,7 +1106,10 @@ def _engine_note(settings: Settings) -> str:
         return (
             f"{settings.tts_engine} runs voice cloning: each character is spoken in "
             "their own voice, cloned from their isolated performance in the film, so "
-            "the dub carries that performance's accent as well as its timbre"
+            "the dub carries that performance's accent as well as its timbre. A "
+            "character whose film audio cannot supply a clean reference is cast from "
+            "a native-Amharic bank instead, and the profile records which source "
+            "each voice came from"
         )
     return (
         f"{settings.tts_engine} is a single-voice engine: one voice speaks every part"
@@ -1191,9 +1294,10 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="DIR",
         help=(
-            "cast every character from a native-Amharic voice bank instead of the "
-            "actor's own reference, trading actor identity for native pronunciation. "
-            "Uses DIR (default: VOICE_BANK_DIR), building a bank there first if none "
+            "make a native-Amharic voice bank available as the fallback for "
+            "characters whose film audio cannot supply a clean, usable reference. "
+            "The actor's own reference stays the identity for everyone else. Uses "
+            "DIR (default: VOICE_BANK_DIR), building a bank there first if none "
             "exists - which is what a fresh checkout needs, since a bank is a build "
             "artifact and is not committed."
         ),

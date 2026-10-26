@@ -1,4 +1,4 @@
-"""A curated bank of native-Amharic voice references, and casting them to characters.
+"""A curated bank of native-Amharic voice references, and a fallback cast for them.
 
 Why this exists
 ---------------
@@ -9,22 +9,25 @@ generated speech. Voice design cannot fix that either - its accent vocabulary is
 English accents and Chinese dialects only - so the only lever is a reference in
 the target language.
 
-This module supplies that reference. It reads a manifest of human-recorded
-Amharic clips with exact transcripts, and swaps each character's film reference
-for one of them::
+This module supplies that reference when, and only when, the film cannot supply
+one of its own. The actor's own clean, transcript-matched window is the default
+voice identity; a character is swapped onto a bank voice only when every window
+the film offers is unusable - too short, holding two voices, or overlapping
+another speaker - because then there is no actor identity left to preserve::
 
-    {"SPEAKER_00": VoiceProfile(...film reference...)}
-        -> apply_voice_bank()
-        -> {"SPEAKER_00": VoiceProfile(...bank reference...)}
+    {"SPEAKER_00": VoiceProfile(...film reference...), "SPEAKER_01": ...}
+        -> apply_voice_bank(..., speaker_ids=["SPEAKER_01"])
+        -> {"SPEAKER_00": film profile, "SPEAKER_01": bank profile}
 
 What it costs, and why that is a decision rather than a bug
 -----------------------------------------------------------
 A bank voice is **not the actor**. Swapping the reference keeps the accent and
-gives up the identity, so this is a casting mode, not a repair: the dub becomes
-"the cast speaks native Amharic" instead of "the actors speak Amharic". It is
-opt-in per run - no configured bank means no change - and every profile it
-produces records ``reference_source="voice_bank"`` and the voice it was cast
-with, so a manifest can never be mistaken for the film path.
+gives up the identity, so a character cast this way is a stand-in, not a repair:
+that character sounds like a native Amharic performer instead of the actor. The
+decision is per character - one actor's unusable audio must not cost the rest of
+the cast their voices - and every profile it produces records
+``reference_source="voice_bank"``, the voice it was cast with and why the film
+could not serve, so a manifest can never be mistaken for the film path.
 
 Everything downstream is untouched. The bank clip becomes the profile's
 reference audio and transcript, exactly as a film window would, so scoring,
@@ -96,7 +99,7 @@ from app.pipeline.voice_profiles import (
     speaker_directory_name,
 )
 
-#: Manifest describing a built bank. Its presence is what switches casting on.
+#: Manifest describing a built bank. Its presence makes the fallback available.
 BANK_MANIFEST_FILENAME = "manifest.json"
 
 #: Attribution written beside a built bank. The corpus is CC BY 4.0, so the
@@ -108,7 +111,7 @@ BANK_CLIP_DIRNAME = "clips"
 
 #: Name of the reference copied into a speaker's profile directory. Deliberately
 #: not ``reference.wav``: that name belongs to the window cut from the film, and
-#: keeping them apart means switching casting off does not overwrite anything.
+#: keeping them apart means removing the fallback does not overwrite anything.
 BANK_REFERENCE_FILENAME = "bank_reference.wav"
 
 #: Bumped when the manifest layout changes in a way a reader has to know about.
@@ -419,10 +422,12 @@ def load_voice_bank(
 ) -> VoiceBank | None:
     """Return the bank in ``directory``, or ``None`` when there is no manifest.
 
-    A missing bank is not an error: casting is opt-in, and an installation that
-    never built one runs exactly as before. A bank that *is* present but broken is
-    an error, because silently falling back to the film reference would produce a
-    different dub from the one the operator asked for.
+    A missing bank is not an error: the film's own actor references are the
+    primary identity source, and a run where every character has a usable one
+    completes identically with or without a bank. A bank that *is* present but
+    broken is still an error, because a run may depend on it for a character the
+    film cannot serve, and a silent, half-cast dub would be worse than a failure
+    that names the broken manifest.
     """
 
     if directory is None:
@@ -493,6 +498,34 @@ def _parse_mapping(mapping: str) -> dict[str, str]:
     return chosen
 
 
+def _normalise_mapping(mapping: str | Mapping[str, str]) -> dict[str, str]:
+    """Return an explicit ``{speaker: voice_id}`` mapping from either accepted form.
+
+    The environment supplies ``SPEAKER_00=voice-id,...`` while callers that have
+    already filtered a mapping - the orchestrator casts only the characters that
+    need a fallback - pass the dictionary they filtered. Both mean the same thing,
+    so both are validated by one path.
+    """
+
+    if isinstance(mapping, str):
+        return _parse_mapping(mapping)
+    if not isinstance(mapping, Mapping):
+        raise CastingError(
+            f"a voice mapping must be a string or a mapping, got {type(mapping).__name__}"
+        )
+
+    chosen: dict[str, str] = {}
+    for speaker, voice_id in mapping.items():
+        if not isinstance(speaker, str) or not speaker.strip():
+            raise CastingError("a mapping needs a non-empty speaker id")
+        if not isinstance(voice_id, str) or not voice_id.strip():
+            raise CastingError(
+                f"the mapping for {speaker!r} needs a non-empty voice id"
+            )
+        chosen[speaker.strip()] = voice_id.strip()
+    return chosen
+
+
 def _pitch_distance(voice: BankVoice, request: VoiceRequest) -> float:
     """Return how far a voice's measured pitch is from a character's, in Hz.
 
@@ -510,13 +543,14 @@ def assign_bank_voices(
     requests: Iterable[VoiceRequest],
     bank: VoiceBank,
     *,
-    mapping: str = "",
+    mapping: str | Mapping[str, str] = "",
 ) -> dict[str, BankVoice]:
     """Return the bank voice each character should be cast with.
 
-    ``mapping`` is ``SPEAKER_00=voice-id,SPEAKER_01=other-id`` and wins where it
-    names a speaker, so an operator can put a specific voice on a specific
-    character. Everyone else is served in order from what is left:
+    ``mapping`` is ``SPEAKER_00=voice-id,SPEAKER_01=other-id`` (or an equivalent
+    mapping) and wins where it names a speaker, so an operator can put a specific
+    voice on a specific character. Everyone else is served in order from what is
+    left:
 
     1. an unused voice whose recorded gender matches the character's estimated
        presentation, closest pitch first;
@@ -539,12 +573,12 @@ def assign_bank_voices(
     if not ordered:
         return {}
 
-    explicit = _parse_mapping(mapping)
+    explicit = _normalise_mapping(mapping)
     known = {request.speaker_id for request in ordered}
     strangers = sorted(set(explicit) - known)
     if strangers:
         raise CastingError(
-            "VOICE_BANK_MAP names speaker(s) that are not in this film: "
+            "VOICE_BANK_MAP names speaker(s) that are not being cast in this film: "
             + ", ".join(strangers)
         )
 
@@ -652,49 +686,124 @@ def apply_voice_bank(
     *,
     settings: Settings | None = None,
     bank: VoiceBank | None = None,
+    speaker_ids: Iterable[str] | None = None,
+    requests: Iterable[VoiceRequest] | None = None,
+    reasons: Mapping[str, str] | None = None,
 ) -> dict[str, VoiceProfile]:
-    """Cast each character from the bank instead of the film's own audio.
+    """Give bank voices to the characters the film cannot provide one for.
 
-    Every character is replaced, or none is: a run that quietly kept one speaker
-    on the actor's reference while the rest were cast would be a dub with two
-    accents in it.
+    ``speaker_ids`` names the characters to cast; it defaults to every character
+    in ``profiles``, which is the whole-cast form. The production path passes only
+    the characters whose film audio had no usable reference, so everyone else
+    keeps the actor's own voice. A character that has no film profile at all - no
+    window in the film could even be measured - is still cast, using an unknown
+    presentation unless the caller supplied a measurement.
 
-    The new profile keeps the speaker id and the film window's ``quality_score``
-    - that score describes the window the profile was built from and is not a
-    claim about the bank clip - and records the casting in ``selection_reason``,
-    ``reference_source`` and ``reference_voice_id``. ``clone_prompt_path`` is
-    cleared, because a prompt cached for the film reference does not describe the
-    bank clip.
+    ``requests`` is the same selection expressed as what the film *measured* about
+    each character. The orchestrator uses it for a character whose reference could
+    not be built but whose turns were still measurable: a bank voice matched to the
+    actor's median pitch keeps the character in the same register, which is what
+    makes the swap sound like the same part rather than a different performer.
+    Supplying ``requests`` implies the cast set; ``speaker_ids`` may not be given
+    with it.
+
+    ``reasons`` records why the caller could not keep the actor for each cast
+    character. It is appended to the profile's ``selection_reason`` so the manifest
+    carries the reason the film could not serve, not only the fact that a bank
+    voice was used.
+
+    Each replaced profile keeps the speaker id and, where there was one, the film
+    window's ``quality_score`` - that score describes the window the profile was
+    built from and is not a claim about the bank clip. ``source_vocal_presentation``
+    and ``source_pitch_hz`` are carried across (or taken from ``requests`` when
+    there is no profile) so the actor's measured register survives the swap and a
+    listening note can always be traced back to the film. ``reference_source``,
+    ``reference_voice_id`` and ``selection_reason`` record the casting;
+    ``clone_prompt_path`` is cleared, because a prompt cached for the film
+    reference does not describe the bank clip.
 
     Notes
     -----
     The clip is copied into the speaker's profile directory as
     :data:`BANK_REFERENCE_FILENAME`, so a profile stays self-contained and
     rebuilding the bank cannot silently change a dub that has already been run.
+    The selection is made over the cast characters only: a bank voice is picked
+    once for the characters that need one, not once for the whole film.
 
     Returns
     -------
     dict[str, VoiceProfile]
-        One profile per input speaker, in the input order. When no bank is
-        configured the input profiles are returned unchanged.
+        Every input profile in input order - cast ones replaced, the rest
+        unchanged - plus any requested speaker that had no film profile. When no
+        bank is configured the input profiles are returned unchanged.
     """
 
     resolved = settings if settings is not None else get_settings()
     library = bank if bank is not None else load_voice_bank(settings=resolved)
-    if library is None or not profiles:
+    if library is None:
         return dict(profiles)
 
-    requests = [
-        VoiceRequest(
-            speaker_id=speaker_id,
-            presentation=profile.estimated_vocal_presentation,
-            pitch_hz=profile.estimated_pitch_hz,
+    if requests is not None:
+        if speaker_ids is not None:
+            raise CastingError(
+                "pass either speaker_ids or requests to choose who is cast, not both"
+            )
+        ordered = [request for request in dict.fromkeys(requests)]
+        casting_ids = [request.speaker_id for request in ordered]
+    else:
+        if speaker_ids is None:
+            casting_ids = list(profiles)
+        else:
+            casting_ids = list(dict.fromkeys(speaker_ids))
+            for speaker_id in casting_ids:
+                if not isinstance(speaker_id, str) or not speaker_id.strip():
+                    # An unnamed speaker would create a profile directory nothing can
+                    # address, so it is refused rather than sanitised into a surprise.
+                    raise CastingError(
+                        "a speaker id to cast must be a non-empty string, got "
+                        f"{speaker_id!r}"
+                    )
+        ordered = [
+            VoiceRequest(
+                speaker_id=speaker_id,
+                presentation=(
+                    _measured_source_presentation(profiles[speaker_id])
+                    if speaker_id in profiles
+                    else "unknown"
+                ),
+                pitch_hz=(
+                    _measured_source_pitch(profiles[speaker_id])
+                    if speaker_id in profiles
+                    else None
+                ),
+            )
+            for speaker_id in casting_ids
+        ]
+    if not casting_ids:
+        return dict(profiles)
+
+    requested = set(casting_ids)
+    # What the film measured, when it could measure a character even though it
+    # could not give that character a reference.
+    measured = {request.speaker_id: request for request in ordered}
+
+    # The operator's pin is validated against the whole cast, not just the
+    # characters being cast: a typo must be reported even when that character
+    # happened to keep their film reference this run.
+    explicit = _normalise_mapping(resolved.voice_bank_voice_map)
+    strangers = sorted(set(explicit) - (set(profiles) | requested))
+    if strangers:
+        raise CastingError(
+            "VOICE_BANK_MAP names speaker(s) that are not in this film: "
+            + ", ".join(strangers)
         )
-        for speaker_id, profile in profiles.items()
-    ]
-    casting = assign_bank_voices(
-        requests, library, mapping=resolved.voice_bank_voice_map
-    )
+    mapping = {
+        speaker_id: voice_id
+        for speaker_id, voice_id in explicit.items()
+        if speaker_id in requested
+    }
+
+    casting = assign_bank_voices(ordered, library, mapping=mapping)
 
     base = Path(resolved.voice_profile_dir)
     reused = {
@@ -703,9 +812,11 @@ def apply_voice_bank(
         if sum(1 for other in casting.values() if other.voice_id == voice.voice_id) > 1
     }
 
-    replaced: dict[str, VoiceProfile] = {}
-    for speaker_id, profile in profiles.items():
+    replaced: dict[str, VoiceProfile] = dict(profiles)
+    for speaker_id in casting_ids:
         voice = casting[speaker_id]
+        profile = profiles.get(speaker_id)
+        request = measured[speaker_id]
         directory = base / speaker_directory_name(speaker_id)
         try:
             directory.mkdir(parents=True, exist_ok=True)
@@ -721,6 +832,20 @@ def apply_voice_bank(
         reason = f"voice bank {voice.voice_id} ({voice.describe()}), humans recorded"
         if voice.voice_id in reused:
             reason += "; reused because the bank is smaller than the cast"
+        fallback_reason = ((reasons or {}).get(speaker_id) or "").strip()
+        if fallback_reason:
+            reason += f"; film reference unusable: {fallback_reason}"
+
+        source_presentation = (
+            _measured_source_presentation(profile)
+            if profile is not None
+            else request.presentation
+        )
+        source_pitch = (
+            _measured_source_pitch(profile)
+            if profile is not None
+            else request.pitch_hz
+        )
 
         replaced[speaker_id] = VoiceProfile(
             speaker_id=speaker_id,
@@ -729,15 +854,38 @@ def apply_voice_bank(
             reference_end=duration,
             reference_text=voice.text,
             clone_prompt_path=None,
-            quality_score=profile.quality_score,
+            quality_score=0.0 if profile is None else profile.quality_score,
             selection_reason=reason,
             estimated_vocal_presentation=voice.presentation,
             estimated_pitch_hz=voice.pitch_hz,
+            source_vocal_presentation=source_presentation,
+            source_pitch_hz=source_pitch,
             reference_source="voice_bank",
             reference_voice_id=voice.voice_id,
         )
 
     return replaced
+
+
+def _measured_source_presentation(profile: VoiceProfile) -> str:
+    """Return what the film measured for a character, even on an older profile.
+
+    Profiles written before ``source_*`` existed carry only the estimate, which at
+    that point *was* the film measurement. Returning it keeps the audit trail
+    complete instead of writing "unknown" over a value that was measured.
+    """
+
+    if profile.source_vocal_presentation != "unknown":
+        return profile.source_vocal_presentation
+    return profile.estimated_vocal_presentation
+
+
+def _measured_source_pitch(profile: VoiceProfile) -> float | None:
+    """Return the film's median pitch for a character, even on an older profile."""
+
+    if profile.source_pitch_hz is not None:
+        return profile.source_pitch_hz
+    return profile.estimated_pitch_hz
 
 
 def _write_reference(source: Path, destination: Path) -> float:
@@ -1762,8 +1910,8 @@ def build_voice_bank(
         say(
             "  only "
             + " and ".join(available)
-            + " voices were found in the whole corpus, so every character will be "
-            "cast in one of them"
+            + " voices were found in the whole corpus, so a fallback character may "
+            "be voiced in the other register"
         )
 
     cast = _select_cast(

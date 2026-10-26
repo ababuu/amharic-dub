@@ -330,7 +330,15 @@ def run(source: Path, output_dir: Path, max_lines: int | None) -> int:
             )
         else:
             profiles = voice_profiles.build_voice_profiles(
-                turns, stems.speech, transcript=lines, settings=settings
+                turns,
+                stems.speech,
+                transcript=lines,
+                settings=settings,
+                # Same policy as the production orchestrator: the actor's window has
+                # to be one voice and its transcript has to describe its audio, with a
+                # clean-but-undescribed window as the only step down.
+                require_reference_transcript=True,
+                allow_clean_fallback=True,
             )
             report_profiles(profiles)
 

@@ -57,12 +57,12 @@ Environment variables
                       adaptation. Absent means an empty bible.
 ``VOICE_REFERENCE_MIN_DURATION`` / ``..._TARGET_DURATION`` / ``..._MAX_DURATION``
                       Preferred length of a voice-cloning reference, in seconds.
-``VOICE_BANK_DIR``    A built native-Amharic voice bank. When it holds a
-                      ``manifest.json``, characters are cast from it instead of
-                      cloning the actor's own English reference - the accent
-                      trade-off this project documents. Absent means off.
+``VOICE_BANK_DIR``    A built native-Amharic voice bank, used as the fallback for a
+                      character whose film audio cannot supply a clean reference.
+                      The actor's own reference stays the identity for everyone
+                      else. Absent means no fallback is available.
 ``VOICE_BANK_MAP``    Optional ``SPEAKER_00=voice-id`` list pinning specific bank
-                      voices to specific characters.
+                      voices to specific fallback-cast characters.
 ``TTS_MODEL``         Amharic speech adapter used by the TTS stage.``DIARIZATION_MIN_SPEAKERS`` / ``DIARIZATION_MAX_SPEAKERS``
                       Optional bounds on how many speakers diarization may find.
                       A cast list turns these into the strongest single guard
@@ -308,15 +308,19 @@ DEFAULT_VOICE_SAMPLE_DIR = PROJECT_ROOT / "data" / "voice-samples"
 DEFAULT_VOICE_SAMPLE_MAP = ""
 
 #: Directory holding a built native-Amharic voice bank: a manifest of curated
-#: human recordings plus their canonical clips. A manifest switches on *casting
-#: mode* - each character is given a native speaker's reference instead of the
-#: actor's English one, which removes the cross-lingual accent at its source and
-#: gives up the actor's identity in exchange. It is opt-in: no manifest, no change.
+#: human recordings plus their canonical clips. It is a **fallback**, not a casting
+#: mode: a character keeps the actor's own reference unless the film cannot supply
+#: one that is safe to clone (too little clean speech, only simultaneous speech, or
+#: no window that is one voice). Those characters are given a native speaker's
+#: reference instead, which removes the cross-lingual accent at its source and gives
+#: up the actor's identity for that character only. It is opt-in: no manifest, no
+#: fallback.
 DEFAULT_VOICE_BANK_DIR = PROJECT_ROOT / "data" / "voice-bank"
 
-#: Optional ``SPEAKER_00=voice-id`` list pinning bank voices to characters. The
-#: automatic casting is deterministic and good enough to start with; this exists
-#: for the case where someone has listened and wants a particular voice.
+#: Optional ``SPEAKER_00=voice-id`` list pinning bank voices to characters. It only
+#: applies to characters the bank is actually used for - the ones the film could not
+#: serve - and lets someone who has listened choose a particular voice for one of
+#: them instead of accepting the automatic, pitch-matched pick.
 DEFAULT_VOICE_BANK_VOICE_MAP = ""
 
 #: Amharic speech engine consumed by :mod:`app.pipeline.tts`.
@@ -831,12 +835,14 @@ class Settings:
     voice_reference_min_duration: float = DEFAULT_VOICE_REFERENCE_MIN_DURATION
     voice_reference_target_duration: float = DEFAULT_VOICE_REFERENCE_TARGET_DURATION
     voice_reference_max_duration: float = DEFAULT_VOICE_REFERENCE_MAX_DURATION
-    #: Directory of native-speaker recordings used instead of the film's own audio, and
-    #: an optional ``SPEAKER=file`` list saying which voice each speaker gets.
+    #: Operator recordings used to build the fallback bank (``--cast-from-bank``), and
+    #: an optional ``SPEAKER=file`` list. Never used as a cloning reference directly.
     voice_sample_dir: Path = DEFAULT_VOICE_SAMPLE_DIR
     voice_sample_map: str = DEFAULT_VOICE_SAMPLE_MAP
     #: Built native-Amharic voice bank, and an optional ``SPEAKER=voice-id`` list
-    #: pinning specific voices. A manifest in this directory switches casting on.
+    #: pinning specific voices. A manifest in this directory makes the fallback
+    #: available; it is used only for a character the film cannot supply a reference
+    #: for.
     voice_bank_dir: Path = DEFAULT_VOICE_BANK_DIR
     voice_bank_voice_map: str = DEFAULT_VOICE_BANK_VOICE_MAP
     #: Persistent character/consistency state handed to dialogue adaptation.

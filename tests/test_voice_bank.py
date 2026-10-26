@@ -436,6 +436,174 @@ def test_applying_without_a_bank_changes_nothing(tmp_path) -> None:
     assert replaced["SPEAKER_00"].reference_source == "film"
 
 
+def test_apply_casts_only_the_named_characters(tmp_path) -> None:
+    """A fallback is per character: the actor keeps their voice when theirs is usable."""
+
+    settings = _settings(tmp_path)
+    bank = VoiceBank(
+        directory=tmp_path / "bank",
+        voices=(_bank_voice("am-m-one", gender="male", pitch=118.0, root=tmp_path),),
+    )
+    profiles = {
+        "SPEAKER_00": _profile(tmp_path, "SPEAKER_00"),
+        "SPEAKER_01": _profile(tmp_path, "SPEAKER_01"),
+    }
+
+    replaced = apply_voice_bank(
+        profiles, settings=settings, bank=bank, speaker_ids=["SPEAKER_01"]
+    )
+
+    assert replaced["SPEAKER_00"] == profiles["SPEAKER_00"]
+    assert replaced["SPEAKER_00"].reference_source == "film"
+    assert replaced["SPEAKER_01"].reference_source == "voice_bank"
+    assert replaced["SPEAKER_01"].reference_voice_id == "am-m-one"
+    assert set(replaced) == {"SPEAKER_00", "SPEAKER_01"}
+
+
+def test_a_casted_character_with_no_film_profile_is_still_returned(tmp_path) -> None:
+    """The character the bank exists for may have no measurable film window at all."""
+
+    settings = _settings(tmp_path)
+    bank = VoiceBank(
+        directory=tmp_path / "bank",
+        voices=(_bank_voice("am-f-one", gender="female", pitch=210.0, root=tmp_path),),
+    )
+
+    replaced = apply_voice_bank(
+        {}, settings=settings, bank=bank, speaker_ids=["SPEAKER_07"]
+    )
+
+    profile = replaced["SPEAKER_07"]
+    assert profile.reference_source == "voice_bank"
+    assert profile.reference_voice_id == "am-f-one"
+    assert profile.quality_score == 0.0
+    assert profile.source_vocal_presentation == "unknown"
+    assert profile.source_pitch_hz is None
+    assert profile.reference_audio.name == BANK_REFERENCE_FILENAME
+
+
+def test_measured_requests_cast_a_character_without_a_profile(tmp_path) -> None:
+    """A measurable actor keeps their register even when no reference could be built."""
+
+    settings = _settings(tmp_path)
+    bank = VoiceBank(
+        directory=tmp_path / "bank",
+        voices=(
+            _bank_voice("am-m-one", gender="male", pitch=118.0, root=tmp_path),
+            _bank_voice("am-f-one", gender="female", pitch=212.0, root=tmp_path),
+        ),
+    )
+
+    replaced = apply_voice_bank(
+        {},
+        settings=settings,
+        bank=bank,
+        requests=[VoiceRequest("SPEAKER_02", "feminine", 214.0)],
+    )
+
+    profile = replaced["SPEAKER_02"]
+    assert profile.reference_voice_id == "am-f-one"
+    assert profile.source_vocal_presentation == "feminine"
+    assert profile.source_pitch_hz == 214.0
+
+
+def test_a_cast_selection_cannot_be_given_twice(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    bank = VoiceBank(
+        directory=tmp_path / "bank",
+        voices=(_bank_voice("am-m-one", gender="male", pitch=118.0, root=tmp_path),),
+    )
+
+    with pytest.raises(CastingError):
+        apply_voice_bank(
+            {},
+            settings=settings,
+            bank=bank,
+            speaker_ids=["SPEAKER_02"],
+            requests=[VoiceRequest("SPEAKER_02")],
+        )
+
+
+def test_casting_keeps_the_actors_measured_register_for_audit(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    bank = VoiceBank(
+        directory=tmp_path / "bank",
+        voices=(_bank_voice("am-f-one", gender="female", pitch=210.0, root=tmp_path),),
+    )
+    profiles = {
+        "SPEAKER_00": _profile(
+            tmp_path,
+            "SPEAKER_00",
+            estimated_vocal_presentation="masculine",
+            estimated_pitch_hz=118.0,
+            source_vocal_presentation="masculine",
+            source_pitch_hz=116.0,
+        )
+    }
+
+    replaced = apply_voice_bank(profiles, settings=settings, bank=bank)
+
+    profile = replaced["SPEAKER_00"]
+    assert profile.estimated_vocal_presentation == "feminine"
+    assert profile.estimated_pitch_hz == 210.0
+    # What the film contained, not what the character now sounds like.
+    assert profile.source_vocal_presentation == "masculine"
+    assert profile.source_pitch_hz == 116.0
+
+
+def test_an_older_profile_without_source_register_keeps_its_estimate(tmp_path) -> None:
+    """A profile written before ``source_*`` existed still has a usable audit value."""
+
+    settings = _settings(tmp_path)
+    bank = VoiceBank(
+        directory=tmp_path / "bank",
+        voices=(_bank_voice("am-f-one", gender="female", pitch=210.0, root=tmp_path),),
+    )
+    profiles = {
+        "SPEAKER_00": _profile(
+            tmp_path,
+            "SPEAKER_00",
+            estimated_vocal_presentation="masculine",
+            estimated_pitch_hz=118.0,
+        )
+    }
+
+    replaced = apply_voice_bank(profiles, settings=settings, bank=bank)
+
+    assert replaced["SPEAKER_00"].source_vocal_presentation == "masculine"
+    assert replaced["SPEAKER_00"].source_pitch_hz == 118.0
+
+
+def test_casting_refuses_an_unnamed_speaker(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    bank = VoiceBank(
+        directory=tmp_path / "bank",
+        voices=(_bank_voice("am-m-one", gender="male", pitch=118.0, root=tmp_path),),
+    )
+
+    with pytest.raises(CastingError):
+        apply_voice_bank({}, settings=settings, bank=bank, speaker_ids=["   "])
+
+
+def test_an_operator_pin_is_validated_against_the_whole_film(tmp_path) -> None:
+    """A typo must be reported even when that character kept their film reference."""
+
+    settings = _settings(tmp_path, voice_bank_voice_map="SPEAKER_09=am-m-one")
+    bank = VoiceBank(
+        directory=tmp_path / "bank",
+        voices=(_bank_voice("am-m-one", gender="male", pitch=118.0, root=tmp_path),),
+    )
+    profiles = {
+        "SPEAKER_00": _profile(tmp_path, "SPEAKER_00"),
+        "SPEAKER_01": _profile(tmp_path, "SPEAKER_01"),
+    }
+
+    with pytest.raises(CastingError, match="SPEAKER_09"):
+        apply_voice_bank(
+            profiles, settings=settings, bank=bank, speaker_ids=["SPEAKER_01"]
+        )
+
+
 def test_the_operator_mapping_is_honoured_when_applying(tmp_path) -> None:
     settings = _settings(
         tmp_path, voice_bank_voice_map="SPEAKER_00=am-f-one"
@@ -605,7 +773,7 @@ def test_a_corpus_with_one_gender_says_so(tmp_path) -> None:
     )
 
     assert {voice.gender for voice in bank} == {"male"}
-    assert any("one of them" in line for line in lines)
+    assert any("other register" in line for line in lines)
 
 
 def test_building_fails_when_nothing_qualifies(tmp_path) -> None:

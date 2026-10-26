@@ -251,15 +251,28 @@ voice-conversion source speech from a target-voice reference and describes a tim
 mode. It does not establish Amharic dubbing quality, so it is not added as an unverified
 extra model or processing stage.
 
-### Native voice bank (casting mode, `voice_bank.py`)
+The pipeline's answer is to keep the actor wherever their audio can supply a safe
+reference, and to fall back to a native speaker only for a character whose film audio
+cannot - see the bank below.
 
-The accent trade-off above has a switch, and it is worth being explicit about what it
-costs, because it is not a repair: it is a second **casting mode**.
+### Native voice bank (fallback casting, `voice_bank.py`)
+
+The accent trade-off above has a fallback, and it is worth being explicit about what it
+costs, because it is not a repair: it is a per-character **stand-in**.
+
+The actor is the voice identity. A character keeps their own reference whenever the film
+can supply one that is safe to clone: at least four seconds of continuous speech that is
+one voice, with no simultaneous speech or overlap with another character, and with an
+exact transcript (or, failing that, clean audio the engine can transcribe itself). A
+voice-cloning prompt cut from anything less is how a second speaker, a music bed or a
+fragment of the English prompt leaks into the Amharic line. The bank is consulted only
+for a character for whom nothing in the film meets that bar - and then that character,
+not the whole cast, is cast from it.
 
 ```bash
 python scripts/build_voice_bank.py          # writes data/voice-bank, ~4 MB
 VOICE_BANK_DIR=data/voice-bank              # already the default; delete the
-                                            # manifest to switch casting off
+                                            # manifest to remove the fallback
 ```
 
 **Or build from your own recordings** instead of a public corpus, which needs no network
@@ -288,17 +301,28 @@ explanation instead.
 A bank is a build artifact and is not committed, so a fresh checkout has none. On the
 command line, `--cast-from-bank` builds one before the run if the bank directory is
 empty — **from `VOICE_SAMPLE_DIR` when that holds recording/transcript pairs**, and only
-from the public corpus when it does not:
+from the public corpus when it does not. The flag makes the bank *available*; it does not
+force it onto characters whose own film reference is usable.
 
-With a bank present, each character is given a human Amharic recording as its cloning
-reference instead of a window cut from the film. The reference audio, its transcript and
-the line are then all Amharic, which removes the cross-lingual mismatch at its source
-rather than hoping the model ignores it. **The actor's identity is gone** - the dub now
-reads as "the cast speaks native Amharic", not "these actors speak Amharic" - and every
+For a character the film cannot serve, the bank recording becomes that character's
+cloning reference instead of a window cut from the film. The reference audio, its
+transcript and the line are then all Amharic, which removes the cross-lingual mismatch at
+its source rather than hoping the model ignores it. **That character's actor identity is
+gone** - they read as a native Amharic performer rather than the original actor - and the
 profile says so in `reference_source="voice_bank"` and `reference_voice_id`. The run
-reports each casting decision, so an accent fix can never be mistaken for an identity
-preserved. Reverting is deleting `manifest.json`; nothing else changes, and no earlier
-run is affected.
+reports each fallback decision with the reason the film could not serve, so a fallback can
+never be mistaken for an identity preserved, and every other character's profile still
+says `reference_source="film"`. A character with no usable reference and no bank is a
+failure that names the character and says how to fix it; cloning the bad window is never
+an option.
+
+The fallback is chosen to keep the part recognizable: the character's estimated vocal
+presentation and measured median pitch - aggregated over every turn they speak, before
+the reference was rejected - pick the closest unused bank voice. So a low-pitched part
+gets a low-pitched voice, and a character whose actor could be measured stays in the same
+register even when their audio could not supply a prompt. When the bank has no unused
+voice in that register the run says so instead of hiding an audible mismatch. Reverting
+is deleting `manifest.json`; nothing else changes, and no earlier run is affected.
 
 The bank is built from `snapwre/amharic-speech` - human recordings with the Common Voice
 schema, **CC BY 4.0**, 13.8k clips from 360 speakers with self-reported gender, age band,
@@ -317,11 +341,12 @@ no model. `scripts/build_voice_bank.py --help` exposes the filters; the defaults
 | transcript | 20-160 chars, no Latin, no numerals | a Fidel-only prompt keeps the text front-end in the same script as the audio |
 | text/audio fit | 3.0-9.0 syllables per second | catches a mismatched transcript, which is the one defect that makes a clone echo |
 
-Casting is deterministic: characters are served in film order, an unused voice of the
-character's **estimated** vocal presentation is preferred, pitch picks the closest of
-those, ties break on voice id, and one voice is never reused while an unused one
-remains. `VOICE_BANK_MAP=SPEAKER_00=am-f-3fa508df52` overrides it for a character after
-listening. A bank smaller than the cast is reported, not silently duplicated.
+Casting is deterministic: fallback characters are served in film order, an unused voice
+of the character's **estimated** vocal presentation is preferred, pitch picks the closest
+of those, ties break on voice id, and one voice is never reused while an unused one
+remains. `VOICE_BANK_MAP=SPEAKER_00=am-f-3fa508df52` pins a voice for a fallback character
+after listening. A bank smaller than the fallback cast is reported, not silently
+duplicated.
 
 **What the filters cannot hear.** An energy VAD cannot tell a clean studio clip from a
 clip with a fan in the room, a cold read from an expressive one, or a good microphone
@@ -415,7 +440,7 @@ amharic-dub/
       transcription.py        # faster-whisper large-v3 transcription + sentence assembly (implemented)
       translation.py          # Amharic dialogue adaptation (backend-selecting) (implemented)
       voice_profiles.py       # per-speaker voice references + clone-prompt cache (implemented)
-      voice_bank.py           # native-Amharic reference bank + casting (implemented)
+      voice_bank.py           # native-Amharic fallback reference bank (implemented)
       nllb.py                 # local NLLB-200 translation (default backend) (implemented)
       dialogue_context.py     # scenes, character bible, syllable budget (implemented)
       amharic_text.py         # Ethiopic syllables + homophone folding (implemented)
@@ -500,8 +525,8 @@ environment, so values configured on the RunPod pod always win.
 | `VOICE_REFERENCE_MIN_DURATION` | Shortest usable voice-cloning reference  | `4.0`              |
 | `VOICE_REFERENCE_TARGET_DURATION` | Preferred reference length            | `5.0`              |
 | `VOICE_REFERENCE_MAX_DURATION` | Longest reference kept (a longer continuous turn is scanned with a sliding window) | `10.0` |
-| `VOICE_BANK_DIR` | A built native-Amharic voice bank; a `manifest.json` here switches on casting (see [Native voice bank](#native-voice-bank-casting-mode-voice_bankpy)) | `data/voice-bank` |
-| `VOICE_BANK_MAP` | `SPEAKER_00=voice-id` list pinning bank voices to characters | empty |
+| `VOICE_BANK_DIR` | A built native-Amharic voice bank, used only as the fallback for a character whose film audio cannot supply a clean reference (see [Native voice bank](#native-voice-bank-fallback-casting-voice_bankpy)) | `data/voice-bank` |
+| `VOICE_BANK_MAP` | `SPEAKER_00=voice-id` list pinning bank voices to fallback-cast characters | empty |
 | `DIALOGUE_BIBLE_PATH` | Persistent character/consistency state for adaptation (see [Cinematic dialogue adaptation](#cinematic-dialogue-adaptation-dialogue_contextpy)) | `$WORK_DIR/dialogue_bible.json` |
 | `TTS_MODEL` | The single-voice engine's checkpoint, used when `TTS_ENGINE=mms` | `facebook/mms-tts-amh` |
 | `TTS_MAX_PAUSE_SECONDS` | Longest pause rendered around a synthesized line | `2.0` |
@@ -539,7 +564,7 @@ default resolved against the project root.
 | Required only for the hosted API | `GEMINI_API_KEY` (default provider) or `DEEPSEEK_API_KEY` | Needed only under `TRANSLATION_BACKEND=openai`. A local OpenAI-compatible server needs no key of its own, and the `nllb` backend reads none at all |
 | Required on a Pod | `HF_HOME` | Defaults to the container's `~/.cache/huggingface`, which is lost when the Pod stops |
 | Worth setting | `MODEL_CACHE_DIR`, `DIALOGUE_BIBLE_PATH` | The first defaults under the project root, so it follows the repository onto the volume. The bible is per-film consistency state worth keeping between runs |
-| Opt-in | `VOICE_BANK_DIR`, `VOICE_BANK_MAP` | Casting mode. Off while the directory holds no `manifest.json`, so the default is the actor-reference run |
+| Opt-in | `VOICE_BANK_DIR`, `VOICE_BANK_MAP` | Fallback casting. No `manifest.json` means no fallback is available; the actor-reference run is the default either way |
 | Everything else | e.g. `TRANSCRIPTION_MODEL`, `TIMING_MAX_TEMPO`, `MIX_DUCK_DB` | Set only to change behaviour |
 
 Which credentials are *required* follows the configuration, and both
@@ -1435,11 +1460,12 @@ pytest tests/test_config.py
 - [ ] Removed engines: `chatterbox` + Seed-VC V2 were dropped as unused; restore only
       if a measured comparison shows OmniVoice's Amharic is not good enough
 - [x] Peak limiting so a clip is attenuated, never silently truncated
-- [x] `voice_bank`: opt-in casting from a native-Amharic reference bank, so the
-      accent can be fixed at the cost of the actor's identity; and no A/B between
-      the two modes has been run yet
-- [ ] A listening A/B of casting vs. the actor reference on the real test clip,
-      to decide whether the accent gain is worth the identity loss
+- [x] `voice_bank`: a native-Amharic fallback cast for a character whose film
+      audio cannot supply one clean voice, so the accent is fixed only where the
+      actor's identity cannot be cloned; no A/B between a fallback cast and a
+      rejected reference has been run yet
+- [ ] A listening A/B of a fallback-cast character against the best film window
+      that was rejected, to check the fallback is the better of the two
 - [ ] Record a scored baseline on real material with the new engines
 - [ ] Per-stage resume, so a long run continues instead of restarting
 - [ ] Mix realism: ambience continuity, dialogue EQ/reverb match, EBU R128

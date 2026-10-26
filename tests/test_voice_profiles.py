@@ -1785,6 +1785,166 @@ def test_production_reference_rejects_missing_matching_transcript(
         )
 
 
+def test_a_clean_undescribed_window_is_the_allowed_step_down(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """The actor's own clean audio stays usable when no line describes it.
+
+    The engine transcribes that window itself, so the prompt's text and audio stay
+    aligned; that is different from sending text that covers only part of the audio.
+    """
+
+    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD)])
+
+    profile = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", 10.0, 20.0)],
+        stem,
+        # A line for another character cannot describe this window.
+        transcript=[TranscriptSegment("SPEAKER_01", 10.5, 14.0, "not mine")],
+        settings=_settings(tmp_path),
+        require_reference_transcript=True,
+        allow_clean_fallback=True,
+    )["SPEAKER_00"]
+
+    assert profile.reference_source == "film"
+    assert profile.reference_text is None
+    assert "no transcript describes this window" in profile.selection_reason
+
+
+def test_the_clean_fallback_never_accepts_a_two_voice_window(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """A step down to no transcript is allowed; a step down to two speakers is not."""
+
+    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD)])
+    crosstalk = [CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 10.0, 20.0)]
+
+    with pytest.raises(NoUsableReferenceError):
+        build_voice_profiles(
+            [SpeakerSegment("SPEAKER_00", 10.0, 20.0)],
+            stem,
+            crosstalk=crosstalk,
+            settings=_settings(tmp_path),
+            require_reference_transcript=True,
+            allow_clean_fallback=True,
+        )
+
+
+def test_an_unusable_speaker_is_reported_without_losing_the_others(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """One character's unusable audio must not cost the rest of the cast a profile."""
+
+    stem = _write_stem(
+        tmp_path / "speech.wav", [(10.0, 20.0, SILENCE), (30.0, 40.0, LOUD)]
+    )
+    reported: list[tuple[str, NoUsableReferenceError]] = []
+
+    profiles = build_voice_profiles(
+        [
+            SpeakerSegment("SPEAKER_00", 10.0, 20.0),
+            SpeakerSegment("SPEAKER_01", 30.0, 40.0),
+        ],
+        stem,
+        settings=_settings(tmp_path),
+        require_reference_transcript=True,
+        allow_clean_fallback=True,
+        on_unusable=lambda speaker_id, error: reported.append((speaker_id, error)),
+    )
+
+    assert [speaker_id for speaker_id, _error in reported] == ["SPEAKER_00"]
+    assert "no speech was detected" in str(reported[0][1])
+    assert set(profiles) == {"SPEAKER_01"}
+    assert profiles["SPEAKER_01"].reference_source == "film"
+    # Nothing was written for the speaker that had no usable audio.
+    assert not (tmp_path / "voices" / "SPEAKER_00").exists()
+
+
+def test_without_a_handler_an_unusable_speaker_still_fails_the_build(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """Omitting the callback keeps the strict, fail-fast contract."""
+
+    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, SILENCE)])
+
+    with pytest.raises(NoUsableReferenceError, match="SPEAKER_00"):
+        build_voice_profiles(
+            [SpeakerSegment("SPEAKER_00", 10.0, 20.0)],
+            stem,
+            settings=_settings(tmp_path),
+            require_reference_transcript=True,
+            allow_clean_fallback=True,
+        )
+
+
+def test_a_fallback_decision_and_the_film_identity_coexist(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """The real selection and the real bank agree on who is cast and who is not."""
+
+    from app.pipeline.voice_bank import (
+        BankVoice,
+        VoiceBank,
+        VoiceRequest,
+        apply_voice_bank,
+    )
+
+    stem = _write_stem(
+        tmp_path / "speech.wav", [(10.0, 20.0, SILENCE), (30.0, 40.0, LOUD)]
+    )
+    reported: list[tuple[str, NoUsableReferenceError]] = []
+    profiles = build_voice_profiles(
+        [
+            SpeakerSegment("SPEAKER_00", 10.0, 20.0),
+            SpeakerSegment("SPEAKER_01", 30.0, 40.0),
+        ],
+        stem,
+        settings=_settings(tmp_path),
+        require_reference_transcript=True,
+        allow_clean_fallback=True,
+        on_unusable=lambda speaker_id, error: reported.append((speaker_id, error)),
+    )
+    assert set(profiles) == {"SPEAKER_01"}
+
+    clip = tmp_path / "bank" / "am-m-one.wav"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    time = np.arange(int(round(6.0 * REFERENCE_RATE))) / REFERENCE_RATE
+    sf.write(
+        str(clip),
+        (0.2 * np.sin(2.0 * np.pi * 120.0 * time)).astype(np.float32),
+        REFERENCE_RATE,
+        subtype="PCM_16",
+    )
+    bank = VoiceBank(
+        directory=tmp_path / "bank",
+        voices=(
+            BankVoice(
+                voice_id="am-m-one",
+                audio=clip,
+                text="ዛሬ ጠዋት አዲስ አበባ ውስጥ በጣም ቀዝቃዛ አየር ነበር",
+                duration=6.0,
+                gender="male",
+                presentation="masculine",
+                pitch_hz=118.0,
+            ),
+        ),
+    )
+
+    cast = apply_voice_bank(
+        profiles,
+        settings=_settings(tmp_path),
+        bank=bank,
+        requests=[VoiceRequest("SPEAKER_00")],
+        reasons={"SPEAKER_00": str(reported[0][1])},
+    )
+
+    assert cast["SPEAKER_01"] == profiles["SPEAKER_01"]
+    assert cast["SPEAKER_01"].reference_source == "film"
+    assert cast["SPEAKER_00"].reference_source == "voice_bank"
+    assert cast["SPEAKER_00"].reference_voice_id == "am-m-one"
+    assert "film reference unusable" in cast["SPEAKER_00"].selection_reason
+
+
 def test_vocal_presentation_is_a_tentative_pitch_estimate(tmp_path: Path) -> None:
     sample_rate = 24_000
     seconds = 1.0

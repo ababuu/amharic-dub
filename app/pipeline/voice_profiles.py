@@ -73,6 +73,28 @@ The component scores eligible windows and keeps the best one:
   deterministically by the earliest window, so the same input always selects the
   same reference.
 
+Production policy, and what "unusable" means
+--------------------------------------------
+The orchestrator asks for the strictest tier (``require_reference_transcript``)
+and allows one safe step down (``allow_clean_fallback``):
+
+1. **clean and described exactly** - the actor's voice, and a prompt whose text
+   accounts for every sample sent. Nothing can be spoken that was not written.
+2. **clean but undescribed** - the actor's voice, with no transcript sent. The
+   engine preprocesses the audio and transcribes *that* audio itself, so audio and
+   text stay aligned; this is the documented no-transcript contract in
+   :mod:`app.pipeline.tts`.
+3. **anything else is unusable** - a window holding simultaneous speech, any
+   overlap with another speaker, no continuous speech of the minimum length, or
+   only steady material with no dialogue. A contaminated prompt is a recording of
+   two people, and no scoring trade can make it safe for cloning.
+
+A speaker nothing in tier 1 or 2 can serve is *reported*, not quietly cloned from
+a bad window: pass ``on_unusable`` to keep building the other characters and let
+the caller give that character a fallback voice, or omit it to fail the run. The
+decision is per character on purpose - one actor's audio cannot lend another
+character a voice.
+
 Speaker ids and the filesystem
 ------------------------------
 ``speaker_id`` is preserved exactly as diarization reported it - in the profile
@@ -320,6 +342,14 @@ class ClonePromptError(VoiceProfileError):
 
 class ProfilePersistenceError(VoiceProfileError):
     """A voice profile could not be written to or read from disk."""
+
+
+#: Called for a speaker whose reference cannot be built, when the caller asked to
+#: keep going instead of failing the run. Receives the speaker id and the error
+#: that explains why the film supplied nothing safe to clone. A handler is how a
+#: caller gives *that* character a fallback voice without accepting a worse
+#: reference for anyone else.
+UnusableSpeakerHandler = Callable[[str, NoUsableReferenceError], None]
 
 
 def _finite_number(name: str, value: object, error: type[Exception]) -> float:
@@ -1835,6 +1865,8 @@ def build_voice_profiles(
     settings: Settings | None = None,
     clone_encoder: ClonePromptEncoder | None = None,
     require_reference_transcript: bool = False,
+    allow_clean_fallback: bool = False,
+    on_unusable: UnusableSpeakerHandler | None = None,
     registers: Mapping[str, SpeakerRegister] | None = None,
 ) -> dict[str, VoiceProfile]:
     """Build one voice identity per diarized speaker.
@@ -1874,6 +1906,19 @@ def build_voice_profiles(
         exact transcript and contain no diarized crosstalk or other-speaker
         overlap. The production Amharic voice-cloning path enables this so the
         model receives a valid voice-cloning prompt rather than mismatched text.
+    allow_clean_fallback:
+        Only meaningful with ``require_reference_transcript``. When no clean,
+        exactly-described window exists, accept a clean window no transcript
+        describes instead. That is still the actor's own voice, and the engine
+        transcribes the prompt itself, so audio and text remain aligned; it is a
+        step down from an exact transcript, not a step down from a clean window.
+        A window holding simultaneous speech or overlapping another speaker is
+        still rejected, because it is not one voice.
+    on_unusable:
+        Called with a speaker's id and the reason when that speaker has no usable
+        reference. Supplying it continues with the other speakers instead of
+        raising; omitting it keeps the strict, fail-fast contract. The callback
+        never receives a speaker whose profile *was* built.
 
     Returns
     -------
@@ -1895,7 +1940,8 @@ def build_voice_profiles(
         The dialogue stem could not be measured.
     NoUsableReferenceError
         A speaker has no clean, long enough continuous speech. A reference from
-        another speaker is never substituted.
+        another speaker is never substituted. With ``on_unusable`` supplied the
+        speaker is reported to it and skipped instead of raising.
     ReferenceExtractionError, ReferencePreprocessingError
         FFmpeg failed, or produced audio in the wrong format.
     ClonePromptError
@@ -1958,17 +2004,44 @@ def build_voice_profiles(
                     )
                 )
             ]
+            if not usable and require_reference_transcript and allow_clean_fallback:
+                # The actor's own clean audio is still a usable prompt without an
+                # exact transcript: the engine transcribes the prompt it is given,
+                # so text and audio stay aligned. What is *not* negotiable is one
+                # voice - a window containing crosstalk or another speaker is a
+                # recording of two people, whatever its score.
+                usable = [
+                    item
+                    for item in candidates
+                    if item.is_usable(minimum)
+                    and not item.contaminated
+                    and item.overlap_seconds <= TIMESTAMP_TOLERANCE
+                ]
             if not usable:
                 if require_reference_transcript and any(
                     item.is_usable(minimum) for item in candidates
                 ):
-                    raise NoUsableReferenceError(
-                        f"no clean, transcript-matched voice reference for speaker "
-                        f"{speaker_id!r}: the Amharic voice-cloning path requires at "
-                        f"least {minimum:.2f}s of speech with an exact transcript and "
-                        "no overlapping speaker"
-                    )
-                raise _no_usable_reference(speaker_id, candidates, minimum=minimum)
+                    if allow_clean_fallback:
+                        error = NoUsableReferenceError(
+                            f"no clean voice reference for speaker {speaker_id!r}: "
+                            f"every window holding at least {minimum:.2f}s of speech "
+                            "also contains simultaneous speech or overlaps another "
+                            "speaker, and a reference holding two voices teaches the "
+                            "clone both of them"
+                        )
+                    else:
+                        error = NoUsableReferenceError(
+                            f"no clean, transcript-matched voice reference for speaker "
+                            f"{speaker_id!r}: the Amharic voice-cloning path requires at "
+                            f"least {minimum:.2f}s of speech with an exact transcript and "
+                            "no overlapping speaker"
+                        )
+                else:
+                    error = _no_usable_reference(speaker_id, candidates, minimum=minimum)
+                if on_unusable is None:
+                    raise error
+                on_unusable(speaker_id, error)
+                continue
 
             # Reference quality is a matter of what the window *is*, not of a weighted
             # score that can trade one defect for another. Four kinds of window exist,
@@ -2345,6 +2418,7 @@ __all__ = [
     "ReferencePreprocessingError",
     "SpeakerSegment",
     "TranscriptSegment",
+    "UnusableSpeakerHandler",
     "VoiceProfile",
     "VoiceProfileError",
     "build_voice_profiles",
