@@ -30,6 +30,10 @@ dependencies = [
   "audioread",
   # pyannote Community-1 - speaker diarization.
   "pyannote.audio==4.0.7",
+  # pyannote's speech-separation pipeline uses a SpeechBrain ECAPA embedding model,
+  # and the optional SpeechBrain SepFormer backend needs the package directly. It is
+  # only exercised when CROSSTALK_SEPARATION is enabled.
+  "speechbrain>=1.0,<2.0",
   # faster-whisper large-v3 - transcription (CTranslate2 backend).
   "faster-whisper",
   # huggingface_hub fetches the OmniVoice checkpoint and the Amharic fine-tune.

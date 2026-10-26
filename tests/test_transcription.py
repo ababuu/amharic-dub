@@ -1,4 +1,4 @@
-"""Tests for :mod:`app.pipeline.transcription`.
+﻿"""Tests for :mod:`app.pipeline.transcription`.
 
 ``faster_whisper`` is never imported or executed here: the model class and the
 audio decoder are replaced by in-memory fakes. The tests therefore need no
@@ -20,7 +20,7 @@ from app.config import (
     DEFAULT_TRANSCRIPTION_MODEL,
     Settings,
 )
-from app.pipeline import transcription
+from app.pipeline import target_extraction, transcription
 from app.pipeline.diarization import SpeakerSegment
 from app.pipeline.transcription import (
     AudioDecodeError,
@@ -34,6 +34,7 @@ from app.pipeline.transcription import (
     TranscriptionInferenceError,
     UnsupportedOutputError,
     transcribe,
+    transcribe_detailed,
 )
 
 
@@ -175,6 +176,9 @@ def _settings(
     language: str | None = None,
     model: str = DEFAULT_TRANSCRIPTION_MODEL,
     compute_type: str = DEFAULT_TRANSCRIPTION_COMPUTE_TYPE,
+    crosstalk_separation: bool = False,
+    huggingface_token: str | None = None,
+    separation_context_seconds: float = 1.0,
 ) -> Settings:
     return Settings(
         input_dir=tmp_path / "input",
@@ -185,6 +189,9 @@ def _settings(
         transcription_model=model,
         transcription_compute_type=compute_type,
         transcription_language=language,
+        huggingface_token=huggingface_token,
+        crosstalk_separation=crosstalk_separation,
+        crosstalk_separation_context_seconds=separation_context_seconds,
     )
 
 
@@ -1440,3 +1447,276 @@ def test_an_unmeasurable_recovered_stretch_is_refused(monkeypatch, tmp_path):
     )
 
     assert [segment.speaker_id for segment in segments] == ["SPEAKER_00"]
+
+
+# ---------------------------------------------------------------------------
+# Target-speaker extraction for the region the exclusive view dropped
+# ---------------------------------------------------------------------------
+
+
+class _FakeSeparator:
+    """Blind separator stand-in: one harmonic tone per configured frequency."""
+
+    backend = "fake"
+    model = "fake/separator"
+    sample_rate = transcription.SAMPLE_RATE
+
+    def __init__(self, frequencies, *, error=None):
+        self.frequencies = frequencies
+        self.error = error
+        self.calls = []
+
+    def separate(self, samples, num_speakers):
+        self.calls.append((len(samples), num_speakers))
+        if self.error is not None:
+            raise self.error
+        sources = []
+        for frequency in self.frequencies:
+            if frequency is None:
+                sources.append(np.zeros(len(samples), dtype=np.float32))
+            else:
+                sources.append(_tone(len(samples) / transcription.SAMPLE_RATE, frequency))
+        return sources
+
+
+def _kept_and_crosstalk():
+    return dict(
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_01", 12.2, 12.9),
+        ],
+        registers={"SPEAKER_00": 200.0, "SPEAKER_01": 110.0},
+    )
+
+
+def test_the_disabled_stage_never_separates_and_keeps_refusing(
+    monkeypatch, tmp_path
+):
+    """Off by default: the run must behave exactly as it did before this stage."""
+
+    _patch(monkeypatch)
+    # The mixture measures as the kept speaker, so the old path must refuse it.
+    monkeypatch.setattr(
+        transcription,
+        "decode_audio",
+        lambda path, sampling_rate=transcription.SAMPLE_RATE: _tone(120.0, 220.0),
+    )
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [FakeSegment(0.0, 0.4, "Oh, yeah.", words=[FakeWord(0.05, 0.35, " Oh, yeah.")])],
+    ]
+    notes = []
+
+    result = transcribe_detailed(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path),
+        report=notes.append,
+        **_kept_and_crosstalk(),
+    )
+
+    assert [segment.speaker_id for segment in result.lines] == ["SPEAKER_00"]
+    assert result.separation is not None
+    assert result.separation.available is False
+    assert "disabled" in (result.separation.unavailable_reason or "")
+    assert result.separated_lines == 0
+    assert any("disabled" in note for note in notes)
+    # The previous path refuses on the mixture's measured pitch before decoding it,
+    # exactly as it did before separation existed.
+    assert any("the mixture measured" in note for note in notes)
+    assert len(FakeWhisperModel.calls) == 1
+
+
+def test_an_unavailable_checkpoint_falls_back_to_the_refusal_path(
+    monkeypatch, tmp_path
+):
+    """A gated model, missing package or bad device must not fail the run."""
+
+    _patch(monkeypatch)
+    monkeypatch.setattr(
+        transcription,
+        "decode_audio",
+        lambda path, sampling_rate=transcription.SAMPLE_RATE: _tone(120.0, 220.0),
+    )
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [FakeSegment(0.0, 0.4, "The police.", words=[FakeWord(0.05, 0.35, " The police.")])],
+    ]
+
+    def unavailable(settings, model):
+        raise target_extraction.UnavailableError(
+            "separation pipeline is gated and the token has not accepted it"
+        )
+
+    monkeypatch.setattr(target_extraction, "_load_pyannote", unavailable)
+    notes = []
+
+    result = transcribe_detailed(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(
+            tmp_path, crosstalk_separation=True, huggingface_token="hf_test"
+        ),
+        report=notes.append,
+        **_kept_and_crosstalk(),
+    )
+
+    assert [segment.speaker_id for segment in result.lines] == ["SPEAKER_00"]
+    assert result.separation is not None
+    assert result.separation.available is False
+    assert "gated" in (result.separation.unavailable_reason or "")
+    assert any("gated" in note for note in notes)
+    assert any("the mixture measured" in note for note in notes)
+    assert len(FakeWhisperModel.calls) == 1
+
+
+def test_a_region_with_both_separated_voices_gets_the_missing_line(
+    monkeypatch, tmp_path
+):
+    """The track carries the character's own voice, so the words are really theirs.
+
+    The recovered line keeps its real time inside the region, so it overlaps the
+    line the exclusive view kept; the existing timing cascade already preserves a
+    pair the film overlapped.
+    """
+
+    _patch(monkeypatch)
+    separator = _FakeSeparator([200.0, 110.0])
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [
+            FakeSegment(
+                0.0,
+                0.6,
+                "thank you",
+                words=[FakeWord(0.05, 0.55, " thank you")],
+            )
+        ],
+    ]
+
+    result = transcribe_detailed(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path, crosstalk_separation=True),
+        separator=separator,
+        **_kept_and_crosstalk(),
+    )
+
+    rows = _rows(result.lines)
+    assert rows == [
+        ("SPEAKER_00", 10.0, 14.0, "I do not say that lightly."),
+        ("SPEAKER_01", 12.25, 12.75, "thank you"),
+    ]
+    kept = result.lines[0]
+    recovered = result.lines[1]
+    assert recovered.start < kept.end and recovered.end > kept.start
+
+    assert result.separated_lines == 1
+    assert result.legacy_lines == 0
+    assert result.separation is not None
+    assert result.separation.separated_regions == 1
+    # Both characters get a track; only the dropped one is decoded because the
+    # kept speaker's line already came from their own exclusive decode.
+    assert result.separation.tracks == 2
+    # Only the kept decode and the missing character's *track* were decoded; the
+    # mixture was never decoded again.
+    assert len(FakeWhisperModel.calls) == 2
+    assert separator.calls == [(int(2.7 * transcription.SAMPLE_RATE), 2)]
+
+
+def test_a_separation_failure_takes_the_old_refusal_path(monkeypatch, tmp_path):
+    """When separation cannot deliver a track, nothing about the old rules changes."""
+
+    _patch(monkeypatch)
+    monkeypatch.setattr(
+        transcription,
+        "decode_audio",
+        lambda path, sampling_rate=transcription.SAMPLE_RATE: _tone(120.0, 220.0),
+    )
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [FakeSegment(0.0, 0.4, "The police.", words=[FakeWord(0.05, 0.35, " The police.")])],
+    ]
+    separator = _FakeSeparator([], error=target_extraction.ExtractionError("no sources"))
+
+    result = transcribe_detailed(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path, crosstalk_separation=True),
+        separator=separator,
+        **_kept_and_crosstalk(),
+    )
+
+    assert [segment.speaker_id for segment in result.lines] == ["SPEAKER_00"]
+    assert result.separation is not None
+    assert result.separation.separated_regions == 0
+    # Both characters were requested, and neither got a track from a failed run.
+    assert result.separation.refused_tracks == 2
+    assert "no sources" in result.separation.regions[0].refusals[0].reason
+    assert result.separated_lines == 0
+    # The old path measured the mixture as the kept voice and refused it before
+    # decoding - the same behaviour as before separation existed.
+    assert any("the mixture measured" in note for note in result.notes)
+    assert len(FakeWhisperModel.calls) == 1
+
+
+def test_the_kept_speakers_voice_is_never_credited_to_the_missing_one(
+    monkeypatch, tmp_path
+):
+    """A bad separation must cause a refusal, never a wrong-voice line."""
+
+    _patch(monkeypatch)
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [FakeSegment(0.0, 0.6, "thank you", words=[FakeWord(0.05, 0.55, " thank you")])],
+    ]
+    # Only the kept speaker's 210 Hz voice is separable; the missing 110 Hz voice is
+    # not there. The extractor must not hand the 210 Hz track to SPEAKER_01.
+    separator = _FakeSeparator([210.0])
+
+    result = transcribe_detailed(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path, crosstalk_separation=True),
+        separator=separator,
+        **_kept_and_crosstalk(),
+    )
+
+    assert [segment.speaker_id for segment in result.lines] == ["SPEAKER_00"]
+    assert result.separation is not None
+    # The kept speaker's 210 Hz voice was separated, but the missing 110 Hz voice
+    # was not there to separate, so nothing may be credited to it.
+    assert result.separation.regions[0].track_for("SPEAKER_01") is None
+    assert result.separation.regions[0].refusals[0].speaker_id == "SPEAKER_01"
+    assert result.separated_lines == 0
+
+
+def test_without_registers_a_separated_track_cannot_be_attributed(
+    monkeypatch, tmp_path
+):
+    _patch(monkeypatch)
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+    ]
+    separator = _FakeSeparator([200.0, 110.0])
+    notes = []
+
+    result = transcribe_detailed(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path, crosstalk_separation=True),
+        separator=separator,
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_01", 12.2, 12.9),
+        ],
+        report=notes.append,
+    )
+
+    assert separator.calls == []
+    assert result.separation is None
+    assert any("no registers" in note for note in notes)
+    assert [segment.speaker_id for segment in result.lines] == ["SPEAKER_00"]
+

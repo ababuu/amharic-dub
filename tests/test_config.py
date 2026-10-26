@@ -11,6 +11,7 @@ import os
 import pytest
 
 from app.config import (
+    DEFAULT_CROSSTALK_SEPARATION_MODEL,
     DEFAULT_DIALOGUE_BIBLE_FILENAME,
     DEFAULT_DIARIZATION_MODEL,
     DEFAULT_MIX_DIALOGUE_GAIN_DB,
@@ -37,6 +38,7 @@ from app.config import (
     DEFAULT_TTS_MIN_LINE_SECONDS,
     DEFAULT_TTS_MAX_PAUSE_SECONDS,
     DEFAULT_TTS_MODEL,
+    SPEECHBRAIN_SEPARATION_MODEL,
     DEFAULT_VOICE_REFERENCE_MAX_DURATION,
     DEFAULT_VOICE_REFERENCE_MIN_DURATION,
     DEFAULT_VOICE_REFERENCE_TARGET_DURATION,
@@ -320,6 +322,52 @@ def test_transcription_settings_are_configurable(
     assert payload["transcription_model"] == "medium"
     assert payload["transcription_compute_type"] == "int8"
     assert payload["transcription_language"] == "am"
+
+
+def test_crosstalk_separation_is_off_by_default(_clean_env: None) -> None:
+    """The model is optional; a run without it must behave exactly as before."""
+
+    settings = Settings.from_env()
+
+    assert settings.crosstalk_separation is False
+    assert settings.crosstalk_separation_backend == "pyannote"
+    assert settings.crosstalk_separation_model == DEFAULT_CROSSTALK_SEPARATION_MODEL
+    assert settings.crosstalk_separation_context_seconds == 1.0
+
+
+def test_crosstalk_separation_settings_are_configurable(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    monkeypatch.setenv("CROSSTALK_SEPARATION", "1")
+    monkeypatch.setenv("CROSSTALK_SEPARATION_BACKEND", "SpeechBrain")
+    monkeypatch.setenv("CROSSTALK_SEPARATION_CONTEXT_SECONDS", "0.5")
+
+    settings = Settings.from_env()
+
+    assert settings.crosstalk_separation is True
+    assert settings.crosstalk_separation_backend == "speechbrain"
+    # An unset model follows the chosen backend rather than staying on pyannote's.
+    assert settings.crosstalk_separation_model == SPEECHBRAIN_SEPARATION_MODEL
+    assert settings.crosstalk_separation_context_seconds == 0.5
+
+    monkeypatch.setenv("CROSSTALK_SEPARATION_MODEL", "someone/else-separation")
+    settings = Settings.from_env()
+    assert settings.crosstalk_separation_model == "someone/else-separation"
+
+    payload = settings.as_dict()
+    assert payload["crosstalk_separation"] is True
+    assert payload["crosstalk_separation_backend"] == "speechbrain"
+    assert payload["crosstalk_separation_model"] == "someone/else-separation"
+    assert payload["crosstalk_separation_context_seconds"] == 0.5
+
+
+def test_crosstalk_separation_must_be_a_boolean(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    monkeypatch.setenv("CROSSTALK_SEPARATION", "sometimes")
+
+    with pytest.raises(ValueError, match="CROSSTALK_SEPARATION"):
+        Settings.from_env()
 
 
 def test_translation_settings_are_configurable(

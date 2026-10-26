@@ -29,6 +29,16 @@ Environment variables
                       CTranslate2 compute type (e.g. ``float16`` on GPU).
 ``TRANSCRIPTION_LANGUAGE``
                       Source language code; unset means detect automatically.
+``CROSSTALK_SEPARATION``
+                      Set to ``1`` to separate a crosstalk region into one track per
+                      character before transcribing it. Off by default; unavailable
+                      models/tokens fall back to refusing the recovery.
+``CROSSTALK_SEPARATION_BACKEND``
+                      ``pyannote`` (default) or ``speechbrain``.
+``CROSSTALK_SEPARATION_MODEL``
+                      Checkpoint id; defaults to the backend's own model.
+``CROSSTALK_SEPARATION_CONTEXT_SECONDS``
+                      Audio kept on each side of the region when the model runs.
 ``TRANSLATION_BACKEND``
                       ``nllb`` for local translation, or ``openai`` (the default) for
                       an instruction-following model served over an OpenAI-compatible
@@ -130,6 +140,38 @@ DEFAULT_TRANSCRIPTION_COMPUTE_TYPE = "float16"
 #: cloned from, a mispronunciation - because none of that is the film's original audio,
 #: so no comparison with the original can find it.
 DEFAULT_QC_PRONUNCIATION = False
+
+#: Whether a crosstalk region is separated into one track per character before it is
+#: transcribed. Off by default: it loads another model and only helps on films where
+#: characters talk over each other. When it is off - or when its model, checkpoint or
+#: token is unavailable - the pipeline keeps its previous behaviour and refuses a
+#: recovery it cannot attribute, rather than failing the run.
+DEFAULT_CROSSTALK_SEPARATION = False
+
+#: ``pyannote`` uses pyannote.audio's SpeechSeparation pipeline; ``speechbrain`` uses
+#: SepFormer. Both are blind separators; the per-character association is made from
+#: the registers the pipeline already measured.
+DEFAULT_CROSSTALK_SEPARATION_BACKEND = "pyannote"
+
+#: Gated PixIT checkpoint for the ``pyannote`` backend. The token's account must have
+#: accepted the model's conditions on Hugging Face.
+DEFAULT_CROSSTALK_SEPARATION_MODEL = "pyannote/speech-separation-ami-1.0"
+
+#: Alternative, ungated checkpoint for the ``speechbrain`` backend.
+SPEECHBRAIN_SEPARATION_MODEL = "speechbrain/sepformer-whamr16k"
+
+#: Seconds of audio kept on each side of a crosstalk region for the separator. A
+#: model cannot learn two voices from 0.2 s of overlap; the tracks are cropped back
+#: to the region afterwards.
+DEFAULT_CROSSTALK_SEPARATION_CONTEXT_SECONDS = 1.0
+
+
+def default_crosstalk_separation_model(backend: str) -> str:
+    """Return the checkpoint a separation backend uses when none is configured."""
+
+    if (backend or "").lower() == "speechbrain":
+        return SPEECHBRAIN_SEPARATION_MODEL
+    return DEFAULT_CROSSTALK_SEPARATION_MODEL
 
 #: Which translation backend :mod:`app.pipeline.translation` uses.
 #:
@@ -797,6 +839,15 @@ class Settings:
     #: faster-whisper model and CTranslate2 compute type for transcription.
     transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL
     transcription_compute_type: str = DEFAULT_TRANSCRIPTION_COMPUTE_TYPE
+    #: Target-speaker extraction for crosstalk regions. See
+    #: :mod:`app.pipeline.target_extraction`. Off by default; an unavailable model
+    #: or token degrades to the previous refuse-if-unprovable behaviour.
+    crosstalk_separation: bool = DEFAULT_CROSSTALK_SEPARATION
+    crosstalk_separation_backend: str = DEFAULT_CROSSTALK_SEPARATION_BACKEND
+    crosstalk_separation_model: str = DEFAULT_CROSSTALK_SEPARATION_MODEL
+    crosstalk_separation_context_seconds: float = (
+        DEFAULT_CROSSTALK_SEPARATION_CONTEXT_SECONDS
+    )
     #: Round-trip every delivered clip through an Amharic ASR model and report the
     #: character error rate against the text that was synthesized. Off by default
     #: because it loads a second model and transcribes every clip.
@@ -888,6 +939,13 @@ class Settings:
         apply_torch_compile_policy()
         work_dir = _read_path("WORK_DIR", DEFAULT_WORK_DIR)
         model_cache_dir = _read_path("MODEL_CACHE_DIR", DEFAULT_MODEL_CACHE_DIR)
+        crosstalk_separation_backend = (
+            _read_env(
+                "CROSSTALK_SEPARATION_BACKEND",
+                DEFAULT_CROSSTALK_SEPARATION_BACKEND,
+            )
+            or DEFAULT_CROSSTALK_SEPARATION_BACKEND
+        ).lower()
         return cls(
             input_dir=_read_path("INPUT_DIR", DEFAULT_INPUT_DIR),
             work_dir=work_dir,
@@ -918,6 +976,18 @@ class Settings:
             ),
             qc_pronunciation=_read_bool(
                 "QC_PRONUNCIATION", DEFAULT_QC_PRONUNCIATION
+            ),
+            crosstalk_separation=_read_bool(
+                "CROSSTALK_SEPARATION", DEFAULT_CROSSTALK_SEPARATION
+            ),
+            crosstalk_separation_backend=crosstalk_separation_backend,
+            crosstalk_separation_model=(
+                _read_env("CROSSTALK_SEPARATION_MODEL")
+                or default_crosstalk_separation_model(crosstalk_separation_backend)
+            ),
+            crosstalk_separation_context_seconds=_read_float(
+                "CROSSTALK_SEPARATION_CONTEXT_SECONDS",
+                DEFAULT_CROSSTALK_SEPARATION_CONTEXT_SECONDS,
             ),
             transcription_language=(
                 (_read_env("TRANSCRIPTION_LANGUAGE") or "").lower() or None
@@ -1165,6 +1235,12 @@ class Settings:
             "transcription_model": self.transcription_model,
             "transcription_compute_type": self.transcription_compute_type,
             "qc_pronunciation": self.qc_pronunciation,
+            "crosstalk_separation": self.crosstalk_separation,
+            "crosstalk_separation_backend": self.crosstalk_separation_backend,
+            "crosstalk_separation_model": self.crosstalk_separation_model,
+            "crosstalk_separation_context_seconds": (
+                self.crosstalk_separation_context_seconds
+            ),
             "transcription_language": self.transcription_language,
             "translation_backend": self.translation_backend,
             "translation_provider": self.translation_provider,

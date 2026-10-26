@@ -11,6 +11,13 @@ Each diarized region is transcribed on its own, so every line is attributed to
 the speaker who actually said it instead of being guessed afterwards from a
 whole-movie transcript.
 
+Inside a crosstalk region where the exclusive diarization dropped a speaker, the
+recovery path first asks :mod:`app.pipeline.target_extraction` for one waveform per
+character and decodes the missing character's own track instead of the mixture.
+When that stage is disabled or unavailable, the previous mixture path (and its
+register gate) still applies unchanged, so an unprovable recovery is refused rather
+than voiced by the wrong character.
+
 Those segments are pause-delimited, not sentence-delimited, so
 :func:`assemble_sentences` turns them into the :class:`DialogueSentence` units the
 rest of the pipeline adapts and speaks. A sentence keeps every timestamp of its
@@ -67,6 +74,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings, get_settings
+from app.pipeline import target_extraction
 from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
 from app.pipeline.prosody import ProsodyError, estimate_f0
 
@@ -225,6 +233,41 @@ class TranscriptSegment:
         """Length of the utterance in seconds."""
 
         return self.end - self.start
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionResult:
+    """Transcribed lines plus what target-speaker extraction did.
+
+    The lines are the same value :func:`transcribe` returns. The extra fields exist
+    for the orchestrator: a run has to be able to say how many crosstalk regions
+    were separated, how many lines came from a per-speaker track rather than from
+    the mixture, and why a region was still refused - without re-listening.
+    """
+
+    lines: tuple[TranscriptSegment, ...]
+    separation: target_extraction.ExtractionReport | None = None
+    #: Lines decoded from a separated per-speaker track.
+    separated_lines: int = 0
+    #: Lines decoded from the mixture by the pre-existing recovery path.
+    legacy_lines: int = 0
+    #: Recoveries the acoustic gate refused, with the reason in ``notes``.
+    refused_recoveries: int = 0
+    notes: tuple[str, ...] = ()
+
+
+class _RecoveryTally:
+    """Mutable counters for one recovery pass, internal to this module."""
+
+    def __init__(self) -> None:
+        self.separated_lines = 0
+        self.legacy_lines = 0
+        self.refusals: list[str] = []
+
+    def refuse(self, message: str) -> None:
+        """Record one refused recovery with its reason."""
+
+        self.refusals.append(message)
 
 
 def _validate_audio_path(path: str | Path) -> Path:
@@ -746,6 +789,18 @@ def _register_of(
     return None
 
 
+def _pitch_reading(samples: Any, rate: int) -> tuple[float | None, int]:
+    """Return the audio's median F0 and voiced-frame count, or ``(None, 0)``."""
+
+    try:
+        profile = estimate_f0(samples, rate)
+    except ProsodyError:
+        return None, 0
+    if profile.median_hz is None:
+        return None, profile.voiced_frames
+    return float(profile.median_hz), profile.voiced_frames
+
+
 def _sounds_like(
     samples: Any,
     rate: int,
@@ -777,15 +832,64 @@ def _sounds_like(
         # acoustic gate cannot add anything and the structural checks stand alone.
         return True
 
-    try:
-        profile = estimate_f0(samples, rate)
-    except ProsodyError:
+    measured, voiced = _pitch_reading(samples, rate)
+    if measured is None or voiced < MIN_RECOVERED_VOICED_FRAMES:
         return False
-    if profile.median_hz is None or profile.voiced_frames < MIN_RECOVERED_VOICED_FRAMES:
-        return False
-
-    measured = float(profile.median_hz)
     return abs(measured - wanted) < abs(measured - avoided)
+
+
+def _dropped_speakers(
+    region: CrosstalkRegion, transcribed: Sequence[TranscriptSegment]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return the speakers the exclusive view dropped in ``region``, if any.
+
+    An empty ``missing`` means either that every region speaker already has a line
+    there, or that the exclusive view produced no authoritative text at all. Both
+    leave nothing to compare a recovery against, and the quality report names the
+    second case.
+    """
+
+    inside = [
+        segment
+        for segment in transcribed
+        if _overlap_seconds(segment.start, segment.end, region.start, region.end) > 0.0
+    ]
+    if not inside:
+        return (), ()
+    present = tuple(sorted({segment.speaker_id for segment in inside}))
+    missing = tuple(
+        speaker_id
+        for speaker_id in region.speaker_ids
+        if speaker_id not in present
+    )
+    return missing, present
+
+
+def _extraction_requests(
+    transcribed: Sequence[TranscriptSegment],
+    crosstalk: Sequence[CrosstalkRegion],
+) -> list[target_extraction.ExtractionRequest]:
+    """Return the regions target extraction should separate, and for whom.
+
+    Only a region where the exclusive view dropped a speaker is requested: an
+    ordinary turn has nothing to separate, and a region the exclusive view filled
+    completely has no missing character to credit a track to.
+    """
+
+    requests: list[target_extraction.ExtractionRequest] = []
+    for region in crosstalk:
+        if region.duration < MIN_RECOVERED_OVERLAP_SECONDS:
+            continue
+        missing, _present = _dropped_speakers(region, transcribed)
+        if missing:
+            # Every speaker in the region gets a track. Only the missing speaker's
+            # is decoded - the kept speaker's line is already authoritative - but
+            # having both lets the report show whether the split was clean and
+            # keeps the model's own view of the region honest.
+            requests.append(
+                target_extraction.ExtractionRequest(region, region.speaker_ids)
+            )
+    return requests
 
 
 def _recover_dropped_speakers(
@@ -797,6 +901,9 @@ def _recover_dropped_speakers(
     language: str | None,
     transcribed: Sequence[TranscriptSegment],
     registers: Mapping[str, float] | None = None,
+    *,
+    extraction: target_extraction.ExtractionReport | None = None,
+    tally: _RecoveryTally | None = None,
 ) -> list[TranscriptSegment]:
     """Return lines for speakers the exclusive view dropped inside crosstalk.
 
@@ -823,10 +930,18 @@ def _recover_dropped_speakers(
        tends to reproduce the dominant voice, and two characters saying one line is
        also wrong.
 
+    When :mod:`app.pipeline.target_extraction` produced a track for the missing
+    speaker, that track is the audio decoded here instead of the mixture. This is the
+    difference between "listen to two people at once and hear the loud one" and
+    "listen to the character": the separated track carries only their voice, so the
+    words are theirs by construction. Gate 2 stays in force and measures the track,
+    not the mixture - a bad separation is still refused rather than credited.
+
     A region the exclusive view did not fill at all is skipped entirely: with no
     authoritative text there is nothing to check a recovery against.
     """
 
+    tally = tally if tally is not None else _RecoveryTally()
     if not overlap_turns:
         return []
 
@@ -835,26 +950,7 @@ def _recover_dropped_speakers(
         if region.duration < MIN_RECOVERED_OVERLAP_SECONDS:
             continue
 
-        inside = [
-            segment
-            for segment in transcribed
-            if _overlap_seconds(
-                segment.start, segment.end, region.start, region.end
-            )
-            > 0.0
-        ]
-        if not inside:
-            # The exclusive view produced nothing here at all, so there is no
-            # authoritative text to compare a recovery against and no evidence about
-            # which of the two speakers a word belongs to. Guessing would invent
-            # dialogue; the gap is reported instead by the quality report.
-            continue
-        present = {segment.speaker_id for segment in inside}
-        missing = [
-            speaker_id
-            for speaker_id in region.speaker_ids
-            if speaker_id not in present
-        ]
+        missing, present = _dropped_speakers(region, transcribed)
         if not missing:
             continue
         spans = {
@@ -882,23 +978,55 @@ def _recover_dropped_speakers(
         if not uncovered:
             continue
 
-        region_text = [segment.text for segment in inside]
+        track = (
+            extraction.track_for(region, missing[0])
+            if extraction is not None
+            else None
+        )
+        region_text = [
+            segment.text
+            for segment in transcribed
+            if _overlap_seconds(segment.start, segment.end, region.start, region.end)
+            > 0.0
+        ]
         for start, end in uncovered:
             if end - start < MIN_RECOVERED_OVERLAP_SECONDS:
                 continue
-            window = SpeakerSegment(
-                speaker_id=missing[0], start=start, end=end
-            )
-            samples = _region_samples(audio, window)
+            window = SpeakerSegment(speaker_id=missing[0], start=start, end=end)
+            if track is not None:
+                # The separated track is this character's own voice, so the words
+                # decoded from it are theirs. The register check still runs: a bad
+                # separation can put the other voice in the track, and that must be
+                # refused rather than credited.
+                samples = track.slice(start, end)
+                rate = track.sample_rate
+            else:
+                # No separated track for this region: keep the previous behaviour
+                # exactly. The mixture is decoded and the same register gate decides
+                # whether it is evidence at all.
+                samples = _region_samples(audio, window)
+                rate = SAMPLE_RATE
             if len(samples) == 0:
                 continue
             if not _sounds_like(
                 samples,
-                SAMPLE_RATE,
+                rate,
                 speaker_id=missing[0],
-                other_id=sorted(present)[0],
+                other_id=present[0],
                 registers=registers,
             ):
+                measured, _voiced = _pitch_reading(samples, rate)
+                source = "separated track" if track is not None else "mixture"
+                reading = (
+                    "no measurable pitch"
+                    if measured is None
+                    else f"measured {measured:.1f} Hz"
+                )
+                tally.refuse(
+                    f"{missing[0]} at {start:.2f}-{end:.2f}s: the {source} "
+                    f"{reading}, which is not decisive for this character against "
+                    f"{present[0]}"
+                )
                 continue
             words = _timed_words(_decode(model, samples, window, language), window)
             if not words:
@@ -910,6 +1038,10 @@ def _recover_dropped_speakers(
                     continue
                 recovered.append(segment)
                 region_text.append(segment.text)
+                if track is not None:
+                    tally.separated_lines += 1
+                else:
+                    tally.legacy_lines += 1
 
     return recovered
 
@@ -981,7 +1113,7 @@ def build_amharic_transcriber(
     return transcribe
 
 
-def transcribe(
+def transcribe_detailed(
     audio_path: str | Path,
     speaker_segments: Iterable[SpeakerSegment],
     *,
@@ -989,8 +1121,10 @@ def transcribe(
     crosstalk: Iterable[CrosstalkRegion] = (),
     overlap_turns: Iterable[SpeakerSegment] = (),
     registers: Mapping[str, float] | None = None,
-) -> list[TranscriptSegment]:
-    """Transcribe the speech of each diarized region of ``audio_path``.
+    separator: target_extraction.Separator | None = None,
+    report: Callable[[str], None] | None = None,
+) -> TranscriptionResult:
+    """Transcribe each diarized region, returning lines and the separation audit.
 
     Parameters
     ----------
@@ -1010,8 +1144,9 @@ def transcribe(
         *exclusive* turn list can only hold one speaker, so the other speaker's
         words are absent from the transcript entirely - and a dub built from that
         transcript has one character talking while another one visibly is. Each
-        region is therefore re-listened to once for the speakers the exclusive
-        view dropped; see :func:`_recover_dropped_speakers`.
+        region where a speaker is missing is separated into per-speaker tracks and
+        the missing character's track is transcribed on its own; see
+        :func:`_recover_dropped_speakers` and :mod:`app.pipeline.target_extraction`.
     overlap_turns:
         The overlap-aware turns from the same call. They say *when* each speaker
         was talking inside a crosstalk, which is the only way to tell two voices in
@@ -1021,18 +1156,27 @@ def transcribe(
     registers:
         Each speaker's median pitch in Hz, when it has been measured. Recovery uses it
         to check that the audio it is about to credit to one character actually sounds
-        like that character: a mixture decoded once returns whichever voice dominates
-        it, and attributing that to the other speaker is heard as one character saying
-        the other's line. Without registers the check cannot run, and the structural
-        checks stand alone.
+        like that character, and target extraction uses it to decide which separated
+        waveform belongs to which character. Without registers the check cannot run
+        and separation cannot attribute its tracks, so both fall back to the
+        structural checks (which refuse anything they cannot prove).
+    separator:
+        Injected separation backend, used instead of one built from ``settings``.
+        Production leaves this ``None``; tests use it to exercise the stage without
+        torch or a gated checkpoint.
+    report:
+        Optional sink for one human-readable line per separation result. The
+        orchestrator passes its progress reporter so a run says which regions were
+        separated, which extra lines came from a track, and why a region was still
+        refused.
 
     Returns
     -------
-    list[TranscriptSegment]
-        Chronologically sorted utterances. An empty list means either nothing was
-        diarized or nothing intelligible was found. Recovered simultaneous speech
-        is included, attributed to the speaker who was actually saying it, so the
-        timeline downstream holds two characters where the film had two.
+    TranscriptionResult
+        Chronologically sorted lines plus the separation audit. Recovered
+        simultaneous speech is attributed to the speaker who was actually saying
+        it, so the timeline downstream can hold two characters where the film had
+        two.
 
     Raises
     ------
@@ -1058,7 +1202,7 @@ def transcribe(
     if not regions:
         # Nothing was diarized, so there is nothing to transcribe. Returning
         # early also avoids loading a multi-gigabyte model for nothing.
-        return []
+        return TranscriptionResult(lines=())
 
     _require_runtime()
     audio = _decode_audio(source)
@@ -1078,22 +1222,128 @@ def transcribe(
 
     transcribed.sort(key=lambda segment: (segment.start, segment.end, segment.speaker_id))
 
+    crosstalk_regions = _validate_crosstalk(crosstalk)
+    overlap = _validate_overlap_turns(overlap_turns)
+    notes: list[str] = []
+    extraction: target_extraction.ExtractionReport | None = None
+
+    # Without overlap-aware turns the recovery pass cannot place a missing
+    # speaker, so there is no reason to load a separation model.
+    requests = (
+        _extraction_requests(transcribed, crosstalk_regions) if overlap else []
+    )
+    if requests and not registers:
+        # A blind separator returns voices, not names. Without a measured register
+        # there is no way to decide which waveform is which character, and guessing
+        # is exactly the wrong-voice failure this stage exists to avoid.
+        notes.append(
+            "crosstalk separation: no registers were measured, so separated voices "
+            "cannot be attributed"
+        )
+        requests = []
+    if requests:
+        backend = separator
+        unavailable: str | None = None
+        if backend is None:
+            backend, unavailable = target_extraction.build_separator(settings)
+        if unavailable is not None:
+            notes.append(f"crosstalk separation: {unavailable}")
+            backend_name, model_name = target_extraction.resolve_backend_model(
+                settings
+            )
+            extraction = target_extraction.ExtractionReport(
+                backend=backend_name,
+                model=model_name,
+                available=False,
+                unavailable_reason=unavailable,
+            )
+        elif backend is not None:
+            try:
+                extraction = target_extraction.extract_tracks(
+                    audio,
+                    requests,
+                    separator=backend,
+                    registers=registers,
+                    context_seconds=settings.crosstalk_separation_context_seconds,
+                )
+            except Exception as exc:  # never let the optional stage end a run
+                notes.append(
+                    "crosstalk separation: failed "
+                    f"({type(exc).__name__}: {exc}); refusing unprovable recoveries"
+                )
+
+    tally = _RecoveryTally()
     recovered = _recover_dropped_speakers(
         model,
         audio,
         regions,
-        _validate_crosstalk(crosstalk),
-        _validate_overlap_turns(overlap_turns),
+        crosstalk_regions,
+        overlap,
         language,
         transcribed,
         registers,
+        extraction=extraction,
+        tally=tally,
     )
     if recovered:
         transcribed.extend(recovered)
         transcribed.sort(
             key=lambda segment: (segment.start, segment.end, segment.speaker_id)
         )
-    return transcribed
+
+    if extraction is not None and extraction.available:
+        notes.append(
+            f"crosstalk separation: {len(requests)} of {len(crosstalk_regions)} "
+            f"crosstalk region(s) needed a split; {extraction.summary()}"
+        )
+        for item in extraction.regions:
+            notes.append(f"crosstalk separation: {item.describe()}")
+    notes.extend(f"crosstalk refusal: {reason}" for reason in tally.refusals)
+    if extraction is not None and extraction.available and requests:
+        notes.append(
+            f"crosstalk lines: {tally.separated_lines} from separated track(s), "
+            f"{tally.legacy_lines} from the mixture"
+        )
+    if report is not None:
+        for note in notes:
+            report(f"  {note}")
+
+    return TranscriptionResult(
+        lines=tuple(transcribed),
+        separation=extraction,
+        separated_lines=tally.separated_lines,
+        legacy_lines=tally.legacy_lines,
+        refused_recoveries=len(tally.refusals),
+        notes=tuple(notes),
+    )
+
+
+def transcribe(
+    audio_path: str | Path,
+    speaker_segments: Iterable[SpeakerSegment],
+    *,
+    settings: Settings | None = None,
+    crosstalk: Iterable[CrosstalkRegion] = (),
+    overlap_turns: Iterable[SpeakerSegment] = (),
+    registers: Mapping[str, float] | None = None,
+) -> list[TranscriptSegment]:
+    """Return just the lines from :func:`transcribe_detailed`.
+
+    Kept as the public entry point for callers that do not need the separation
+    audit; the orchestrator uses :func:`transcribe_detailed` so the manifest can
+    record it.
+    """
+
+    return list(
+        transcribe_detailed(
+            audio_path,
+            speaker_segments,
+            settings=settings,
+            crosstalk=crosstalk,
+            overlap_turns=overlap_turns,
+            registers=registers,
+        ).lines
+    )
 
 
 # ---------------------------------------------------------------------------

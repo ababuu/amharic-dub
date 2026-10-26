@@ -60,6 +60,7 @@ from app.pipeline import (
     qc,
     register,
     separation,
+    target_extraction,
     timing,
     transcription,
     translation,
@@ -150,6 +151,16 @@ class PipelineResult:
     #: label it contradicted. The audit trail for "why was this character cast with
     #: this voice?".
     attribution: register.AttributionReport | None = None
+    #: What crosstalk target extraction did: which regions got per-speaker tracks,
+    #: which characters were refused and why. ``None`` when the stage never ran.
+    separation: "target_extraction.ExtractionReport | None" = None
+    #: Lines that came from a separated per-speaker track rather than the mixture.
+    separated_lines: int = 0
+    #: Lines still recovered by the previous mixture path (normally zero now that
+    #: the register gate refuses unattributable mixture decodes).
+    legacy_separated_lines: int = 0
+    #: Recoveries the acoustic gate refused; the reason is in the run's report.
+    refused_recoveries: int = 0
 
     @property
     def final_video(self) -> Path:
@@ -259,6 +270,15 @@ class PipelineResult:
                 "lines": len(self.lines),
                 "sentences": len(self.dialogue),
                 "segments": [_segment_dict(segment) for segment in self.lines],
+                # What the optional per-speaker split did, including the reasons a
+                # region was still single-voiced. Absent means the stage was off or
+                # no crosstalk dropped a speaker.
+                "crosstalk_separation": (
+                    None if self.separation is None else self.separation.as_dict()
+                ),
+                "separated_lines": self.separated_lines,
+                "legacy_separated_lines": self.legacy_separated_lines,
+                "refused_recoveries": self.refused_recoveries,
             },
             "translation": {
                 "lines": len(self.dialogue),
@@ -314,12 +334,22 @@ class PipelineResult:
         speakers = sorted({turn.speaker_id for turn in self.turns})
         stretched = sum(1 for line in self.alignment if line.tempo != 1.0)
         drifted = [line for line in self.alignment if line.drift > 0.005]
+        crosstalk_summary = (
+            "not separated" if self.separation is None else self.separation.summary()
+        )
+        if self.separation is not None and self.separation.available:
+            crosstalk_summary += (
+                f"; {self.separated_lines} line(s) from separated track(s), "
+                f"{self.legacy_separated_lines} from the mixture, "
+                f"{self.refused_recoveries} refused"
+            )
         lines = [
             f"source          {self.source}",
             f"output          {self.output_dir}",
             f"stems           {', '.join(path.name for path in self.stems.as_dict().values())}",
             f"diarization     {len(self.turns)} turn(s), {len(speakers)} speaker(s)",
             f"transcription   {len(self.lines)} line(s)",
+            f"crosstalk       {crosstalk_summary}",
             f"adaptation      {len(self.dialogue)} Amharic line(s)",
             f"voice profiles  {len(self.profiles)} profile(s)",
             f"tts             {len(self.clips)} clip(s)",
@@ -612,28 +642,31 @@ def run_pipeline(
                 )
             )
 
-    lines = tuple(
-        _stage(
-            "transcription",
-            seconds,
-            report,
-            transcription.transcribe,
-            stems.speech,
-            turns,
-            settings=resolved,
-            # Simultaneous speech is re-listened to for the speaker the exclusive
-            # turn list had to drop: without this, a two-character argument is
-            # transcribed as one character talking and the dub follows it.
-            crosstalk=crosstalk,
-            overlap_turns=diarized.overlap_turns,
-            # Which voice is which, measured from the diarized turns before any text
-            # exists. A crosstalk can only be heard by decoding a mixture, and the
-            # decode returns whichever voice dominates it - so a recovered line has to
-            # be checked against the register of the character it is about to be given
-            # to, or the other character ends up saying it in the wrong voice.
-            registers=speaker_registers,
-        )
+    transcription_result = _stage(
+        "transcription",
+        seconds,
+        report,
+        transcription.transcribe_detailed,
+        stems.speech,
+        turns,
+        settings=resolved,
+        # Simultaneous speech is re-listened to for the speaker the exclusive
+        # turn list had to drop: without this, a two-character argument is
+        # transcribed as one character talking and the dub follows it.
+        crosstalk=crosstalk,
+        overlap_turns=diarized.overlap_turns,
+        # Which voice is which, measured from the diarized turns before any text
+        # exists. A crosstalk can only be heard by decoding a mixture, and the
+        # decode returns whichever voice dominates it - so a recovered line has to
+        # be checked against the register of the character it is about to be given
+        # to, or the other character ends up saying it in the wrong voice.
+        registers=speaker_registers,
+        # Target-speaker extraction prints what it did (or why it could not run)
+        # through the same reporter as every other stage.
+        report=report,
     )
+    lines = tuple(transcription_result.lines)
+    separation_report = transcription_result.separation
     if not lines:
         raise EmptyStageError("transcription produced no lines; nothing to adapt")
     if crosstalk:
@@ -1108,6 +1141,10 @@ def run_pipeline(
         stage_seconds=dict(seconds),
         elapsed_seconds=time.perf_counter() - started,
         synthesized_lines=len(clips),
+        separation=separation_report,
+        separated_lines=transcription_result.separated_lines,
+        legacy_separated_lines=transcription_result.legacy_lines,
+        refused_recoveries=transcription_result.refused_recoveries,
     )
 
     # Measured, not assumed: the model-free quality report is part of every run.
@@ -1242,7 +1279,10 @@ def _write_manifest(
             "qc.overlap measures how much of it survived",
             "speech the film played simultaneously is recovered for the character the "
             "exclusive diarization had to drop, written as a short competing line, "
-            "and placed at the same instant as the line it overlaps; "
+            "and placed at the same instant as the line it overlaps; when "
+            "CROSSTALK_SEPARATION is enabled the two voices are separated first and "
+            "the missing character's own track is transcribed, and the register gate "
+            "still refuses any track that does not measure as that character; "
             "qc.overlap.unpaired names any crosstalk where only one character is heard",
             "the qc block is measured, not assumed; pronunciation is left "
             "unmeasured because it needs an Amharic ASR model, which is injected "

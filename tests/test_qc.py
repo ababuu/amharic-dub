@@ -628,6 +628,27 @@ def test_a_pair_that_was_laid_end_to_end_is_reported_as_serialized(tmp_path: Pat
     assert "1 serialized" in report.summary()
 
 
+def test_a_single_voiced_region_is_named_by_time_and_by_missing_speaker(
+    tmp_path: Path,
+) -> None:
+    """The report must say *where* the defect is and *who* is absent."""
+
+    line = _dialogue(start=10.0, end=14.0, speaker_id="SPEAKER_00")
+    aligned = _aligned(tmp_path, index=3, window=4.0, speech=4.0, dialogue=line)
+
+    report = measure_overlap(
+        [aligned],
+        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+    )
+
+    assert len(report.unpaired_regions) == 1
+    region = report.unpaired_regions[0]
+    assert (region.start, region.end) == (12.2, 12.9)
+    assert region.heard == ("SPEAKER_00",)
+    assert region.missing == ("SPEAKER_01",)
+    assert "12.20-12.90s (SPEAKER_00 heard; SPEAKER_01 missing)" in report.summary()
+
+
 def test_a_crosstalk_region_with_only_one_speakers_line_is_named(tmp_path: Path) -> None:
     """The film has two people talking and the dub has one: that is the defect."""
 
@@ -641,6 +662,23 @@ def test_a_crosstalk_region_with_only_one_speakers_line_is_named(tmp_path: Path)
 
     assert report.unpaired == (3,)
     assert "no counterpart" in report.summary()
+
+
+def test_a_crosstalk_region_with_no_line_at_all_is_still_named(tmp_path: Path) -> None:
+    """A region nobody voiced has no line index, but it is the same defect."""
+
+    report = measure_overlap(
+        [],
+        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+    )
+
+    assert report.unpaired == ()
+    assert len(report.unpaired_regions) == 1
+    named = report.unpaired_regions[0]
+    assert named.start == 12.2 and named.end == 12.9
+    assert named.heard == ()
+    assert named.missing == ("SPEAKER_00", "SPEAKER_01")
+    assert "not voiced by both characters" in report.summary()
 
 
 def test_a_crosstalk_region_with_both_speakers_dubbed_is_not_named(

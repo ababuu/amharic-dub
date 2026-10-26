@@ -10,7 +10,9 @@ Stage order
 2. ``separation``    - split the soundtrack into dialogue / music / effects stems.
 3. ``diarization``   - identify who spoke when.
 4. ``transcription`` - transcribe the dialogue stem with timestamps, then assemble
-   the pause-delimited segments into complete sentences.
+   the pause-delimited segments into complete sentences. A crosstalk region where
+   the exclusive diarization dropped a speaker may first be split into per-speaker
+   tracks by ``target_extraction``, so both characters' words can be transcribed.
 5. ``translation``   - adapt and translate the sentences into Amharic.
 6. ``voice_profiles``- build a per-character Amharic voice profile.
 7. ``tts``           - synthesize Amharic dialogue with cloned voices.

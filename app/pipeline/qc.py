@@ -274,6 +274,38 @@ class DurationFitReport:
 
 
 @dataclass(frozen=True, slots=True)
+class UnpairedRegion:
+    """A crosstalk region the dub still voices with a single character.
+
+    The line index below says *which line* is alone; this says *where* it is and
+    who is missing, so a region that target extraction could not separate is named
+    rather than merely counted.
+    """
+
+    start: float
+    end: float
+    heard: tuple[str, ...]
+    missing: tuple[str, ...]
+
+    def describe(self) -> str:
+        """Return ``12.21-12.89s (SPEAKER_00 heard; SPEAKER_01 missing)``."""
+
+        heard = ", ".join(self.heard) if self.heard else "nobody"
+        missing = ", ".join(self.missing) if self.missing else "nobody"
+        return f"{self.start:.2f}-{self.end:.2f}s ({heard} heard; {missing} missing)"
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe view."""
+
+        return {
+            "start": self.start,
+            "end": self.end,
+            "heard": list(self.heard),
+            "missing": list(self.missing),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class OverlapReport:
     """What the dub did with the speech the film played simultaneously.
 
@@ -297,6 +329,9 @@ class OverlapReport:
     #: Line indexes that had no counterpart: a crosstalk region with only one
     #: character's line in it, so someone the film had talking when the dub is silent.
     unpaired: tuple[int, ...] = ()
+    #: The same defect named by region and by character, so a run can say *where*
+    #: separation still failed instead of only how many lines were involved.
+    unpaired_regions: tuple[UnpairedRegion, ...] = ()
 
     @property
     def preserved_ratio(self) -> float:
@@ -316,6 +351,7 @@ class OverlapReport:
             "lost_pairs": self.lost_pairs,
             "preserved_ratio": round(self.preserved_ratio, 4),
             "unpaired": list(self.unpaired),
+            "unpaired_regions": [region.as_dict() for region in self.unpaired_regions],
         }
 
     def summary(self) -> str:
@@ -337,6 +373,16 @@ class OverlapReport:
             parts.append(
                 f"{len(self.unpaired)} line(s) whose crosstalk has no counterpart "
                 f"from the other character ({shown})"
+            )
+        if self.unpaired_regions:
+            named = "; ".join(
+                region.describe() for region in self.unpaired_regions[:4]
+            )
+            if len(self.unpaired_regions) > 4:
+                named += f"; and {len(self.unpaired_regions) - 4} more"
+            parts.append(
+                f"{len(self.unpaired_regions)} crosstalk region(s) still "
+                f"not voiced by both characters ({named})"
             )
         return ", ".join(parts) if parts else "no simultaneous speech in the source"
 
@@ -574,6 +620,7 @@ def measure_overlap(
 
     regions = tuple(crosstalk)
     unpaired: list[int] = []
+    lone_regions: dict[tuple[float, float], CrosstalkRegion] = {}
     if regions:
         for index, _line, aligned in placed:
             start = aligned.start
@@ -597,8 +644,39 @@ def measure_overlap(
                     speaker != aligned.speaker_id for speaker in region.speaker_ids
                 ):
                     unpaired.append(index)
+                    lone_regions[(region.start, region.end)] = region
                     break
         unpaired = sorted(set(unpaired))
+
+    unpaired_regions: list[UnpairedRegion] = []
+    # Every region is checked, not only those that already had a lone line: a
+    # region with no line at all is the same defect and has to be named too.
+    for region in sorted(regions, key=lambda item: (item.start, item.end)):
+        heard = tuple(
+            sorted(
+                {
+                    aligned.speaker_id
+                    for _index, _line, aligned in placed
+                    if aligned.start < region.end
+                    and aligned.start
+                    + aligned.rendered_pause_before
+                    + aligned.speech_duration
+                    > region.start
+                }
+            )
+        )
+        missing = tuple(
+            speaker for speaker in region.speaker_ids if speaker not in heard
+        )
+        if missing:
+            unpaired_regions.append(
+                UnpairedRegion(
+                    start=region.start,
+                    end=region.end,
+                    heard=heard,
+                    missing=missing,
+                )
+            )
 
     return OverlapReport(
         source_pairs=source_pairs,
@@ -606,6 +684,7 @@ def measure_overlap(
         preserved_seconds=preserved_seconds,
         lost_pairs=source_pairs - preserved_pairs,
         unpaired=tuple(unpaired),
+        unpaired_regions=tuple(unpaired_regions),
     )
 
 

@@ -13,8 +13,10 @@ from pathlib import Path
 
 import pytest
 
+import numpy as np
+
 from app.config import DEFAULT_TRANSLATION_GEMINI_MODEL, Settings
-from app.pipeline import orchestrator
+from app.pipeline import orchestrator, target_extraction
 from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
 from app.pipeline.mixing import MixResult
 from app.pipeline.orchestrator import (
@@ -349,6 +351,17 @@ def _wire(monkeypatch: pytest.MonkeyPatch, fake: Stages) -> None:
         orchestrator.diarization, "diarize_detailed", fake.diarize_detailed
     )
     monkeypatch.setattr(orchestrator.transcription, "transcribe", fake.transcribe)
+
+    def transcribe_detailed(*args, report=None, **kwargs):
+        # The orchestrator calls the detailed form so it can record the
+        # separation audit; the fake only implements the line-returning form.
+        return orchestrator.transcription.TranscriptionResult(
+            lines=tuple(fake.transcribe(*args, **kwargs))
+        )
+
+    monkeypatch.setattr(
+        orchestrator.transcription, "transcribe_detailed", transcribe_detailed
+    )
     monkeypatch.setattr(orchestrator.translation, "adapt_dialogue", fake.adapt_dialogue)
     monkeypatch.setattr(
         orchestrator.voice_profiles, "build_voice_profiles", fake.build_voice_profiles
@@ -653,6 +666,65 @@ def test_crosstalk_is_reported_in_the_manifest(tmp_path: Path, monkeypatch) -> N
     assert crosstalk["detail"] == [
         {"start": 1.0, "end": 2.5, "speakers": ["SPEAKER_00", "SPEAKER_01"]}
     ]
+
+
+def test_the_target_extraction_audit_reaches_the_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run has to be able to say which regions were split and which were not."""
+
+    fake = Stages(tmp_path)
+    _wire(monkeypatch, fake)
+    region = CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), start=1.0, end=2.5)
+    report = target_extraction.ExtractionReport(
+        backend="fake",
+        model="fake/separator",
+        available=True,
+        regions=(
+            target_extraction.RegionExtraction(
+                region=region,
+                tracks=(
+                    target_extraction.ExtractedTrack(
+                        speaker_id="SPEAKER_01",
+                        start=region.start,
+                        end=region.end,
+                        samples=np.zeros(int(1.5 * target_extraction.SAMPLE_RATE), np.float32),
+                        measured_hz=120.0,
+                    ),
+                ),
+                refusals=(target_extraction.Refusal("SPEAKER_00", "ambiguous"),),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator.transcription,
+        "transcribe_detailed",
+        lambda *args, **kwargs: orchestrator.transcription.TranscriptionResult(
+            lines=tuple(fake.lines),
+            separation=report,
+            separated_lines=1,
+            legacy_lines=0,
+            refused_recoveries=1,
+        ),
+    )
+
+    result = run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))["run"][
+        "transcription"
+    ]
+    assert payload["crosstalk_separation"]["regions_separated"] == 1
+    assert payload["crosstalk_separation"]["tracks"] == 1
+    assert payload["crosstalk_separation"]["refused_tracks"] == 1
+    assert payload["crosstalk_separation"]["detail"][0]["refusals"][0] == {
+        "speaker_id": "SPEAKER_00",
+        "reason": "ambiguous",
+        "measured_hz": None,
+    }
+    assert payload["separated_lines"] == 1
+    assert payload["legacy_separated_lines"] == 0
+    assert payload["refused_recoveries"] == 1
+    assert "1/1 crosstalk region(s) separated" in result.report()
 
 
 def test_the_dialogue_bible_is_handed_to_adaptation(
