@@ -111,6 +111,20 @@ RECOVERED_DUPLICATE_RATIO = 0.6
 #: (a stray token Whisper emits between two real words).
 MIN_RECOVERED_WORD_SECONDS = 0.02
 
+#: Whisper's own hallucination heuristics, applied to a *recovered* line only.
+#:
+#: A recovered line is decoded from a mixture that the film itself made unintelligible,
+#: which is exactly the input Whisper fills in from its language model. On the run that
+#: prompted this it produced "RUN!" from 0.24s of two people talking at once - text
+#: nobody said, in a character's voice, inside a scene. The three thresholds are the
+#: ones Whisper's own reference implementation uses to spot that: a segment the model
+#: considered mostly non-speech, one it was not confident about, or one whose text
+#: compresses implausibly well (a repetition loop). They are applied only here, so a
+#: normal line that happens to be quiet is never discarded.
+MIN_RECOVERED_AVG_LOGPROB = -1.0
+MAX_RECOVERED_NO_SPEECH = 0.6
+MAX_RECOVERED_COMPRESSION = 2.4
+
 
 class TranscriptionError(RuntimeError):
     """Base class for every error raised by this module."""
@@ -540,6 +554,33 @@ def _speaker_spans(
     return spans
 
 
+def _plausible_speech(raw: Any) -> bool:
+    """Return whether a decoded segment looks like speech rather than a guess.
+
+    Only used on recovered crosstalk audio, which is the one place this stage decodes a
+    mixture the film itself made unintelligible. A segment that carries none of the
+    three diagnostics is accepted: a decoder that does not report them is not evidence
+    against itself.
+    """
+
+    average = getattr(raw, "avg_logprob", None)
+    if isinstance(average, (int, float)) and not isinstance(average, bool):
+        if float(average) < MIN_RECOVERED_AVG_LOGPROB:
+            return False
+
+    silent = getattr(raw, "no_speech_prob", None)
+    if isinstance(silent, (int, float)) and not isinstance(silent, bool):
+        if float(silent) > MAX_RECOVERED_NO_SPEECH:
+            return False
+
+    compression = getattr(raw, "compression_ratio", None)
+    if isinstance(compression, (int, float)) and not isinstance(compression, bool):
+        if float(compression) > MAX_RECOVERED_COMPRESSION:
+            return False
+
+    return True
+
+
 def _timed_words(
     raw_segments: Iterable[Any], region: SpeakerSegment
 ) -> list[tuple[str, float, float]]:
@@ -553,6 +594,8 @@ def _timed_words(
 
     words: list[tuple[str, float, float]] = []
     for raw in raw_segments:
+        if not _plausible_speech(raw):
+            continue
         entries = getattr(raw, "words", None)
         if entries:
             for entry in entries:

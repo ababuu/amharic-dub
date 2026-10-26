@@ -576,6 +576,14 @@ def run_pipeline(
             f"  speaker verification: corrected {len(speaker_corrections)} "
             "high-confidence turn attribution(s)"
         )
+    if diarized.verified:
+        # Said out loud because it changes what a later stage may do: these labels
+        # were compared with the model's own speaker embeddings, so no pitch
+        # measurement is allowed to overturn them.
+        report(
+            f"  speaker verification: {len(diarized.verified)} turn(s) confirmed "
+            "against the speaker embeddings"
+        )
     if crosstalk:
         report(
             f"  crosstalk: {len(crosstalk)} region(s), "
@@ -630,7 +638,16 @@ def run_pipeline(
     # a stretch where two people were labelled as one speaker can only split into
     # two sentences once the labels are right.
     try:
-        lines, attribution = register.repair_attribution(lines, stems.speech)
+        lines, attribution = register.repair_attribution(
+            lines,
+            stems.speech,
+            # A short turn inside a crosstalk keeps its label: the other character
+            # really was talking there, so it is not a diarization fragment.
+            overlaps=[(region.start, region.end) for region in crosstalk],
+            # And a turn the embeddings confirmed keeps its label too: pitch is a
+            # weaker measurement of identity and must not overturn a stronger one.
+            trusted=[(turn.start, turn.end) for turn in diarized.verified],
+        )
     except register.RegisterError as exc:
         # Loud, never silent: this stage is what stops a character being cast with the
         # wrong gender, so a run that loses it has to say so rather than quietly
@@ -641,6 +658,15 @@ def run_pipeline(
     if attribution is not None:
         for speaker_id, measured in attribution.after.items():
             report(f"  register: {measured.describe()}")
+        if attribution.continuity:
+            # Named rather than counted, because each one is a place where the dub
+            # would otherwise have had the other character's voice inside a sentence.
+            report(
+                f"  speaker continuity: {len(attribution.continuity)} short "
+                "fragment(s) took the speaker of the sentence around them"
+            )
+            for correction in attribution.continuity:
+                report(f"        {correction.describe()}")
         if attribution.corrections:
             report(
                 f"  speaker verification: reassigned {len(attribution.corrections)} "

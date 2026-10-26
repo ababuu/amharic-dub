@@ -952,3 +952,37 @@ def test_configured_counts_are_validated_before_the_model_is_touched(monkeypatch
         diarize(_audio(tmp_path), settings=_settings(tmp_path, min_speakers=9, max_speakers=4))
 
     assert FakePipeline.requests == []
+
+
+def test_the_turns_the_embeddings_confirmed_are_published(monkeypatch, tmp_path):
+    """A later stage needs to know which labels were *checked*, not just guessed.
+
+    Pitch repair runs after this stage and measures one acoustic dimension of a voice.
+    Without knowing which labels were already compared against the model's speaker
+    prototypes, it will happily overturn a confirmation.
+    """
+
+    _patch(monkeypatch)
+    FakePipeline.result = FakeDiarizeOutput(
+        exclusive_speaker_diarization=FakeAnnotation([(0.0, 4.0, "SPEAKER_00")])
+    )
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    # The fake pipeline exposes no embedder, so nothing could be checked and the
+    # list is empty rather than claiming confirmation it never obtained.
+    assert result.verified == ()
+
+
+def test_a_confirmed_turn_is_reported_separately_from_a_correction(
+    monkeypatch, tmp_path
+):
+    """The two outcomes of verification are different and both are published."""
+
+    _patch(monkeypatch)
+    FakePipeline.result = _pipeline_output([(0.0, 2.0, "SPEAKER_00")])
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.corrections == ()
+    assert result.verified == ()

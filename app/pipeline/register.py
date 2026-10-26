@@ -48,6 +48,10 @@ import soundfile as sf
 from app.pipeline.prosody import PitchProfile, ProsodyError, estimate_f0
 from app.pipeline.transcription import TranscriptSegment
 
+#: Two intervals closer than this are not sharing time. Same value as the other
+#: stages use for a timestamp comparison, so "overlapping" means one thing everywhere.
+TIMESTAMP_TOLERANCE = 1e-3
+
 #: Below this median a voice reads as masculine, in Hz. Set from measured film
 #: dialogue: male turns clustered at 94-160 Hz and female turns at 171-300 Hz, so
 #: the boundary sits in the empty band between them rather than in either cluster.
@@ -80,6 +84,34 @@ MIN_SEPARATION_RATIO = 1.25
 #: registers the next pass compares against; two passes settle on the film this was
 #: built for and the loop is bounded so a pathological input cannot spin.
 MAX_PASSES = 3
+
+#: Shortest turn whose pitch may move it to another speaker, in seconds.
+#:
+#: A pitch median from a fragment is not a measurement of a voice. Two things go wrong
+#: below this length, and both were heard on a real film: autocorrelation can lock onto
+#: twice the period and report an octave high, and a fragment cut from inside one
+#: person's sentence is not an utterance at all, so there is no reason for it to be a
+#: different speaker. Moving such a turn puts the other character's voice *inside* one
+#: sentence - on the run that prompted this, five short fragments of a single
+#: continuous monologue were handed to the other character. The threshold matches
+#: :data:`app.pipeline.diarization`'s own verification floor, so a turn is only ever
+#: moved by a measurement that is long enough for both stages to agree on.
+MIN_REASSIGNMENT_TURN_SECONDS = 1.5
+
+#: Longest turn that may be treated as a fragment of its neighbours, in seconds.
+SHORT_TURN_SECONDS = 1.5
+
+#: How close a fragment has to sit to one of its neighbours, in seconds, for that
+#: neighbour to explain it. At least one side must be this close: a fragment glued to
+#: the end of somebody's sentence is part of it, while an utterance separated from both
+#: neighbours by a beat is a reply and keeps its own label even when it is short.
+CONTINUITY_GAP_SECONDS = 1.0
+
+#: How wide one speaker's own turns may spread, as a ratio, before the cluster is
+#: reported as probably holding more than one voice. A single voice varies by a quarter
+#: either way between a hushed line and a shouted one; 2.0x is a full octave across
+#: per-utterance medians, which no single speaker produces and two do easily.
+CLUSTER_SPREAD_LIMIT = 2.0
 
 _PRESENTATIONS = ("unknown", "uncertain", "masculine", "feminine")
 
@@ -189,19 +221,47 @@ class AttributionCorrection:
 
 
 @dataclass(frozen=True, slots=True)
+class ContinuityCorrection:
+    """A short turn relabelled because the speaker around it explains it.
+
+    Recorded separately from a pitch correction because the evidence is different in
+    kind: this one comes from the shape of the dialogue (a fragment glued to one
+    character's sentence, with nobody else talking over it), not from a frequency
+    measurement of the fragment itself.
+    """
+
+    start: float
+    end: float
+    from_speaker: str
+    to_speaker: str
+    duration: float
+
+    def describe(self) -> str:
+        """Return a one-line explanation for a report."""
+
+        return (
+            f"{self.start:.2f}-{self.end:.2f}s ({self.duration:.2f}s) "
+            f"{self.from_speaker} -> {self.to_speaker}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AttributionReport:
     """Registers before and after repair, plus what was reassigned."""
 
     before: Mapping[str, SpeakerRegister]
     after: Mapping[str, SpeakerRegister]
     corrections: tuple[AttributionCorrection, ...]
+    #: Short fragments whose label was taken from the speaker around them.
+    continuity: tuple[ContinuityCorrection, ...] = ()
 
     @property
     def reassigned_fraction(self) -> float:
         """Return the share of turns whose speaker had to change."""
 
         total = sum(register.turns for register in self.after.values())
-        return len(self.corrections) / total if total else 0.0
+        moved = len(self.corrections) + len(self.continuity)
+        return moved / total if total else 0.0
 
 
 def _read_speech(path: str | Path) -> tuple[np.ndarray, int]:
@@ -360,13 +420,33 @@ def repair_attribution(
     audio: str | Path,
     *,
     max_passes: int = MAX_PASSES,
+    overlaps: Iterable[tuple[float, float]] = (),
+    trusted: Iterable[tuple[float, float]] = (),
 ) -> tuple[list[TranscriptSegment], AttributionReport]:
     """Reassign turns their own speaker's register cannot explain.
 
-    Only *decisive* evidence moves a turn: it has to sit at least
-    :data:`OUTLIER_RATIO` away from its speaker's register and at least twice as
-    close to another speaker's. A turn that sits between two speakers is left where
-    diarization put it, because a coin flip is not an improvement.
+    Two corrections happen, in this order, and they use different evidence.
+
+    **Continuity first.** A short fragment glued to one character's sentence, with
+    nobody talking over it, belongs to that character - see
+    :func:`smooth_short_turns`. This runs before anything is measured so that a
+    fragment cannot pollute the register it would then be compared against.
+
+    **Then the register.** Only *decisive* evidence moves a turn: it has to be long
+    enough for its own pitch to mean something
+    (:data:`MIN_REASSIGNMENT_TURN_SECONDS`), sit at least :data:`OUTLIER_RATIO` away
+    from its speaker's register, and be at least twice as close to another speaker's.
+    A turn that sits between two speakers is left where diarization put it, because a
+    coin flip is not an improvement.
+
+    ``trusted`` is where a **stronger** measurement already settled the question: spans
+    whose label was confirmed by comparing the turn against the diarization model's own
+    speaker embeddings. Pitch never overrides those. A pitch median measures one
+    acoustic dimension, and a trained actor's expressive range covers most of an octave
+    either way - one hushed line and one shouted line from the same person can sit an
+    octave apart - while an embedding compares the voice itself. Ranking the two the
+    other way round is how a real film ended up with fragments of one character's
+    monologue voiced by the other character's clone.
 
     Parameters
     ----------
@@ -374,17 +454,31 @@ def repair_attribution(
         Transcript segments, each carrying the speaker diarization assigned.
     audio:
         The dialogue stem the segments were transcribed from.
+    overlaps:
+        Regions where two or more speakers talk at once. A short turn inside one keeps
+        its diarized label: the other character really was talking there.
+    trusted:
+        Spans, in seconds, whose speaker was confirmed by speaker embeddings. Pitch may
+        not move a turn that falls inside one.
 
     Returns
     -------
     tuple[list[TranscriptSegment], AttributionReport]
-        The segments with decisive corrections applied, in input order, and the
-        registers and corrections that explain what changed.
+        The segments with corrections applied, in input order, and the registers and
+        corrections that explain what changed.
     """
 
     ordered = _validate(segments)
     if not ordered:
         return [], AttributionReport(before={}, after={}, corrections=())
+
+    ordered, continuity = smooth_short_turns(ordered, overlaps=overlaps)
+
+    confirmed = [
+        (start, end)
+        for start, end in trusted
+        if isinstance(start, (int, float)) and isinstance(end, (int, float))
+    ]
 
     samples, rate = _read_speech(audio)
     pitches = measure_turn_pitch(ordered, samples, rate)
@@ -404,6 +498,18 @@ def repair_attribution(
         for index, pitch in enumerate(pitches):
             own = registers.get(labels[index])
             if own is None or own.median_hz is None or not pitch.usable:
+                continue
+            if pitch.end - pitch.start < MIN_REASSIGNMENT_TURN_SECONDS:
+                # Too short for its own pitch to identify a voice. Continuity has
+                # already had its say; a fragment is not evidence of a stranger.
+                continue
+            if any(
+                pitch.start < end - TIMESTAMP_TOLERANCE
+                and pitch.end > start + TIMESTAMP_TOLERANCE
+                for start, end in confirmed
+            ):
+                # Speaker embeddings already compared this turn with the voice
+                # itself. Pitch is the weaker measurement and does not overturn it.
                 continue
             assert pitch.median_hz is not None
             own_distance = abs(math.log(pitch.median_hz / own.median_hz))
@@ -445,8 +551,118 @@ def repair_attribution(
         for label, segment in zip(labels, ordered)
     ]
     return repaired, AttributionReport(
-        before=before, after=after, corrections=tuple(corrections)
+        before=before,
+        after=after,
+        corrections=tuple(corrections),
+        continuity=continuity,
     )
+
+
+def smooth_short_turns(
+    segments: Iterable[TranscriptSegment],
+    *,
+    overlaps: Iterable[tuple[float, float]] = (),
+    short_seconds: float = SHORT_TURN_SECONDS,
+    max_gap: float = CONTINUITY_GAP_SECONDS,
+) -> tuple[list[TranscriptSegment], tuple[ContinuityCorrection, ...]]:
+    """Give every short fragment its neighbours' speaker, when nothing says otherwise.
+
+    Diarization decides *who spoke when* from embeddings computed over a window, and a
+    window that holds a third of a second of speech is not enough of a voice to decide
+    anything: the exclusive view flip-flops at the pauses inside a single sentence. On
+    the film that prompted this, one character's continuous monologue came back with
+    five of its fragments labelled as the other character - each one voiced by the
+    other character's clone, in the middle of a sentence.
+
+    The evidence that fixes it is the shape of the dialogue rather than the sound of
+    the fragment:
+
+    * the turn is **short** - longer than that and its own audio is worth trusting, so
+      it is left for :func:`repair_attribution` to judge;
+    * the turns **immediately before and after** it belong to the same *other*
+      speaker, so a single voice is running through this stretch of the film;
+    * it is **glued to at least one side** - within :data:`CONTINUITY_GAP_SECONDS` -
+      so it sits inside somebody's utterance rather than being a reply with a beat
+      either side of it;
+    * it is **not simultaneous** with another speaker. A real interjection is normally
+      talked over, and that is exactly what the overlap-aware diarization reports. If
+      two voices are really there, the label is kept.
+
+    A relabel is only made next to a *fuller* neighbour: at least one of the two must
+    be longer than the fragment itself. A run of fragments all the same length is
+    therefore never evidence for itself, which is what stops a stretch of short turns
+    relabelling one another in a circle.
+
+    Parameters
+    ----------
+    segments:
+        Transcribed turns, in chronological order, each with its diarized speaker.
+    overlaps:
+        Regions where two or more speakers talk at once, from
+        :func:`app.pipeline.diarization.diarize_detailed`. A turn inside one keeps its
+        label: somebody else really was there.
+
+    Returns
+    -------
+    tuple[list[TranscriptSegment], tuple[ContinuityCorrection, ...]]
+        The segments in input order and the fragments that were relabelled.
+    """
+
+    ordered = _validate(segments)
+    regions = [
+        (start, end)
+        for start, end in overlaps
+        if isinstance(start, (int, float)) and isinstance(end, (int, float))
+    ]
+    if len(ordered) < 3:
+        return ordered, ()
+
+    corrections: list[ContinuityCorrection] = []
+    labels = [segment.speaker_id for segment in ordered]
+    for index in range(1, len(ordered) - 1):
+        segment = ordered[index]
+        duration = segment.end - segment.start
+        if duration > short_seconds:
+            continue
+        if any(
+            min(segment.end, end) - max(segment.start, start) > TIMESTAMP_TOLERANCE
+            for start, end in regions
+        ):
+            continue
+
+        previous = ordered[index - 1]
+        following = ordered[index + 1]
+        surrounding = previous.speaker_id
+        if surrounding != following.speaker_id or surrounding == segment.speaker_id:
+            continue
+        previous_gap = segment.start - previous.end
+        following_gap = following.start - segment.end
+        if min(previous_gap, following_gap) > max_gap:
+            continue
+        if (
+            previous.end - previous.start <= duration
+            and following.end - following.start <= duration
+        ):
+            continue
+
+        labels[index] = surrounding
+        corrections.append(
+            ContinuityCorrection(
+                start=segment.start,
+                end=segment.end,
+                from_speaker=segment.speaker_id,
+                to_speaker=surrounding,
+                duration=duration,
+            )
+        )
+
+    repaired = [
+        segment
+        if label == segment.speaker_id
+        else TranscriptSegment(label, segment.start, segment.end, segment.text)
+        for label, segment in zip(labels, ordered)
+    ]
+    return repaired, tuple(corrections)
 
 
 def contiguous_turns(
@@ -509,22 +725,74 @@ def disagreement(
             f"{moved} of {total} turn(s) had to be reassigned, so the diarization "
             "labels describe the timeline rather than the people"
         )
+
+    spread = register_spread(report)
+    if spread:
+        described = ", ".join(spread)
+        return (
+            "a speaker's own turns do not look like one voice "
+            f"({described}); check the separation before trusting the cast"
+        )
     return None
+
+
+def register_spread(
+    report: AttributionReport,
+    *,
+    limit: float = CLUSTER_SPREAD_LIMIT,
+) -> tuple[str, ...]:
+    """Return one line per speaker whose own turns span an implausible range.
+
+    A single voice, measured once per utterance across a film, varies by maybe a
+    quarter either way: a hushed line and a shouted one sit a few semitones apart, not
+    an octave. When the turns a cluster kept span more than
+    :data:`CLUSTER_SPREAD_LIMIT`, the cluster is more likely to hold two voices than to
+    hold one unusually expressive one - which is heard, downstream, as a character
+    whose voice changes between scenes because their turns were split across two voice
+    references.
+
+    Reported rather than acted on: nothing here knows which halves belong together, and
+    guessing would be a coin flip. It is the signal that the *separation* needs a look.
+    """
+
+    described: list[str] = []
+    for speaker_id in sorted(report.before):
+        before = report.before[speaker_id]
+        if (
+            before.low_hz is None
+            or before.high_hz is None
+            or before.median_hz is None
+            or before.measured_turns < 3
+        ):
+            continue
+        spread = before.high_hz / before.low_hz
+        if spread >= limit:
+            described.append(
+                f"{speaker_id} spans {before.low_hz:.0f}-{before.high_hz:.0f} Hz "
+                f"({spread:.2f}x around {before.median_hz:.0f} Hz over "
+                f"{before.measured_turns} turn(s))"
+            )
+    return tuple(described)
 
 
 __all__ = [
     "AttributionCorrection",
     "AttributionReport",
     "AudioReadError",
+    "CONTINUITY_GAP_SECONDS",
+    "CLUSTER_SPREAD_LIMIT",
+    "ContinuityCorrection",
     "FEMININE_MIN_HZ",
     "InvalidSegmentsError",
     "MASCULINE_MAX_HZ",
     "MAX_PASSES",
+    "MIN_REASSIGNMENT_TURN_SECONDS",
     "MIN_SEPARATION_RATIO",
     "MIN_VOICED_FRAMES",
     "OUTLIER_RATIO",
     "REASSIGNMENT_MARGIN",
     "RegisterError",
+    "SHORT_TURN_SECONDS",
     "SpeakerRegister",
     "TurnPitch",
     "aggregate_registers",
@@ -532,5 +800,7 @@ __all__ = [
     "disagreement",
     "measure_turn_pitch",
     "presentation_of",
+    "register_spread",
     "repair_attribution",
+    "smooth_short_turns",
 ]

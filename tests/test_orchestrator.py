@@ -848,7 +848,7 @@ def test_only_a_character_without_a_usable_film_reference_is_cast(
     monkeypatch.setattr(
         orchestrator.register,
         "repair_attribution",
-        lambda lines, audio: (
+        lambda lines, audio, **kwargs: (
             list(lines),
             AttributionReport(before=measured, after=measured, corrections=()),
         ),

@@ -263,6 +263,18 @@ class DiarizationResult:
     #: Empty when the pyannote result carries no such annotation; everything
     #: downstream must keep working in that case.
     overlap_turns: tuple[SpeakerSegment, ...] = ()
+    #: Turns whose label :func:`_verify_speaker_attributions` actually checked against
+    #: Community-1's speaker embeddings and left as diarization reported them. Not
+    #: "probably right": these were compared with the model-space prototype of every
+    #: speaker and no other one won by a decisive margin.
+    #:
+    #: This matters because it ranks two kinds of evidence. An embedding compares the
+    #: voice itself; a pitch median measures one acoustic dimension of it, and a
+    #: trained actor's expressive range covers most of an octave either way - a hushed
+    #: line and a shouted one from the same person can sit an octave apart. So a later
+    #: pitch-based repair must not overturn a confirmation made here, and the turn is
+    #: published for exactly that reason.
+    verified: tuple[SpeakerSegment, ...] = ()
 
 
     @property
@@ -679,28 +691,34 @@ def _verify_speaker_attributions(
     audio_path: Path,
     segments: list[SpeakerSegment],
     crosstalk: tuple[CrosstalkRegion, ...],
-) -> tuple[list[SpeakerSegment], tuple[SpeakerAttributionCorrection, ...]]:
-    """Correct only long, clean turns with strong agreement from speaker embeddings.
+) -> tuple[list[SpeakerSegment], tuple[SpeakerAttributionCorrection, ...], tuple[SpeakerSegment, ...]]:
+    """Correct long, clean turns with strong agreement from speaker embeddings.
 
     Community-1's speaker embeddings are the same model-space prototypes used by
     its clustering. Comparing clean turn embeddings against those prototypes
     avoids a fixed SPEAKER_00/SPEAKER_01 assumption and requires no extra model.
+
+    Returns the turns, the corrections made, and the turns whose label the
+    embeddings *confirmed*. The last one is published so a later, weaker signal
+    cannot overturn it: a pitch median is one acoustic dimension of a voice, while
+    an embedding is a comparison against the voice itself.
     """
 
     centroids = _speaker_centroids(result)
     audio = getattr(pipeline, "_audio", None)
     embedder = getattr(pipeline, "_embedding", None)
     if len(centroids) < 2 or audio is None or embedder is None or torch is None:
-        return segments, ()
+        return segments, (), ()
 
     try:
         from pyannote.core import Segment
     except ImportError:
         _LOGGER.warning("pyannote.core is unavailable; preserving diarization labels")
-        return segments, ()
+        return segments, (), ()
 
     corrections: list[SpeakerAttributionCorrection] = []
     verified: list[SpeakerSegment] = []
+    confirmed: list[SpeakerSegment] = []
     audio_file = {"audio": str(audio_path)}
     for index, segment in enumerate(segments):
         if (
@@ -728,7 +746,7 @@ def _verify_speaker_attributions(
                 exc,
             )
             verified.extend(segments[index:])
-            return verified, tuple(corrections)
+            return verified, tuple(corrections), tuple(confirmed)
 
         embedding_rows = (
             raw_embedding.tolist()
@@ -778,8 +796,9 @@ def _verify_speaker_attributions(
             )
         else:
             verified.append(segment)
+            confirmed.append(segment)
 
-    return verified, tuple(corrections)
+    return verified, tuple(corrections), tuple(confirmed)
 
 
 def _resolve_speaker_counts(
@@ -847,7 +866,7 @@ def diarize_detailed(
     overlap_turns = (
         () if overlap_annotation is None else tuple(_to_overlap_turns(overlap_annotation))
     )
-    turns, corrections = _verify_speaker_attributions(
+    turns, corrections, verified = _verify_speaker_attributions(
         pipeline,
         result,
         source,
@@ -859,6 +878,7 @@ def diarize_detailed(
         crosstalk=crosstalk,
         corrections=corrections,
         overlap_turns=overlap_turns,
+        verified=verified,
     )
 
 

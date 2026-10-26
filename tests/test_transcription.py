@@ -1259,3 +1259,70 @@ def test_the_same_interjection_is_recovered_in_two_different_crosstalks(
 
     recovered = [segment for segment in segments if segment.speaker_id == "SPEAKER_01"]
     assert len(recovered) == 2
+
+
+def test_a_recovered_line_whisper_was_not_confident_about_is_not_invented(
+    monkeypatch, tmp_path
+):
+    """A mixture is what Whisper fills in from its language model.
+
+    On a real clip it produced "RUN!" from a quarter-second of two people talking at
+    once. A recovered line has to look like speech by the decoder's own diagnostics
+    before it is allowed into somebody's mouth.
+    """
+
+    import types
+
+    _patch(monkeypatch)
+    doubtful = FakeSegment(
+        0.0, 0.6, "RUN!", words=[FakeWord(0.05, 0.55, " RUN!")]
+    )
+    doubtful.avg_logprob = -1.9
+    doubtful.no_speech_prob = 0.82
+    doubtful.compression_ratio = 0.9
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [doubtful],
+    ]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path),
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_01", 12.2, 12.9),
+        ],
+    )
+
+    assert [segment.speaker_id for segment in segments] == ["SPEAKER_00"]
+
+
+def test_a_confident_recovered_line_is_still_kept(monkeypatch, tmp_path):
+    """The filter must not throw away real simultaneous speech."""
+
+    _patch(monkeypatch)
+    confident = FakeSegment(
+        0.0, 0.7, "thank you", words=[FakeWord(0.05, 0.65, " thank you")]
+    )
+    confident.avg_logprob = -0.3
+    confident.no_speech_prob = 0.05
+    confident.compression_ratio = 1.1
+    FakeWhisperModel.responses = [
+        [FakeSegment(0.0, 4.0, "I do not say that lightly.")],
+        [confident],
+    ]
+
+    segments = transcribe(
+        _audio(tmp_path),
+        [_region("SPEAKER_00", 10.0, 14.0)],
+        settings=_settings(tmp_path),
+        crosstalk=[_crosstalk(("SPEAKER_00", "SPEAKER_01"), 12.2, 12.9)],
+        overlap_turns=[
+            _region("SPEAKER_00", 10.0, 14.0),
+            _region("SPEAKER_01", 12.2, 12.9),
+        ],
+    )
+
+    assert [segment.speaker_id for segment in segments] == ["SPEAKER_00", "SPEAKER_01"]
