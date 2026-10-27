@@ -1178,8 +1178,13 @@ class OmniVoiceEngine(VoiceCloningEngine):
         describes the original length, so the model treats the reference's trailing
         words as unspoken and repeats them at the start of every generated line (a
         reference ending "in this very room." was heard as "room" before each line).
-        Without a transcript, preprocessing runs first and the model transcribes the
-        processed audio, so the two stay aligned.
+        The alternative - preprocessing the audio and letting the library transcribe
+        it again - costs an ASR download and a second recognition pass.
+
+        What makes that safe is the reference itself: :mod:`app.pipeline.voice_profiles`
+        cuts it to the speaker's real acoustic offset and closes it on silence, so the
+        audio and ``ref_text`` end at the same word. A prompt that still stops inside a
+        word is the one thing this path must never receive.
         """
 
         key = (str(reference), (reference_text or "").strip())

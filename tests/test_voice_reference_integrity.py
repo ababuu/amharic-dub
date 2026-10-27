@@ -184,9 +184,7 @@ def test_the_transcript_sent_matches_the_audio_sent(tmp_path: Path) -> None:
 
     assert profile.reference_text is not None
     starts = {line.start for line in transcript}
-    ends = {line.end for line in transcript}
     assert profile.reference_start in starts
-    assert profile.reference_end in ends
     words = profile.reference_text.split()
     covered = " ".join(
         line.text
@@ -195,6 +193,9 @@ def test_the_transcript_sent_matches_the_audio_sent(tmp_path: Path) -> None:
         and line.end <= profile.reference_end + 1e-3
     ).split()
     assert words == covered
+    assert max(
+        line.end for line in transcript if line.end <= profile.reference_end + 1e-3
+    ) == pytest.approx(profile.reference_end, abs=0.65)
 
 
 def test_a_reference_is_never_cut_on_an_arbitrary_grid_when_lines_exist(
@@ -215,7 +216,8 @@ def test_a_reference_is_never_cut_on_an_arbitrary_grid_when_lines_exist(
     )["SPEAKER_00"]
 
     assert profile.reference_start == pytest.approx(11.37)
-    assert profile.reference_end == pytest.approx(19.03)
+    # The last line's release and a short silent tail follow the transcript end.
+    assert profile.reference_end == pytest.approx(19.03, abs=0.65)
     assert profile.reference_text == "alpha beta gamma delta epsilon zeta"
 
 

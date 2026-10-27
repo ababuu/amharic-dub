@@ -260,9 +260,23 @@ REFERENCE_EDGE_SEARCH_SECONDS = 0.60
 #: reach into a neighbouring character's first syllable.
 REFERENCE_EDGE_GUARD_SECONDS = 0.05
 
-#: A search region this share active has no acoustic offset to find - it is steady
-#: material such as a music bed or bleed - so the window is left exactly as cut.
-REFERENCE_EDGE_ACTIVE_RATIO_LIMIT = 0.95
+#: Gap inside a spoken word that does not end it, in seconds. A stop consonant closes
+#: the vocal tract for a few tens of milliseconds; treating that closure as the end of
+#: the utterance would cut the prompt mid-word, which is the defect the trailing
+#: silence rules exist to prevent. A gap longer than this is a boundary between
+#: utterances.
+REFERENCE_RELEASE_GAP_SECONDS = 0.12
+
+#: How far below the speech immediately before a transcript's end a frame may sit and
+#: still count as that last word still sounding, in dB. The energy VAD above estimates
+#: a noise floor from a window's own quietest frames, which is the right test for
+#: measuring a window but useless in the 0.2s that follow a line that ends mid-word:
+#: every frame there is speech, so the "floor" is speech and nothing reads as active.
+#: Anchoring to the level just before the line ends is what makes a release visible.
+REFERENCE_RELEASE_LEVEL_MARGIN_DB = 20.0
+
+#: Audio read before a transcript's end to measure how loudly that last word spoke.
+REFERENCE_RELEASE_LOOKBACK_SECONDS = 0.30
 
 #: Orthographic targets of the phonetic-variety proxy: distinct symbols and
 #: distinct words a reference should exercise, and the number of words below
@@ -853,6 +867,10 @@ class _ReferenceCandidate:
     #: scoring and selection rules that care about it.
     speech_start: float | None = None
     speech_end: float | None = None
+    #: End of the audio that actually exists in the dialogue stem. ``end`` may sit
+    #: beyond it when silence is appended to close the prompt; extraction reads only
+    #: up to this point so it can never pull in the next line's speech.
+    source_end: float | None = None
 
     @property
     def duration(self) -> float:
@@ -1302,24 +1320,43 @@ def _trailing_silence_window(
     occupied: Sequence[tuple[float, float]],
     *,
     maximum: float,
-) -> tuple[float, float]:
-    """Grow a window's end past its transcript line, into the silence that follows.
+) -> tuple[float, float, float]:
+    """Return where a window really ends in the source, and the silence to add.
 
     A transcript's end time is not an acoustic offset. On the film that prompted
-    this, the selected reference ended *inside* a word: its last 40 ms sat at
-    -30 dBFS and the file simply stopped there. OmniVoice's prompt is a prefix of an
-    utterance whose masked region is trained to continue it, so a prompt that stops
-    inside a word asks the model to finish that word first - which is heard as a
-    fragment of the reference at the start of every take.
+    this, the selected reference ended *inside* a word: the recogniser put the end
+    of "money?" at 40.61 s while the speaker's release ran on to 40.82 s, so the
+    prompt's audio stopped mid-phone while its transcript still claimed the whole
+    word. OmniVoice's prompt is a prefix of an utterance whose masked region is
+    trained to continue it, and the prompt region contributes no loss - so a prompt
+    that stops inside a word is treated as unfinished, and the model speaks the
+    missing fragment before the line it was asked for. Because the prompt is built
+    once per character, that fragment is then heard at the start of *every* line
+    that character speaks.
 
-    The real offset is located with the same energy VAD used to measure windows, and
-    :data:`REFERENCE_TRAIL_SILENCE_SECONDS` of the silence after it is kept. An offset
-    is accepted only when that much silence is actually observed after it; otherwise
-    the speech may simply be pausing between syllables, and guessing would pull the
-    next, untranscribed words into the prompt. The window never grows into another
-    line and never past ``maximum``, and a tail that is still active at the end of the
-    search range (a music bed, or speech carrying on too far to trust) is left exactly
-    as cut.
+    Two things therefore have to be true of the prompt, and this function supplies
+    both:
+
+    * it ends at the speaker's real release, not at a recogniser's guess, and
+    * after that release it carries silence, so the model has nothing left to say.
+
+    The release is found by following the run of sound that starts at the transcript's
+    end, crossing only the closures inside a word
+    (:data:`REFERENCE_RELEASE_GAP_SECONDS`); the first real gap ends it, and whatever
+    sounds after that gap belongs to the next utterance and is never read. When the
+    run reaches the edge of the search region, the speaker is still talking, so the
+    only honest end is the boundary in view - the next line, or another character
+    starting - taken up to :data:`REFERENCE_EDGE_GUARD_SECONDS` before it. With no
+    boundary in view either, the window is left where the transcript ends: extending
+    would be a guess that reads untranscribed speech.
+
+    Returns
+    -------
+    tuple[float, float, float]
+        ``(start, source_end, digital_tail)``. ``source_end`` is how far to read
+        from the stem, and ``digital_tail`` is the silence to append afterwards so
+        the prompt carries :data:`REFERENCE_TRAIL_SILENCE_SECONDS` of silence after
+        its last word, whether the source supplied it or not.
 
     The head is deliberately untouched: the model continues the *end* of a prompt,
     never its beginning, and pulling a window backwards would risk swallowing the
@@ -1328,46 +1365,92 @@ def _trailing_silence_window(
 
     limit = _speech_limit_after(end, occupied)
     search = REFERENCE_EDGE_SEARCH_SECONDS + REFERENCE_TRAIL_SILENCE_SECONDS
-    room = search if math.isinf(limit) else limit - end - REFERENCE_EDGE_GUARD_SECONDS
-    if room <= 0.0:
-        return start, end
+    bound = (
+        math.inf if math.isinf(limit) else max(end, limit - REFERENCE_EDGE_GUARD_SECONDS)
+    )
+    room = min(search, bound - end) if math.isfinite(bound) else search
 
-    read_end = end + min(room, search)
-    samples = reader.read(end, read_end)
-    if samples.size == 0:
-        return start, end
+    # Where the last word stops, and how much *real* silence follows it.
+    release = end
+    quiet = 0.0
+    gap_frames = max(
+        1, int(round(REFERENCE_RELEASE_GAP_SECONDS / ANALYSIS_FRAME_SECONDS))
+    )
 
-    levels = _frame_levels(samples, reader.sample_rate)
-    if levels.size < 3:
-        return start, end
+    samples = (
+        reader.read(end, end + room) if room > 0.0 else np.zeros(0, dtype=np.float32)
+    )
+    levels = (
+        _frame_levels(samples, reader.sample_rate)
+        if samples.size
+        else np.empty(0, dtype=float)
+    )
+    if levels.size >= 3:
+        # Two ways for a frame to count as sounding, whichever is more sensitive: it
+        # rises above the region's own noise floor, or it is within reach of how loudly
+        # the last word was still speaking when the transcript says the line ended.
+        threshold = (
+            float(np.percentile(levels, NOISE_FLOOR_PERCENTILE)) + ACTIVITY_MARGIN_DB
+        )
+        before = reader.read(max(0.0, end - REFERENCE_RELEASE_LOOKBACK_SECONDS), end)
+        if before.size:
+            spoken = float(
+                np.percentile(_frame_levels(before, reader.sample_rate), PEAK_PERCENTILE)
+            )
+            threshold = min(threshold, spoken - REFERENCE_RELEASE_LEVEL_MARGIN_DB)
+        active = levels >= max(threshold, SILENCE_FLOOR_DBFS)
+        sounded = np.flatnonzero(active)
 
-    noise_floor = float(np.percentile(levels, NOISE_FLOOR_PERCENTILE))
-    threshold = max(noise_floor + ACTIVITY_MARGIN_DB, SILENCE_FLOOR_DBFS)
-    active = levels >= threshold
+        if sounded.size == 0:
+            # Already quiet: nothing left to disturb, only a tail to close with.
+            quiet = min(
+                levels.size * ANALYSIS_FRAME_SECONDS, REFERENCE_TRAIL_SILENCE_SECONDS
+            )
+        else:
+            # The release is the end of the run of sound that *starts* at the
+            # transcript's end. Anything after the first real gap is a later utterance
+            # - the next character's onset, or a word nothing describes - and must not
+            # be swallowed. Short closures inside a word are crossed, see
+            # REFERENCE_RELEASE_GAP_SECONDS.
+            release_frame = int(sounded[0])
+            for candidate_frame in sounded[1:]:
+                if int(candidate_frame) - release_frame - 1 > gap_frames:
+                    break
+                release_frame = int(candidate_frame)
 
-    sounded = np.flatnonzero(active)
-    if sounded.size == 0:
-        # The window already ends in silence; there is nothing to add.
-        return start, end
-    if int(sounded[-1]) >= active.size - 1:
-        # Speech runs to the edge of what may be taken: no offset to trust.
-        return start, end
-    if float(active.mean()) >= REFERENCE_EDGE_ACTIVE_RATIO_LIMIT:
-        return start, end
+            if release_frame >= active.size - 1 - gap_frames:
+                # The speaker is still sounding at the edge of the search region. Where
+                # the word ends is only known if something bounds it: the next line, or
+                # another character starting. Take the speaker's own speech right up to
+                # that guard; without a boundary in view, extending would be a guess
+                # that reads untranscribed speech.
+                if math.isfinite(bound) and bound - end <= search:
+                    release = bound
+            else:
+                candidate = end + (release_frame + 1) * ANALYSIS_FRAME_SECONDS
+                if candidate - end <= REFERENCE_EDGE_SEARCH_SECONDS:
+                    release = candidate
+                    after = active[release_frame + 1 :]
+                    silent_frames = (
+                        int(np.argmax(after)) if not after.all() else after.size
+                    )
+                    quiet = min(
+                        silent_frames * ANALYSIS_FRAME_SECONDS,
+                        REFERENCE_TRAIL_SILENCE_SECONDS,
+                    )
 
-    acoustic_end = end + (int(sounded[-1]) + 1) * ANALYSIS_FRAME_SECONDS
-    padded_end = acoustic_end + REFERENCE_TRAIL_SILENCE_SECONDS
-    if padded_end > read_end:
-        # The silence after the last frame is shorter than the reference needs, so
-        # the speech may simply be pausing between syllables. Without seeing the
-        # silence itself there is no offset to trust, and guessing would pull the
-        # next, untranscribed words into the prompt.
-        return start, end
-    if padded_end - start > maximum:
-        padded_end = start + maximum
-    if padded_end <= end:
-        return start, end
-    return start, padded_end
+    # Never let the closure push the prompt past the configured maximum: a reference
+    # that is already at the limit gets silence only as far as the limit allows.
+    release = min(release, start + maximum)
+    quiet = min(quiet, max(0.0, start + maximum - release))
+    tail = max(
+        0.0,
+        min(
+            REFERENCE_TRAIL_SILENCE_SECONDS - quiet,
+            start + maximum - (release + quiet),
+        ),
+    )
+    return start, release + quiet, tail
 
 
 def _candidates_for(
@@ -1427,28 +1510,37 @@ def _candidates_for(
         # window grows: the added silence carries no words.
         text = _window_text(speaker_id, start, end, transcript)
         covered = _covered_text(speaker_id, start, end, transcript)
-        padded_start, padded_end = _trailing_silence_window(
+        padded_start, source_end, digital_tail = _trailing_silence_window(
             reader, start, end, occupied, maximum=maximum
         )
-        key = (round(padded_start, 4), round(padded_end, 4))
+        # Every prompt closes on silence, described or not. A prompt that stops while
+        # a phone is still sounding is treated by the model as unfinished, whatever
+        # text accompanies it, and the fragment it then speaks is the defect this is
+        # here to prevent.
+        prompt_end = source_end + digital_tail
+        key = (round(padded_start, 4), round(prompt_end, 4))
         if key in seen:
             continue
         seen.add(key)
-        samples = reader.read(padded_start, padded_end)
+        # Measurements describe the speech itself, not the closure that follows it:
+        # how much silence a window happens to be followed by must not decide which
+        # window is chosen.
+        samples = reader.read(padded_start, end)
         if samples.size == 0:
             continue
         candidates.append(
             _ReferenceCandidate(
                 speaker_id=speaker_id,
                 start=padded_start,
-                end=padded_end,
+                end=prompt_end,
                 stats=_measure_window(samples, reader.sample_rate),
-                overlap_seconds=_overlap_seconds(padded_start, padded_end, others),
+                overlap_seconds=_overlap_seconds(padded_start, source_end, others),
                 text=text,
                 variety=_phonetic_variety(covered or text),
-                contaminated=_contaminated(padded_start, padded_end, contaminated),
+                contaminated=_contaminated(padded_start, source_end, contaminated),
                 speech_start=start,
                 speech_end=end,
+                source_end=source_end,
             )
         )
     return candidates
@@ -1638,17 +1730,59 @@ def _verify_reference(path: Path, *, expected_duration: float, speaker_id: str) 
         )
 
 
+def _append_silence(path: Path, seconds: float) -> None:
+    """Append digital silence to a reference WAV, in place.
+
+    The clone prompt is a prefix the model continues; a prompt whose last sample
+    is still speech is treated as unfinished and the model speaks the missing
+    fragment before the line it was asked for. Appending silence closes the
+    prompt without touching a single speech sample, so the voice and its content
+    are unchanged.
+    """
+
+    if seconds <= 0.0:
+        return
+
+    try:
+        samples, rate = sf.read(str(path), dtype="float32", always_2d=True)
+    except (OSError, RuntimeError) as exc:
+        raise ReferencePreprocessingError(
+            f"could not read back the extracted reference {path}: {exc}"
+        ) from exc
+
+    mono = np.ascontiguousarray(np.asarray(samples, dtype=np.float32).mean(axis=1))
+    padding = np.zeros(int(round(seconds * rate)), dtype=np.float32)
+    padded = np.concatenate([mono, padding])
+    try:
+        sf.write(str(path), padded, rate, format="WAV", subtype="PCM_16")
+    except (OSError, RuntimeError) as exc:
+        raise ReferencePreprocessingError(
+            f"could not pad the extracted reference {path}: {exc}"
+        ) from exc
+
+
 def _extract_reference(
     source: Path,
     candidate: _ReferenceCandidate,
     *,
     destination: Path,
-) -> None:
-    """Cut the selected window out of the dialogue stem as a mono 24 kHz WAV."""
+) -> float:
+    """Cut the selected window out of the dialogue stem as a mono 24 kHz WAV.
+
+    Returns the duration of the written file. The file always ends on silence:
+    the source is read up to :attr:`_ReferenceCandidate.source_end`, and any
+    remaining tail of the window is filled with digital silence.
+    """
 
     # Only attenuate: a reference that is already quiet must not be amplified,
     # because that would raise its noise floor and change how it clones.
     gain_db = min(0.0, REFERENCE_PEAK_DBFS - candidate.stats.peak_dbfs)
+
+    source_end = (
+        candidate.source_end if candidate.source_end is not None else candidate.end
+    )
+    source_end = min(source_end, candidate.end)
+    source_duration = max(0.0, source_end - candidate.start)
 
     arguments = [
         "-nostdin",
@@ -1659,7 +1793,7 @@ def _extract_reference(
         "-ss",
         f"{candidate.start:.6f}",
         "-t",
-        f"{candidate.duration:.6f}",
+        f"{source_duration:.6f}",
         "-i",
         str(source),
         "-vn",
@@ -1676,8 +1810,15 @@ def _extract_reference(
 
     _run_ffmpeg(arguments)
     _verify_reference(
-        destination, expected_duration=candidate.duration, speaker_id=candidate.speaker_id
+        destination, expected_duration=source_duration, speaker_id=candidate.speaker_id
     )
+
+    written = source_duration
+    if candidate.end > source_end + DURATION_TOLERANCE:
+        _append_silence(destination, candidate.end - source_end)
+        written = candidate.end - candidate.start
+
+    return written
 
 
 def _is_usable_prompt(path: Path) -> bool:
@@ -1816,7 +1957,8 @@ def _build_profile(
         ) from exc
 
     reference = speaker_dir / REFERENCE_FILENAME
-    _extract_reference(source, candidate, destination=reference)
+    written = _extract_reference(source, candidate, destination=reference)
+    reference_end = candidate.start + written
     window_pitch, window_presentation = _estimate_vocal_presentation(reference)
 
     # The aggregate wins when it exists: one window can be an expressive outlier or a
@@ -1839,7 +1981,7 @@ def _build_profile(
         speaker_id=speaker_id,
         reference_audio=reference,
         reference_start=candidate.start,
-        reference_end=candidate.end,
+        reference_end=reference_end,
         reference_text=candidate.text,
         clone_prompt_path=_clone_prompt(
             speaker_dir / CLONE_PROMPT_FILENAME,

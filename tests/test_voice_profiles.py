@@ -209,6 +209,29 @@ class FakeFfmpeg:
         return self.calls[-1]
 
 
+class SlicingFfmpeg:
+    """FFmpeg stand-in that really cuts the stem, so audio content can be inspected."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, arguments: list[str]) -> None:
+        self.calls.append(list(arguments))
+        source = Path(arguments[arguments.index("-i") + 1])
+        start = float(arguments[arguments.index("-ss") + 1])
+        duration = float(arguments[arguments.index("-t") + 1])
+        data, rate = sf.read(str(source), dtype="float32", always_2d=True)
+        mono = np.asarray(data).mean(axis=1)
+        first = int(round(start * rate))
+        last = first + int(round(duration * rate))
+        piece = mono[first:last]
+        if rate != REFERENCE_RATE:
+            piece = piece[:: int(rate // REFERENCE_RATE)]
+        destination = Path(arguments[-1])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(destination), piece, REFERENCE_RATE, subtype="PCM_16")
+
+
 class FakeEncoder:
     """Stand-in for the OmniVoice clone-prompt encoder."""
 
@@ -682,13 +705,13 @@ def test_longer_clean_speech_is_preferred(tmp_path: Path, ffmpeg: FakeFfmpeg) ->
         ),
     )["SPEAKER_00"]
 
-    assert profile.reference_duration == 9.0
+    assert profile.reference_duration == pytest.approx(9.3)
     assert profile.reference_start == 30.0
 
     # The shipping default prefers the short prompt instead, which is the trade the
     # 5s target exists to make.
     short = build_voice_profiles(segments, stem, settings=_settings(tmp_path))["SPEAKER_00"]
-    assert short.reference_duration == 4.0
+    assert short.reference_duration == pytest.approx(4.3)
     assert short.reference_start == 10.0
 
 
@@ -750,7 +773,7 @@ def test_a_short_but_clean_reference_is_used_when_it_is_all_there_is(
         [SpeakerSegment("SPEAKER_00", 10.0, 15.0)], stem, settings=_settings(tmp_path)
     )["SPEAKER_00"]
 
-    assert profile.reference_duration == 5.0
+    assert profile.reference_duration == pytest.approx(5.3)
 
 
 def test_silence_is_not_a_usable_reference(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
@@ -779,7 +802,8 @@ def test_contiguous_turns_are_joined_into_one_reference(
     profile = build_voice_profiles(segments, stem, settings=_settings(tmp_path))["SPEAKER_00"]
 
     assert profile.reference_start == 10.0
-    assert abs(profile.reference_duration - 8.1) < 1e-6
+    # 8.1s of speech plus the 0.3s silent tail every prompt carries.
+    assert profile.reference_duration == pytest.approx(8.4)
 
 
 def test_distant_turns_are_not_concatenated(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
@@ -797,7 +821,7 @@ def test_distant_turns_are_not_concatenated(tmp_path: Path, ffmpeg: FakeFfmpeg) 
 
     profile = build_voice_profiles(segments, stem, settings=_settings(tmp_path))["SPEAKER_00"]
 
-    assert profile.reference_duration == 4.0
+    assert profile.reference_duration == pytest.approx(4.3)
     assert profile.reference_start == 10.0
 
 
@@ -830,7 +854,7 @@ def test_a_long_monologue_is_scanned_with_a_sliding_window(
         [SpeakerSegment("SPEAKER_00", 10.0, 50.0)], stem, settings=_settings(tmp_path)
     )["SPEAKER_00"]
     assert short.reference_start == 30.0
-    assert short.reference_duration == 5.0
+    assert short.reference_duration == pytest.approx(5.3)
 
 
 def test_ties_are_broken_deterministically(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
@@ -966,8 +990,10 @@ def test_the_reference_text_describes_the_reference_audio_exactly(
     )["SPEAKER_00"]
 
     # The window is cut on the line boundaries, so the text is theirs exactly.
+    # A short digital tail closes the prompt on silence; it carries no words, so
+    # the same transcript still describes the audio.
     assert profile.reference_start == 10.0
-    assert profile.reference_end == 15.0
+    assert profile.reference_end == pytest.approx(15.3)
     assert profile.reference_text == "hello there"
 
 
@@ -1659,7 +1685,7 @@ def test_a_described_window_beats_a_longer_undescribed_one(
     )["SPEAKER_00"]
 
     assert profile.reference_start == 10.5
-    assert profile.reference_end == 15.0
+    assert profile.reference_end == pytest.approx(15.3)
     assert profile.reference_text == REPETITIVE_TEXT
 
 
@@ -1698,7 +1724,7 @@ def test_production_reference_requires_exact_transcript_and_four_seconds(
         require_reference_transcript=True,
     )["SPEAKER_00"]
 
-    assert profile.reference_duration == 5.0
+    assert profile.reference_duration == pytest.approx(5.3)
     assert 4.0 <= profile.reference_duration <= 10.0
     assert profile.reference_text == RICH_TEXT
 
@@ -1726,7 +1752,7 @@ def test_production_builds_one_continuous_reference_from_multiple_lines(
         require_reference_transcript=True,
     )["SPEAKER_00"]
 
-    assert profile.reference_duration == pytest.approx(5.1)
+    assert profile.reference_duration == pytest.approx(5.4)
     assert 4.0 <= profile.reference_duration <= 10.0
     assert profile.reference_text == "first phrase second phrase"
     assert profile.reference_audio == (
@@ -1767,7 +1793,7 @@ def test_short_clean_prompt_avoids_reference_tail_and_short_final_utterance(
 
     assert profile.reference_text == "a longer clean phrase"
     assert profile.reference_text is not None
-    assert profile.reference_end == pytest.approx(20.2)
+    assert profile.reference_end == pytest.approx(20.5)
     assert "business" not in profile.reference_text
 
 
@@ -2015,10 +2041,148 @@ def test_the_reference_keeps_silence_after_its_last_word(
     assert profile.reference_text == line.text
 
 
-def test_a_tail_still_speaking_at_the_search_limit_is_left_as_cut(
+#: Stems that cover every way a reference's last word can run past a transcript's
+#: end. Each is ``(regions, transcript, label)``: the audio, the lines describing it.
+_RELEASE_SHAPES = {
+    "release-then-silence": (
+        [(1.0, 6.10, LOUD), (6.10, 7.5, SILENCE)],
+        [("SPEAKER_00", 1.0, 6.0, "a line whose last word runs on")],
+    ),
+    "next-line-hard-against-the-release": (
+        [(1.0, 6.15, LOUD), (6.15, 8.0, SILENCE)],
+        [
+            ("SPEAKER_00", 1.0, 6.0, "a line whose last word runs on"),
+            ("SPEAKER_01", 6.25, 7.0, "the other character answers"),
+        ],
+    ),
+    "next-line-immediately": (
+        [(1.0, 6.30, LOUD), (6.30, 8.0, SILENCE)],
+        [
+            ("SPEAKER_00", 1.0, 6.0, "a line whose last word runs on"),
+            ("SPEAKER_01", 6.05, 6.28, "the other character interrupts"),
+        ],
+    ),
+    "speaker-still-talking-past-the-search": (
+        [(1.0, 9.0, LOUD)],
+        [("SPEAKER_00", 1.0, 6.0, "a line whose last word runs on")],
+    ),
+    "no-words-after-the-end-at-all": (
+        [(1.0, 6.0, LOUD)],
+        [("SPEAKER_00", 1.0, 6.0, "a line that ends where the file ends")],
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_RELEASE_SHAPES), ids=sorted(_RELEASE_SHAPES))
+def test_every_reference_ends_on_silence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """The invariant that stops OmniVoice repeating the reference's last word.
+
+    OmniVoice conditions on the reference as a *prefix* to continue: prompt audio and
+    ``ref_text`` are aligned by position, and the prompt region contributes no loss.
+    A prompt whose audio stops while a phone is still sounding is therefore read as
+    unfinished, and the model speaks the rest of that word before the line it was
+    asked for - once per character, because the prompt is built once per character.
+    The run this fixes had exactly that: the reference's speech ran to its final
+    sample at -17 dBFS while its transcript claimed the whole last word.
+
+    So whatever shape the audio takes, the file handed to the model has to end on
+    silence. It is checked on the written file, not on the decision, because the
+    silence may be added rather than read from the source.
+    """
+
+    regions, lines = _RELEASE_SHAPES[shape]
+    monkeypatch.setattr(voice_profiles, "_run_ffmpeg", SlicingFfmpeg())
+    stem = _write_stem(tmp_path / "speech.wav", regions)
+    transcript = [TranscriptSegment(*line) for line in lines]
+
+    profile = build_voice_profiles(
+        [
+            SpeakerSegment(line.speaker_id, line.start, line.end)
+            for line in transcript
+            if line.speaker_id == "SPEAKER_00"
+        ],
+        stem,
+        transcript=transcript,
+        settings=_settings(tmp_path, voice_reference_target_duration=5.0),
+    )["SPEAKER_00"]
+
+    samples, rate = sf.read(str(profile.reference_audio), dtype="float32")
+    samples = np.asarray(samples, dtype=np.float32)
+    peak = float(np.max(np.abs(samples)))
+    tail = samples[-int(voice_profiles.REFERENCE_TRAIL_SILENCE_SECONDS * rate) :]
+    tail_rms = float(np.sqrt(np.mean(np.square(tail))))
+    assert tail_rms <= max(peak * 0.01, 1e-4), (
+        f"{shape}: the prompt still ends on sound ({tail_rms:.4f} vs peak {peak:.4f})"
+    )
+    # The transcript's last word is still in the prompt: the cut was moved to the
+    # release, not shortened away.
+    assert profile.reference_text == lines[0][3]
+    assert profile.reference_end - profile.reference_start == pytest.approx(
+        len(samples) / rate, abs=0.01
+    )
+
+
+def test_the_reference_tail_is_padded_when_the_next_line_leaves_no_room(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run that prompted this had exactly this shape.
+
+    The speaker's final word ran past the transcript's end timestamp, and the next
+    character started only 0.25s later - less than the 0.3s tail the prompt wants.
+    The old search rejected the window because the full tail did not fit, so the
+    reference was cut inside the last word while its transcript still claimed it
+    whole; OmniVoice then finished that English fragment at the start of every
+    Amharic line. The window must follow the speaker's release and pad the missing
+    tail with silence instead.
+    """
+
+    monkeypatch.setattr(voice_profiles, "_run_ffmpeg", SlicingFfmpeg())
+    stem = _write_stem(
+        tmp_path / "speech.wav", [(1.0, 6.15, LOUD), (6.15, 8.0, SILENCE)]
+    )
+    transcript = [
+        TranscriptSegment("SPEAKER_00", 1.0, 6.0, "a complete line"),
+        TranscriptSegment("SPEAKER_01", 6.25, 7.0, "next speaker"),
+    ]
+
+    profile = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", 1.0, 6.0)],
+        stem,
+        transcript=transcript,
+        settings=_settings(tmp_path, voice_reference_target_duration=5.0),
+    )["SPEAKER_00"]
+
+    assert profile.reference_text == "a complete line"
+    # The prompt follows the release (6.15 s) and then carries 0.3 s of silence,
+    # which is longer than the 0.25 s gap to the next character - so part of that
+    # tail has to be added, not read from the source.
+    assert profile.reference_end == pytest.approx(6.45, abs=0.06)
+    samples, rate = sf.read(str(profile.reference_audio), dtype="float32")
+    assert len(samples) / rate == pytest.approx(profile.reference_duration, abs=0.01)
+    # The release is inside the prompt, rather than the cut being hidden by starting
+    # the padding at 6.0 and leaving the last phone out.
+    release = samples[int(5.05 * rate) : int(5.14 * rate)]
+    assert float(np.sqrt(np.mean(release**2))) > 1e-3
+    tail = samples[-int(0.2 * rate) :]
+    assert float(np.sqrt(np.mean(tail**2))) < 1e-3
+    # Nothing from the next character's line leaked in: everything past the bound
+    # the next line imposes is the silence this project added, not source audio.
+    after_next_line = samples[int((6.25 - profile.reference_start) * rate) :]
+    assert float(np.max(np.abs(after_next_line))) < 1e-3
+
+
+def test_a_tail_still_speaking_at_the_search_limit_is_padded_but_not_extended(
     tmp_path: Path, ffmpeg: FakeFfmpeg
 ) -> None:
-    """Without an acoustic offset there is nothing to pad to, so nothing changes."""
+    """There is no acoustic offset to extend to, so the prompt is closed with silence.
+
+    The source is still speaking when the search region ends, so no untranscribed
+    speech may be pulled in. The prompt still has to end on silence: a prompt that
+    stops while a phone is sounding is treated as unfinished and the model speaks
+    the missing fragment before the line it was asked for.
+    """
 
     stem = _write_stem(tmp_path / "speech.wav", [(1.0, 8.0, LOUD)])
 
@@ -2029,7 +2193,8 @@ def test_a_tail_still_speaking_at_the_search_limit_is_left_as_cut(
         settings=_settings(tmp_path, voice_reference_target_duration=5.0),
     )["SPEAKER_00"]
 
-    assert profile.reference_end == pytest.approx(6.0)
+    assert profile.reference_end == pytest.approx(6.3)
+    assert "silence after the speech" in profile.selection_reason
 
 
 def test_padding_cannot_reach_into_the_next_line() -> None:
