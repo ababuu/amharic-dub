@@ -42,6 +42,7 @@ def _settings(root: Path, **overrides: object) -> Settings:
         "model_cache_dir": root / "models",
         "dialogue_bible_path": root / "work" / "dialogue_bible.json",
         "character_guide_path": root / "work" / "character_guide.json",
+        "episode_script_path": root / "work" / "episode_script.json",
         "deepseek_api_key": "test-key",
         "translation_backend": "openai",
         "translation_provider": "deepseek",
@@ -580,3 +581,184 @@ def test_a_malformed_review_response_does_not_change_labels(tmp_path: Path) -> N
     assert lines[0].speaker_id == SPEAKER_A
     assert review.applied == ()
     assert review.uncertain == ()
+
+# ---------------------------------------------------------------------------
+# Episode script research
+# ---------------------------------------------------------------------------
+
+
+def _dialogue_reply(count: int = 12) -> dict:
+    speakers = ["Walt", "Skyler"]
+    return {
+        "lines": [
+            {
+                "speaker": speakers[index % 2],
+                "text": f"Line number {index} about the family and the danger.",
+            }
+            for index in range(count)
+        ]
+    }
+
+
+def _script_fixture(root: Path):
+    from app.pipeline.dialogue_context import CharacterGuide, GuideCharacter
+
+    path = _title_file(root, "breaking-bad.txt", "Breaking Bad S04E06")
+    title = TitleInfo(title="Breaking Bad S04E06", path=path, season=4, episode=6)
+    hits = [SearchHit("Transcript", "https://example.com/transcript", authority=2)]
+    pages = [
+        FetchedPage(
+            "https://example.com/transcript",
+            "Transcript",
+            "\n".join(
+                f"[Walt] Something spoken at length number {index}."
+                for index in range(40)
+            ),
+        )
+    ]
+    guide = CharacterGuide(
+        title="Breaking Bad S04E06",
+        season=4,
+        episode=6,
+        characters=(
+            GuideCharacter(name="Walt", gender="masculine", sources=("https://example.com",)),
+            GuideCharacter(name="Skyler", gender="feminine", sources=("https://example.com",)),
+        ),
+    )
+    return title, _FakeTools(hits, pages), guide
+
+
+def test_episode_script_is_extracted_and_cached(tmp_path: Path) -> None:
+    from app.pipeline.context_ai import build_episode_script
+
+    title, tools, guide = _script_fixture(tmp_path)
+    chat = _FakeChat(_dialogue_reply())
+    settings = _settings(tmp_path)
+
+    script = build_episode_script(
+        title, settings=settings, guide=guide, tools=tools, chat_client=chat
+    )
+
+    assert script is not None
+    assert len(script) == 12
+    assert {line.speaker for line in script.lines} == {"Walt", "Skyler"}
+    assert script.sources == ("https://example.com/transcript",)
+    assert settings.episode_script_path.is_file()
+    payload = json.loads(chat.completions.requests[0]["messages"][1]["content"])
+    assert payload["title"] == title.label
+    assert "Walt" in payload["known_characters"]
+
+
+def test_a_cached_script_is_reused_without_network_calls(tmp_path: Path) -> None:
+    from app.pipeline.context_ai import build_episode_script
+
+    title, tools, guide = _script_fixture(tmp_path)
+    settings = _settings(tmp_path)
+    build_episode_script(
+        title,
+        settings=settings,
+        guide=guide,
+        tools=tools,
+        chat_client=_FakeChat(_dialogue_reply()),
+    )
+
+    unused_tools = _FakeTools([], [])
+    unused_chat = _FakeChat(RuntimeError("must not be called"))
+    cached = build_episode_script(
+        title,
+        settings=settings,
+        guide=guide,
+        tools=unused_tools,
+        chat_client=unused_chat,
+    )
+
+    assert cached is not None and len(cached) == 12
+    assert unused_tools.searches == []
+    assert unused_chat.completions.requests == []
+
+
+def test_script_extraction_rejects_stage_directions_and_thin_pages(tmp_path: Path) -> None:
+    from app.pipeline.context_ai import build_episode_script
+
+    title, tools, guide = _script_fixture(tmp_path)
+    chat = _FakeChat(
+        {
+            "lines": [
+                {"speaker": "[gunshot]", "text": "bang"},
+                {"speaker": "Walt", "text": "[door slams]"},
+                {"speaker": "Walt", "text": "One."},
+            ]
+        }
+    )
+
+    script = build_episode_script(
+        title, settings=_settings(tmp_path), guide=guide, tools=tools, chat_client=chat
+    )
+
+    assert script is None
+
+
+def test_script_extraction_requires_two_speakers(tmp_path: Path) -> None:
+    from app.pipeline.context_ai import build_episode_script
+
+    title, tools, guide = _script_fixture(tmp_path)
+    chat = _FakeChat(
+        {
+            "lines": [
+                {"speaker": "Walt", "text": f"Only one voice says line {index}."}
+                for index in range(12)
+            ]
+        }
+    )
+
+    script = build_episode_script(
+        title, settings=_settings(tmp_path), guide=guide, tools=tools, chat_client=chat
+    )
+
+    assert script is None
+
+
+def test_episode_script_research_needs_a_key(tmp_path: Path) -> None:
+    from app.pipeline.context_ai import build_episode_script
+
+    title, tools, guide = _script_fixture(tmp_path)
+    chat = _FakeChat(_dialogue_reply())
+
+    script = build_episode_script(
+        title,
+        settings=_settings(tmp_path, deepseek_api_key=None),
+        guide=guide,
+        tools=tools,
+        chat_client=chat,
+    )
+
+    assert script is None
+    assert tools.searches == []
+
+def test_a_wrong_episode_script_is_rejected_by_phrase_overlap(tmp_path: Path) -> None:
+    from app.pipeline.context_ai import build_episode_script
+
+    title, tools, guide = _script_fixture(tmp_path)
+    chat = _FakeChat(
+        {
+            "lines": [
+                {
+                    "speaker": "Walt" if index % 2 else "Skyler",
+                    "text": f"An unrelated scene sentence number {index} about something else.",
+                }
+                for index in range(12)
+            ]
+        }
+    )
+
+    script = build_episode_script(
+        title,
+        settings=_settings(tmp_path),
+        guide=guide,
+        tools=tools,
+        chat_client=chat,
+        transcript=["I am not in danger, Skyler.", "I am the danger."],
+    )
+
+    assert script is None
+    assert not _settings(tmp_path).episode_script_path.exists()

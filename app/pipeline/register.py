@@ -333,6 +333,22 @@ class _Spanned(Protocol):
     end: float
 
 
+def measure_line_pitches(
+    segments: Iterable[TranscriptSegment], audio: str | Path
+) -> list[float | None]:
+    """Return each segment's median pitch, or ``None`` when it is unmeasurable.
+
+    The script reconciler uses this to separate two characters of the same gender.
+    It is a line-level measurement, so an octave error or a very short fragment can
+    mislead it; the gender of the researched character is the stronger signal when
+    it leaves exactly one candidate voice.
+    """
+
+    ordered = _validate(segments)
+    samples, rate = _read_speech(audio)
+    return [pitch.median_hz for pitch in measure_turn_pitch(ordered, samples, rate)]
+
+
 def measure_registers(
     spans: Iterable[_Spanned],
     audio: str | Path,
@@ -869,6 +885,7 @@ __all__ = [
     "aggregate_registers",
     "contiguous_turns",
     "disagreement",
+    "measure_line_pitches",
     "measure_registers",
     "measure_turn_pitch",
     "presentation_of",

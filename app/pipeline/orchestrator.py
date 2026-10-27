@@ -60,6 +60,7 @@ from app.pipeline import (
     mixing,
     qc,
     register,
+    script_reconciliation,
     separation,
     target_extraction,
     timing,
@@ -166,6 +167,10 @@ class PipelineResult:
     refused_recoveries: int = 0
     #: Sourced research about the film's cast, passed to the translation prompt.
     character_guide: dialogue_context.CharacterGuide | None = None
+    #: Speaker-labelled episode script used to reconcile ASR lines with who says
+    #: them, and the result of that reconciliation.
+    episode_script: script_reconciliation.EpisodeScript | None = None
+    script_reconciliation: script_reconciliation.ScriptReconciliation | None = None
     #: The AI speaker-attribution review: what was corrected and what was left for
     #: QC. ``None`` when the review was disabled or never had evidence to review.
     attribution_review: context_ai.AttributionReview | None = None
@@ -192,13 +197,14 @@ class PipelineResult:
         """Return the register audit: what each voice measured, and what moved."""
 
         if self.attribution is None:
-            # The AI review can still have run without register measurement, and a
-            # QC case is worth recording even when the pitch audit is missing.
-            return (
-                {}
-                if self.attribution_review is None
-                else {"ai_review": self.attribution_review.as_dict()}
-            )
+            # A review can still have run without register measurement, and a QC
+            # case is worth recording even when the pitch audit is missing.
+            payload: dict[str, Any] = {}
+            if self.attribution_review is not None:
+                payload["ai_review"] = self.attribution_review.as_dict()
+            if self.script_reconciliation is not None:
+                payload["script_reconciliation"] = self.script_reconciliation.as_dict()
+            return payload
 
         def registers(items: Mapping[str, register.SpeakerRegister]) -> dict[str, Any]:
             return {
@@ -233,6 +239,8 @@ class PipelineResult:
         }
         if self.attribution_review is not None:
             payload["ai_review"] = self.attribution_review.as_dict()
+        if self.script_reconciliation is not None:
+            payload["script_reconciliation"] = self.script_reconciliation.as_dict()
         return payload
 
     def to_dict(self) -> dict[str, Any]:
@@ -349,6 +357,9 @@ class PipelineResult:
             # decision, so it is recorded with its sources for audit.
             "characters": (
                 None if self.character_guide is None else self.character_guide.as_dict()
+            ),
+            "script": (
+                None if self.episode_script is None else self.episode_script.summary()
             ),
             "tts": {
                 "clips": [clip.to_dict() for clip in self.clips],
@@ -746,6 +757,23 @@ def run_pipeline(
     except Exception as exc:  # research must never be the reason a film fails
         report(f"  characters: unavailable ({type(exc).__name__}: {exc}); continuing")
 
+    # The script is the other half of the research: a sourced, speaker-labelled
+    # transcript lets the reconciliation below recover the lines diarization merged
+    # into one character's long turn. Fetched once and cached per episode.
+    script: script_reconciliation.EpisodeScript | None = None
+    try:
+        script = context_ai.episode_script_for_run(
+            video_path,
+            settings=resolved,
+            guide=guide,
+            # The clip's own words validate a fetched transcript before it is used:
+            # a page for the wrong episode shares almost none of its phrases.
+            transcript=[line.text for line in lines],
+            report=report,
+        )
+    except Exception as exc:  # a missing script degrades, never fails
+        report(f"  script: unavailable ({type(exc).__name__}: {exc}); continuing")
+
     # Who is speaking, measured from the voice itself. Diarization usually gets the
     # clusters right and a handful of turns wrong, and one wrong turn is enough to
     # hand a character the wrong voice for the whole film - the reference recording
@@ -792,36 +820,81 @@ def run_pipeline(
         if untrustworthy:
             report(f"  cast warning: {untrustworthy}")
 
-    # The measured labels can still be wrong on an interruption: the model may
-    # propose a correction, but only diarization or overlap evidence can justify
-    # one, and a label the speaker embeddings confirmed is never moved. A proposal
-    # that fails those gates stays in the manifest as a QC case rather than being
-    # handed to the wrong character's voice.
-    speaker_review: context_ai.AttributionReview | None = None
-    try:
-        lines, speaker_review = context_ai.review_speaker_attribution(
-            lines,
-            settings=resolved,
-            turns=turns,
-            verified=diarized.verified,
-            crosstalk=crosstalk,
-            registers=(
-                attribution.after if attribution is not None else speaker_registers
-            ),
-            guide=guide,
-            report=report,
-        )
-    except Exception as exc:  # the review is an improvement, not a prerequisite
-        report(f"  ai review: unavailable ({type(exc).__name__}: {exc})")
-        speaker_review = None
-    else:
-        if speaker_review is not None and speaker_review.skipped:
-            report(f"  ai review: {speaker_review.skipped}")
-        if speaker_review is not None and speaker_review.uncertain:
-            report(
-                "  ai review: uncertain attributions are recorded in "
-                "run.speakers.ai_review.uncertain for QC"
+    # A long diarization turn is verified as one voice, but a short interjection
+    # from the other character inside it belongs to the interjection. The episode
+    # script, aligned word by word, is the evidence that separates them. It may only
+    # move a label when the match is strong and the character can be tied to a
+    # diarized voice; a label embedding-verified at the line's own timescale stays.
+    script_review: script_reconciliation.ScriptReconciliation | None = None
+    if script is not None:
+        pitches: list[float | None] | None = None
+        try:
+            pitches = register.measure_line_pitches(lines, stems.speech)
+        except register.RegisterError as exc:
+            report(f"  script: line pitch unmeasured ({exc})")
+        try:
+            lines, script_review = script_reconciliation.reconcile_speakers(
+                lines,
+                script=script,
+                guide=guide,
+                registers=(
+                    attribution.after if attribution is not None else speaker_registers
+                ),
+                pitches=pitches,
+                verified=diarized.verified,
+                threshold=resolved.context_ai_confidence_threshold,
             )
+        except Exception as exc:  # reconciliation is an improvement, not a prerequisite
+            report(f"  script: reconciliation unavailable ({type(exc).__name__}: {exc})")
+            script_review = None
+        else:
+            if script_review.applied:
+                report(
+                    f"  script: corrected {len(script_review.applied)} speaker "
+                    f"attribution(s) against {script_review.matched_lines} matched "
+                    "line(s)"
+                )
+            for change in script_review.applied:
+                report(
+                    f"        {change.start:.2f}-{change.end:.2f}s "
+                    f"{change.from_speaker} -> {change.to_speaker} "
+                    f"({change.character})"
+                )
+            if script_review.uncertain:
+                report(
+                    f"  script: {len(script_review.uncertain)} line(s) left for QC in "
+                    "run.speakers.script_reconciliation.uncertain"
+                )
+
+    # Without a script, fall back to the diarization-only review. With one, the
+    # script alignment is the stronger evidence and a second, weaker review would
+    # only reintroduce the coarse-turn mistake.
+    speaker_review: context_ai.AttributionReview | None = None
+    if script_review is None:
+        try:
+            lines, speaker_review = context_ai.review_speaker_attribution(
+                lines,
+                settings=resolved,
+                turns=turns,
+                verified=diarized.verified,
+                crosstalk=crosstalk,
+                registers=(
+                    attribution.after if attribution is not None else speaker_registers
+                ),
+                guide=guide,
+                report=report,
+            )
+        except Exception as exc:  # the review is an improvement, not a prerequisite
+            report(f"  ai review: unavailable ({type(exc).__name__}: {exc})")
+            speaker_review = None
+        else:
+            if speaker_review is not None and speaker_review.skipped:
+                report(f"  ai review: {speaker_review.skipped}")
+            if speaker_review is not None and speaker_review.uncertain:
+                report(
+                    "  ai review: uncertain attributions are recorded in "
+                    "run.speakers.ai_review.uncertain for QC"
+                )
 
     lines = tuple(lines)
 
@@ -873,6 +946,21 @@ def run_pipeline(
     bible = dialogue_context.CharacterBible.load(
         resolved.dialogue_bible_path
     ).with_guide(guide)
+    # The script reconciliation also established which diarized voice is which
+    # character. That is exactly the state translation needs for gendered forms and
+    # address, so it fills any speaker the operator's bible did not already name.
+    if script_review is not None and script_review.mapping:
+        cast = dict(bible.characters)
+        for found in script_review.mapping:
+            if not found.speaker_id or found.speaker_id in cast:
+                continue
+            cast[found.speaker_id] = dialogue_context.Character(
+                speaker_id=found.speaker_id,
+                name=found.character,
+                gender=found.gender if found.gender != "unknown" else "",
+                sources=tuple(script.sources[:1]) if script is not None else (),
+            )
+        bible = dialogue_context.CharacterBible(characters=cast, guide=guide)
 
     dialogue = tuple(
         _stage(
@@ -1266,6 +1354,8 @@ def run_pipeline(
         legacy_separated_lines=transcription_result.legacy_lines,
         refused_recoveries=transcription_result.refused_recoveries,
         character_guide=guide,
+        episode_script=script,
+        script_reconciliation=script_review,
         attribution_review=speaker_review,
     )
 

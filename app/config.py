@@ -339,6 +339,11 @@ DEFAULT_DIALOGUE_BIBLE_PATH = DEFAULT_WORK_DIR / DEFAULT_DIALOGUE_BIBLE_FILENAME
 DEFAULT_CHARACTER_GUIDE_FILENAME = "character_guide.json"
 DEFAULT_CHARACTER_GUIDE_PATH = DEFAULT_WORK_DIR / DEFAULT_CHARACTER_GUIDE_FILENAME
 
+#: Cached, speaker-labelled episode script used to reconcile ASR lines with who
+#: actually says them. Kept beside the guide and reused for the same episode.
+DEFAULT_EPISODE_SCRIPT_FILENAME = "episode_script.json"
+DEFAULT_EPISODE_SCRIPT_PATH = DEFAULT_WORK_DIR / DEFAULT_EPISODE_SCRIPT_FILENAME
+
 #: Whether the context-aware AI layer runs at all. It needs a DeepSeek key and
 #: degrades to no-ops when one is absent, so this is an escape hatch rather than a
 #: hard dependency.
@@ -351,6 +356,10 @@ DEFAULT_CONTEXT_AI_CONFIDENCE_THRESHOLD = 0.75
 #: Per-request timeout for character research, in seconds. Bounded so an unavailable
 #: search or fetch endpoint cannot stall a run.
 DEFAULT_CONTEXT_AI_TIMEOUT_SECONDS = 20.0
+
+#: Timeout for script extraction, in seconds. A full episode transcript is a much
+#: larger request than a character lookup, so it gets its own, longer bound.
+DEFAULT_CONTEXT_AI_SCRIPT_TIMEOUT_SECONDS = 120.0
 
 #: DeepSeek's documented Search and Fetch endpoints, relative to its base URL.
 DEFAULT_DEEPSEEK_SEARCH_PATH = "/v1/tools/search"
@@ -923,9 +932,13 @@ class Settings:
     #: Cached character research and the settings that bound it. See
     #: :mod:`app.pipeline.context_ai`.
     character_guide_path: Path = DEFAULT_CHARACTER_GUIDE_PATH
+    episode_script_path: Path = DEFAULT_EPISODE_SCRIPT_PATH
     context_ai_enabled: bool = DEFAULT_CONTEXT_AI_ENABLED
     context_ai_confidence_threshold: float = DEFAULT_CONTEXT_AI_CONFIDENCE_THRESHOLD
     context_ai_timeout_seconds: float = DEFAULT_CONTEXT_AI_TIMEOUT_SECONDS
+    context_ai_script_timeout_seconds: float = (
+        DEFAULT_CONTEXT_AI_SCRIPT_TIMEOUT_SECONDS
+    )
     #: TTS settings for :mod:`app.pipeline.tts`: the Amharic speech adapter and the
     #: pause bounds of one synthesized line.
     tts_model: str = DEFAULT_TTS_MODEL
@@ -1101,6 +1114,9 @@ class Settings:
             character_guide_path=_read_path(
                 "CHARACTER_GUIDE_PATH", work_dir / DEFAULT_CHARACTER_GUIDE_FILENAME
             ),
+            episode_script_path=_read_path(
+                "EPISODE_SCRIPT_PATH", work_dir / DEFAULT_EPISODE_SCRIPT_FILENAME
+            ),
             context_ai_enabled=_read_bool(
                 "CONTEXT_AI_ENABLED", DEFAULT_CONTEXT_AI_ENABLED
             ),
@@ -1110,6 +1126,10 @@ class Settings:
             ),
             context_ai_timeout_seconds=_read_float(
                 "CONTEXT_AI_TIMEOUT_SECONDS", DEFAULT_CONTEXT_AI_TIMEOUT_SECONDS
+            ),
+            context_ai_script_timeout_seconds=_read_float(
+                "CONTEXT_AI_SCRIPT_TIMEOUT_SECONDS",
+                DEFAULT_CONTEXT_AI_SCRIPT_TIMEOUT_SECONDS,
             ),
             tts_model=(_read_env("TTS_MODEL", DEFAULT_TTS_MODEL) or DEFAULT_TTS_MODEL),
             tts_engine=(
@@ -1313,9 +1333,13 @@ class Settings:
             "voice_bank_voice_map": self.voice_bank_voice_map,
             "dialogue_bible_path": str(self.dialogue_bible_path),
             "character_guide_path": str(self.character_guide_path),
+            "episode_script_path": str(self.episode_script_path),
             "context_ai_enabled": self.context_ai_enabled,
             "context_ai_confidence_threshold": self.context_ai_confidence_threshold,
             "context_ai_timeout_seconds": self.context_ai_timeout_seconds,
+            "context_ai_script_timeout_seconds": (
+                self.context_ai_script_timeout_seconds
+            ),
             "tts_model": self.tts_model,
             "tts_engine": self.tts_engine,
             "omnivoice_model": self.omnivoice_model,
@@ -1355,6 +1379,9 @@ __all__ = [
     "DEFAULT_DIALOGUE_BIBLE_PATH",
     "DEFAULT_CHARACTER_GUIDE_FILENAME",
     "DEFAULT_CHARACTER_GUIDE_PATH",
+    "DEFAULT_EPISODE_SCRIPT_FILENAME",
+    "DEFAULT_EPISODE_SCRIPT_PATH",
+    "DEFAULT_CONTEXT_AI_SCRIPT_TIMEOUT_SECONDS",
     "DEFAULT_CONTEXT_AI_ENABLED",
     "DEFAULT_CONTEXT_AI_CONFIDENCE_THRESHOLD",
     "DEFAULT_CONTEXT_AI_TIMEOUT_SECONDS",

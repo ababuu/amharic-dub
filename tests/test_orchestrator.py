@@ -58,6 +58,8 @@ def _settings(root: Path, **overrides: object) -> Settings:
         # manifest.
         "voice_bank_dir": root / "voice-bank",
         "dialogue_bible_path": root / "work" / "dialogue_bible.json",
+        "character_guide_path": root / "work" / "character_guide.json",
+        "episode_script_path": root / "work" / "episode_script.json",
         # These tests exercise the per-character path, which needs voice profiles,
         # so they pin the engine that uses them rather than inheriting the default.
         "tts_engine": "omnivoice",
