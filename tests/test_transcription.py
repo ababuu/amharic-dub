@@ -1882,3 +1882,60 @@ def test_a_group_that_crosses_a_speaker_change_is_split():
 
     assert [sentence.speaker_id for sentence in sentences] == ["SPEAKER_00", "SPEAKER_01"]
 
+
+# ---------------------------------------------------------------------------
+# Sentence integrity inside a model-proposed grouping
+# ---------------------------------------------------------------------------
+
+
+def _artifact_parts():
+    """The real Breaking Bad fragments that the model over-merged."""
+
+    return [
+        transcription.TranscriptSegment(
+            "SPEAKER_01", 85.72, 86.76, "No, you clearly."
+        ),
+        transcription.TranscriptSegment(
+            "SPEAKER_01", 87.81, 89.93, "Don't know who you're talking to."
+        ),
+        transcription.TranscriptSegment(
+            "SPEAKER_01", 90.65, 92.61, "I am not in danger, Skyler."
+        ),
+        transcription.TranscriptSegment("SPEAKER_01", 92.69, 94.17, "I am the danger."),
+    ]
+
+
+def test_a_model_grouping_cannot_merge_two_finished_sentences():
+    """A fragment join is kept; two complete utterances are not glued together."""
+
+    sentences = transcription.assemble_sentences(
+        _artifact_parts(), grouper=lambda _segments: [[0, 1, 2, 3]]
+    )
+
+    assert [sentence.text for sentence in sentences] == [
+        "No, you clearly, Don't know who you're talking to.",
+        "I am not in danger, Skyler.",
+        "I am the danger.",
+    ]
+
+
+def test_a_model_grouping_cannot_absorb_a_short_utterance():
+    parts = [
+        transcription.TranscriptSegment(
+            "SPEAKER_01", 94.37, 97.19, "A guy opens his door and gets shot."
+        ),
+        transcription.TranscriptSegment("SPEAKER_01", 97.87, 97.97, "No."),
+        transcription.TranscriptSegment("SPEAKER_01", 99.02, 99.38, "I am."),
+        transcription.TranscriptSegment("SPEAKER_01", 99.80, 100.46, "The one who knocks."),
+    ]
+
+    sentences = transcription.assemble_sentences(
+        parts, grouper=lambda _segments: [[0, 1, 2, 3]]
+    )
+
+    assert [sentence.text for sentence in sentences] == [
+        "A guy opens his door and gets shot.",
+        "No.",
+        "I am.",
+        "The one who knocks.",
+    ]

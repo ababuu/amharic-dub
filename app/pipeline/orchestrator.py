@@ -53,6 +53,7 @@ from typing import Any
 
 from app.config import Settings, get_settings
 from app.pipeline import (
+    context_ai,
     dialogue_context,
     diarization,
     evaluation,
@@ -163,6 +164,11 @@ class PipelineResult:
     legacy_separated_lines: int = 0
     #: Recoveries the acoustic gate refused; the reason is in the run's report.
     refused_recoveries: int = 0
+    #: Sourced research about the film's cast, passed to the translation prompt.
+    character_guide: dialogue_context.CharacterGuide | None = None
+    #: The AI speaker-attribution review: what was corrected and what was left for
+    #: QC. ``None`` when the review was disabled or never had evidence to review.
+    attribution_review: context_ai.AttributionReview | None = None
 
     @property
     def final_video(self) -> Path:
@@ -186,7 +192,13 @@ class PipelineResult:
         """Return the register audit: what each voice measured, and what moved."""
 
         if self.attribution is None:
-            return {}
+            # The AI review can still have run without register measurement, and a
+            # QC case is worth recording even when the pitch audit is missing.
+            return (
+                {}
+                if self.attribution_review is None
+                else {"ai_review": self.attribution_review.as_dict()}
+            )
 
         def registers(items: Mapping[str, register.SpeakerRegister]) -> dict[str, Any]:
             return {
@@ -203,7 +215,7 @@ class PipelineResult:
                 for speaker_id, measured in items.items()
             }
 
-        return {
+        payload = {
             "before": registers(self.attribution.before),
             "after": registers(self.attribution.after),
             "reassigned_fraction": round(self.attribution.reassigned_fraction, 4),
@@ -219,6 +231,9 @@ class PipelineResult:
             ],
             "warning": register.disagreement(self.attribution),
         }
+        if self.attribution_review is not None:
+            payload["ai_review"] = self.attribution_review.as_dict()
+        return payload
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe view of the run, for a manifest or a report."""
@@ -330,6 +345,11 @@ class PipelineResult:
                 for speaker_id, profile in self.profiles.items()
             },
             "speakers": self._attribution_dict(),
+            # The researched cast is evidence for translation, not a casting
+            # decision, so it is recorded with its sources for audit.
+            "characters": (
+                None if self.character_guide is None else self.character_guide.as_dict()
+            ),
             "tts": {
                 "clips": [clip.to_dict() for clip in self.clips],
                 # Lines the stage could not voice. Recorded because a line missing
@@ -712,6 +732,20 @@ def run_pipeline(
             "diarization)"
         )
 
+    # The film's own title is the only dependable way to know who its characters
+    # are. It is read from a .txt file discovered in the input directory (never a
+    # hard-coded name), researched through DeepSeek's Search and Fetch endpoints,
+    # and cached so the whole run - and the next run of the same episode - shares
+    # one sourced guide. Missing title, missing key or an unavailable endpoint is a
+    # note, never a failed run.
+    guide: dialogue_context.CharacterGuide | None = None
+    try:
+        guide = context_ai.character_guide_for_run(
+            video_path, settings=resolved, report=report
+        )
+    except Exception as exc:  # research must never be the reason a film fails
+        report(f"  characters: unavailable ({type(exc).__name__}: {exc}); continuing")
+
     # Who is speaking, measured from the voice itself. Diarization usually gets the
     # clusters right and a handful of turns wrong, and one wrong turn is enough to
     # hand a character the wrong voice for the whole film - the reference recording
@@ -758,6 +792,37 @@ def run_pipeline(
         if untrustworthy:
             report(f"  cast warning: {untrustworthy}")
 
+    # The measured labels can still be wrong on an interruption: the model may
+    # propose a correction, but only diarization or overlap evidence can justify
+    # one, and a label the speaker embeddings confirmed is never moved. A proposal
+    # that fails those gates stays in the manifest as a QC case rather than being
+    # handed to the wrong character's voice.
+    speaker_review: context_ai.AttributionReview | None = None
+    try:
+        lines, speaker_review = context_ai.review_speaker_attribution(
+            lines,
+            settings=resolved,
+            turns=turns,
+            verified=diarized.verified,
+            crosstalk=crosstalk,
+            registers=(
+                attribution.after if attribution is not None else speaker_registers
+            ),
+            guide=guide,
+            report=report,
+        )
+    except Exception as exc:  # the review is an improvement, not a prerequisite
+        report(f"  ai review: unavailable ({type(exc).__name__}: {exc})")
+        speaker_review = None
+    else:
+        if speaker_review is not None and speaker_review.skipped:
+            report(f"  ai review: {speaker_review.skipped}")
+        if speaker_review is not None and speaker_review.uncertain:
+            report(
+                "  ai review: uncertain attributions are recorded in "
+                "run.speakers.ai_review.uncertain for QC"
+            )
+
     lines = tuple(lines)
 
     # A transcriber segments on pauses, not on grammar, so one spoken sentence
@@ -803,7 +868,11 @@ def run_pipeline(
 
     # Consistency state, not a guess: an absent bible yields an empty one, so a
     # first run works and a second run inherits whatever was filled in by hand.
-    bible = dialogue_context.CharacterBible.load(resolved.dialogue_bible_path)
+    # The researched guide travels beside the operator's cast so every translation
+    # request in the run sees the same sourced names and genders.
+    bible = dialogue_context.CharacterBible.load(
+        resolved.dialogue_bible_path
+    ).with_guide(guide)
 
     dialogue = tuple(
         _stage(
@@ -1196,6 +1265,8 @@ def run_pipeline(
         separated_lines=transcription_result.separated_lines,
         legacy_separated_lines=transcription_result.legacy_lines,
         refused_recoveries=transcription_result.refused_recoveries,
+        character_guide=guide,
+        attribution_review=speaker_review,
     )
 
     # Measured, not assumed: the model-free quality report is part of every run.

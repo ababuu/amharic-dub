@@ -1531,6 +1531,81 @@ def _last_written_index(text: str) -> int:
     return index
 
 
+#: Words that begin a new sentence far more often than they continue one. The test
+#: is on the word's stem, so "I'm" and "That's" count while "Don't" does not - it is
+#: an auxiliary continuing "No, you clearly."
+_SENTENCE_STARTERS = frozenset(
+    """
+    a an the this that these those i you he she it we they there here
+    what who whom whose where when why how do does did is are was were am
+    can could will would shall should may might must have has had let lets
+    please thank sorry no yes oh well jesus god sir madam
+    """.split()
+)
+
+
+def _first_stem(text: str) -> str:
+    """Return the lower-case stem of the first written word in ``text``."""
+
+    stripped = text.strip().lstrip(_WRAPPING)
+    word = stripped.split(maxsplit=1)[0] if stripped.split() else ""
+    word = word.strip(_WRAPPING + ".,!?;:").casefold().replace("\u2019", "'")
+    return word.split("'", 1)[0]
+
+
+#: Pause at which a full stop between two longer fragments is treated as a real
+#: boundary even when the next fragment is transcribed with a lowercase letter.
+#: Whisper now and then starts a new utterance in lower case, so the letter alone is
+#: not proof of continuation; a short fragment such as "a business." stays attached
+#: to what follows, while a finished clause followed by a pause does not.
+FRAGMENT_CONTINUATION_GAP_SECONDS = 0.6
+
+#: Fragments shorter than this carry too little of a sentence to stand on their own,
+#: so they continue a neighbour across a longer pause than a full clause would.
+SHORT_FRAGMENT_CHARS = 25
+
+
+def _continues_sentence(
+    previous_text: str, next_text: str, *, gap: float | None = None
+) -> bool:
+    """Return whether ``next_text`` continues the sentence ``previous_text`` began.
+
+    A model grouping is accepted only where the text and timing support it:
+
+    * no terminal punctuation - the fragment plainly continues;
+    * a lowercase first letter - the transcriber marked a continuation;
+    * a first word that cannot comfortably open a sentence ("don't", "isn't") -
+      "No, you clearly." + "Don't know who you're talking to" is one sentence;
+    * a typical sentence opener ("I", "the", "who") after a finished clause is a
+      boundary, however short the pause - "I am." + "The one who knocks." is two
+      utterances.
+
+    ``gap`` is the silence between the fragments. A long pause after a finished,
+    non-trivial clause is a boundary even for a lowercase fragment, because a
+    new utterance can begin in lower case; a short fragment is exempt, since it
+    needs the neighbour to become a sentence.
+    """
+
+    if not _ends_sentence(previous_text):
+        return True
+
+    finished_clause = (
+        gap is not None
+        and gap >= FRAGMENT_CONTINUATION_GAP_SECONDS
+        and len(_without_wrapping(previous_text)) >= SHORT_FRAGMENT_CHARS
+    )
+    if _starts_mid_sentence(next_text):
+        return not finished_clause
+    if _first_stem(next_text) in _SENTENCE_STARTERS:
+        return False
+    if _without_wrapping(previous_text)[-1] in ("?", "!", "\u2026"):
+        return False
+    # A capitalised word that is not a typical opener can continue a sentence
+    # ("a business" + "Big enough that..."), but not across a pause after a full
+    # clause ("... belly up." + "Disappears.").
+    return not finished_clause
+
+
 def _join_sentence_parts(parts: Sequence[TranscriptSegment]) -> str:
     """Return the text of ``parts`` as one sentence.
 
@@ -1543,7 +1618,12 @@ def _join_sentence_parts(parts: Sequence[TranscriptSegment]) -> str:
     joined: list[str] = []
     for part in parts:
         text = part.text.strip()
-        if joined and _starts_mid_sentence(text):
+        previous_index = len(joined) - 1
+        if previous_index >= 0 and _continues_sentence(
+            parts[previous_index].text,
+            text,
+            gap=part.start - parts[previous_index].end,
+        ):
             previous = joined[-1]
             index = _last_written_index(previous)
             if index >= 0 and previous[index] == ".":
@@ -1632,8 +1712,9 @@ def _sentences_from_groups(
     segment. Anything else - a missing index, a repeat, a crossed speaker - is
     rejected rather than repaired, because a wrong partition would silently drop or
     duplicate spoken words. A group that crosses a speaker change is split (that is
-    not a sentence boundary the model is allowed to invent), and one longer than
-    :data:`MAX_GROUPED_SENTENCE_SECONDS` is divided at its own parts.
+    not a sentence boundary the model is allowed to invent), a group that joins two
+    finished sentences is split at the punctuation that proves it, and one longer
+    than :data:`MAX_GROUPED_SENTENCE_SECONDS` is divided at its own parts.
     """
 
     if groups is None:
@@ -1663,6 +1744,14 @@ def _sentences_from_groups(
         for index in group:
             segment = ordered[index]
             if parts and segment.speaker_id != parts[-1].speaker_id:
+                sentences.append(_sentence_from_parts(parts))
+                parts = []
+            if parts and not _continues_sentence(
+                parts[-1].text, segment.text, gap=segment.start - parts[-1].end
+            ):
+                # The model joined two complete sentences. Punctuation and case are
+                # the evidence that they are not one utterance, so the join is
+                # refused rather than translated as a single run-on line.
                 sentences.append(_sentence_from_parts(parts))
                 parts = []
             if (

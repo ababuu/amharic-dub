@@ -287,6 +287,13 @@ refer to anyone else in the gender the context gives. Keep a character's gender 
 same across the whole film. If "speaker_gender" is unknown, infer it from the name,
 the character block and what is being said - never guess against a stated gender.
 
+RESEARCHED CHARACTERS. The context may include a guide researched for this film or
+episode, with its sources. Use it for names, spellings, relationships, and a gender
+a source reliably establishes for someone being addressed or referred to. It is
+supporting evidence, not proof of who is speaking: the measured "speaker_gender"
+always decides the speaker's own forms, and if the guide and that measurement
+disagree, follow the measurement. Never invent a character, a name or a gender.
+
 CONTEXT. Read the scene block and the surrounding lines before translating. The same
 English word can need a different Amharic form depending on who is speaking to whom,
 whether they are arguing, pleading or joking, and what was just said. Keep names,
@@ -687,19 +694,40 @@ def _scene_of(scenes: Sequence[Scene], position: int) -> Scene | None:
     return None
 
 
+#: Lines on each side of a batch sent as context. Two is enough to show what a line
+#: answers without turning every request into the whole scene.
+SURROUNDING_LINES = 2
+
+
+def _surrounding_lines(
+    lines: Sequence[TranscriptSegment | DialogueSentence],
+) -> list[str]:
+    """Render neighbouring lines as context, with their speaker only."""
+
+    rendered: list[str] = []
+    for line in lines:
+        text = line.text.strip()
+        if len(text) > 240:
+            text = text[:237].rstrip() + "..."
+        rendered.append(f"- {line.speaker_id}: {text}")
+    return rendered
+
+
 def _context_block(
     *,
     scene: Scene | None,
     scene_lines: int,
     bible: CharacterBible | None,
     speakers: Sequence[str],
+    before: Sequence[TranscriptSegment | DialogueSentence] = (),
+    after: Sequence[TranscriptSegment | DialogueSentence] = (),
 ) -> str | None:
     """Build the scene-and-characters preamble for one batch, or ``None``.
 
     The block is deliberately built from state the application owns - the scene
-    boundaries it derived from the timings, and the character bible it was given -
-    rather than from anything the model inferred, so a request cannot invent a
-    location or a relationship.
+    boundaries it derived from the timings, the character bible it was given, and
+    the transcript lines next to the batch - rather than from anything the model
+    inferred, so a request cannot invent a location or a relationship.
     """
 
     parts: list[str] = []
@@ -725,6 +753,17 @@ def _context_block(
         block = bible.as_prompt_block(speakers)
         if block:
             parts.append("\nCHARACTERS IN THIS SCENE:\n" + block)
+
+    if before:
+        parts.append(
+            "\nPREVIOUS LINES (immediately before this batch; context only, "
+            "do not translate):\n" + "\n".join(_surrounding_lines(before))
+        )
+    if after:
+        parts.append(
+            "\nNEXT LINES (immediately after this batch; context only, "
+            "do not translate):\n" + "\n".join(_surrounding_lines(after))
+        )
 
     if not parts:
         return None
@@ -1831,12 +1870,23 @@ def adapt_dialogue(
             for offset in range(len(batch))
         ]
 
-        scene = _scene_of(resolved_scenes, first_position - 1)
+        first_index = first_position - 1
+        last_index = first_index + len(batch) - 1
+        scene = _scene_of(resolved_scenes, first_index)
         context = _context_block(
             scene=scene,
             scene_lines=scene.line_count if scene is not None else len(batch),
             bible=bible,
             speakers=[line.speaker_id for line in batch],
+            # The batch is a window, not a conversation. The lines either side of
+            # it are what let the model resolve a pronoun or an answer that refers
+            # back across the batch boundary.
+            before=transcript[
+                max(0, first_index - SURROUNDING_LINES) : first_index
+            ],
+            after=transcript[
+                last_index + 1 : last_index + 1 + SURROUNDING_LINES
+            ],
         )
 
         produced = _adapt_batch(
@@ -1892,19 +1942,23 @@ Rules
 -----
 - Return a complete, ordered partition of every index: each index appears exactly
   once, groups are in order, and no index is skipped, repeated or reordered.
-- Join fragments that belong to the same sentence, even across a long pause. A
-  sentence is one complete thought with its clauses, not one fragment.
-- If a fragment contains the end of one sentence and the start of the next, put it
+- Join two adjacent fragments ONLY when the second continues the first sentence:
+  the first does not end with sentence punctuation, or the second begins
+  mid-sentence (a lowercase first letter).
+- NEVER join a fragment that ends with ".", "!" or "?" to one that begins a new
+  sentence with a capital letter. Those are two utterances, however short. "No."
+  and "I am." are separate; "Do you know?" and "how much I make a year." are one.
+- A fragment may contain the end of one sentence and the start of the next; put it
   in the group it mostly belongs to. Never invent, split or rewrite text.
 - Never put two different speakers in one group: a change of speaker always ends a
   sentence.
-- A single short fragment is a sentence when it is a complete utterance ("No.",
-  "Run!", "Thank you."). Do not merge it into a neighbour merely to make it longer.
-- Keep the sentence as long as the language needs: a 10-second sentence with several
-  clauses stays one group.
+- A short complete utterance ("No.", "Run!", "Thank you.") is its own sentence. Do
+  not merge it into a neighbour merely to make the group longer.
+- A long sentence with several clauses still stays one group; length alone is not
+  a reason to split it.
 
 Reply with a single JSON object and nothing else:
-{"sentences": [[0,1],[2],[3,4,5]]}
+{"sentences": [[0,1],[2],[3],[4,5]]}
 """
 
 #: Largest transcript sent for grouping in one request. A feature film fits; beyond

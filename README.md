@@ -484,7 +484,7 @@ environment, so values configured on the RunPod pod always win.
 | Variable            | Purpose                                             | Default            |
 | ------------------- | --------------------------------------------------- | ------------------ |
 | `GEMINI_API_KEY`    | Google AI Studio key for dialogue adaptation/translation (the default provider) | *(unset)* |
-| `DEEPSEEK_API_KEY`  | DeepSeek key, read only when `TRANSLATION_PROVIDER=deepseek` | *(unset)* |
+| `DEEPSEEK_API_KEY`  | DeepSeek key: read when `TRANSLATION_PROVIDER=deepseek`, and by the context-AI Search/Fetch layer | *(unset)* |
 | `TRANSLATION_API_KEY` | Key read only when `TRANSLATION_PROVIDER=other`, for a self-hosted server with its own variable name | *(unset)* |
 | `HUGGINGFACE_TOKEN` | Download gated model weights (e.g. pyannote)        | *(unset)*          |
 | `INPUT_DIR`         | Source videos                                       | `./data/input`     |
@@ -528,6 +528,10 @@ environment, so values configured on the RunPod pod always win.
 | `VOICE_BANK_DIR` | A built native-Amharic voice bank, used only as the fallback for a character whose film audio cannot supply a clean reference (see [Native voice bank](#native-voice-bank-fallback-casting-voice_bankpy)) | `data/voice-bank` |
 | `VOICE_BANK_MAP` | `SPEAKER_00=voice-id` list pinning bank voices to fallback-cast characters | empty |
 | `DIALOGUE_BIBLE_PATH` | Persistent character/consistency state for adaptation (see [Cinematic dialogue adaptation](#cinematic-dialogue-adaptation-dialogue_contextpy)) | `$WORK_DIR/dialogue_bible.json` |
+| `CONTEXT_AI_ENABLED` | Read the film's title from `INPUT_DIR/*.txt`, research the cast through DeepSeek Search/Fetch, and review speaker attribution before TTS | `true` |
+| `CONTEXT_AI_CONFIDENCE_THRESHOLD` | Minimum proposal confidence before a speaker label may move (evidence gates still apply) | `0.75` |
+| `CONTEXT_AI_TIMEOUT_SECONDS` | Per-request timeout for Search, Fetch and research extraction | `20` |
+| `CHARACTER_GUIDE_PATH` | Cached sourced character guide, reused for the same title/season/episode | `$WORK_DIR/character_guide.json` |
 | `TTS_MODEL` | The single-voice engine's checkpoint, used when `TTS_ENGINE=mms` | `facebook/mms-tts-amh` |
 | `TTS_MAX_PAUSE_SECONDS` | Longest pause rendered around a synthesized line | `2.0` |
 | `TTS_MIN_LINE_SECONDS` | Shortest original window that can be dubbed; shorter lines are skipped and reported | `0.30` |
@@ -1311,6 +1315,30 @@ things a ten-line window cannot provide:
   needs no G2P model - and a line that comes back over budget is **sent back once
   with the number of syllables to cut**. Shortening the text is the fix the
   literature supports; `timing.py` is left to do only a small final trim.
+
+### Context-aware AI layer (`context_ai.py`)
+
+Two things a dialogue model cannot measure are supplied by a small, bounded layer
+that sits beside — not inside — diarization and TTS:
+
+* **A sourced character guide.** The film's title is read from a `.txt` file
+  discovered in `INPUT_DIR` (a file named after the video wins; several different
+  titles are reported as ambiguous rather than guessed). The title plus any
+  season/episode marker is researched through DeepSeek's documented
+  `POST /v1/tools/search` and `POST /v1/tools/fetch` endpoints, and cached in
+  `CHARACTER_GUIDE_PATH`. The guide carries names, aliases, reliably established
+  gender, relationships, notes and the source URLs for each character, and is
+  passed to the translation prompt as *supporting evidence* — never as proof of
+  who is speaking.
+* **A speaker-attribution review.** Before TTS, the model may propose moving a
+  line to another diarized speaker. A proposal is applied only when the line is
+  covered by that speaker's diarization turn or sits in a crosstalk region that
+  contains them, its confidence clears `CONTEXT_AI_CONFIDENCE_THRESHOLD`, and the
+  current label was not confirmed by the speaker embeddings. Everything else is
+  left alone and written to `run.speakers.ai_review.uncertain` for QC.
+
+`CONTEXT_AI_ENABLED=false`, a missing `DEEPSEEK_API_KEY`, no title file, or an
+unavailable endpoint all degrade to "no research" without stopping a run.
 
 ### Borrowed words: keep the word, change the script
 

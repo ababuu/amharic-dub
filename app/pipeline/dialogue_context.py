@@ -254,6 +254,9 @@ class Character:
     #: recurring proper noun is spelled the same way every time it appears.
     terms: Mapping[str, str] = field(default_factory=dict)
     notes: str = ""
+    #: URLs or titles that established this entry. Empty when the operator typed
+    #: the bible by hand or when research could not cite a source.
+    sources: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for label, value in (("speaker_id", self.speaker_id), ("name", self.name)):
@@ -268,6 +271,10 @@ class Character:
         object.__setattr__(self, "aliases", aliases)
         object.__setattr__(self, "relationships", dict(self.relationships))
         object.__setattr__(self, "terms", dict(self.terms))
+        sources = tuple(
+            dict.fromkeys(source.strip() for source in self.sources if str(source).strip())
+        )
+        object.__setattr__(self, "sources", sources)
 
     def as_prompt_block(self) -> str:
         """Render this character as the lines a prompt can carry."""
@@ -302,6 +309,8 @@ class Character:
             )
         if self.notes.strip():
             parts.append(f" {self.notes.strip()}")
+        if self.sources:
+            parts.append(f" Sources: {', '.join(self.sources)}.")
         return "".join(parts)
 
     def as_dict(self) -> dict[str, Any]:
@@ -317,7 +326,258 @@ class Character:
             "relationships": dict(self.relationships),
             "terms": dict(self.terms),
             "notes": self.notes,
+            "sources": list(self.sources),
         }
+
+
+#: Genders a researched character may reliably be said to have. Anything else is
+#: reported as ``unknown`` rather than guessed.
+_GUIDE_GENDERS = ("masculine", "feminine", "unknown")
+
+
+@dataclass(frozen=True, slots=True)
+class GuideCharacter:
+    """One character established by web research, with the evidence that says so.
+
+    This is deliberately *not* a :class:`Character`: a researched name is not proof
+    that a particular diarized speaker is that person. Keeping the two apart is what
+    stops the translation prompt from treating a web page as a casting decision.
+    """
+
+    name: str
+    aliases: tuple[str, ...] = ()
+    gender: str = "unknown"
+    relationships: Mapping[str, str] = field(default_factory=dict)
+    notes: str = ""
+    sources: tuple[str, ...] = ()
+    confidence: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise InvalidCharacterError("a researched character needs a name")
+        gender = str(self.gender or "").strip().lower()
+        if gender not in _GUIDE_GENDERS:
+            gender = "unknown"
+        aliases = tuple(
+            dict.fromkeys(alias.strip() for alias in self.aliases if str(alias).strip())
+        )
+        relationships = {
+            str(other).strip(): str(bond).strip()
+            for other, bond in dict(self.relationships).items()
+            if str(other).strip() and str(bond).strip()
+        }
+        sources = tuple(
+            dict.fromkeys(source.strip() for source in self.sources if str(source).strip())
+        )
+        try:
+            confidence = float(self.confidence)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        confidence = min(max(confidence, 0.0), 1.0)
+        object.__setattr__(self, "name", self.name.strip())
+        object.__setattr__(self, "gender", gender)
+        object.__setattr__(self, "aliases", aliases)
+        object.__setattr__(self, "relationships", relationships)
+        object.__setattr__(self, "sources", sources)
+        object.__setattr__(self, "confidence", confidence)
+
+    def as_prompt_block(self) -> str:
+        """Render this researched character as one prompt line."""
+
+        parts = [f"- {self.name}"]
+        if self.aliases:
+            parts.append(f" (also called {', '.join(self.aliases)})")
+        parts.append(f": gender {self.gender}.")
+        if self.relationships:
+            parts.append(
+                " Relationships: "
+                + "; ".join(
+                    f"{other} - {bond}"
+                    for other, bond in sorted(self.relationships.items())
+                )
+                + "."
+            )
+        if self.notes.strip():
+            parts.append(f" {self.notes.strip()}")
+        if self.sources:
+            parts.append(f" Sources: {', '.join(self.sources)}.")
+        return "".join(parts)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe view of the researched character."""
+
+        return {
+            "name": self.name,
+            "aliases": list(self.aliases),
+            "gender": self.gender,
+            "relationships": dict(self.relationships),
+            "notes": self.notes,
+            "sources": list(self.sources),
+            "confidence": self.confidence,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "GuideCharacter":
+        """Build a character from a stored mapping, or fail with a clear message."""
+
+        if not isinstance(payload, Mapping):
+            raise InvalidCharacterError(
+                f"a researched character must be a JSON object, got "
+                f"{type(payload).__name__}"
+            )
+        return cls(
+            name=str(payload.get("name", "") or ""),
+            aliases=tuple(payload.get("aliases", ()) or ()),
+            gender=str(payload.get("gender", "unknown") or "unknown"),
+            relationships=dict(payload.get("relationships", {}) or {}),
+            notes=str(payload.get("notes", "") or ""),
+            sources=tuple(payload.get("sources", ()) or ()),
+            confidence=payload.get("confidence", 0.0),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CharacterGuide:
+    """Cached, sourced research about a film's characters.
+
+    ``sources`` are the pages the guide was built from. The prompt that carries this
+    guide says what the audit trail says: research is supporting evidence, not a
+    replacement for the audio, and a gender is only used when a source reliably
+    establishes it.
+    """
+
+    title: str = ""
+    season: int | None = None
+    episode: int | None = None
+    characters: tuple[GuideCharacter, ...] = ()
+    sources: tuple[str, ...] = ()
+    researched_at: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.title, str):
+            raise InvalidCharacterError("a guide title must be a string")
+        for label, value in (("season", self.season), ("episode", self.episode)):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise InvalidCharacterError(
+                    f"{label} must be a non-negative integer or None, got {value!r}"
+                )
+        characters: list[GuideCharacter] = []
+        seen: set[str] = set()
+        for character in self.characters:
+            if not isinstance(character, GuideCharacter):
+                raise InvalidCharacterError(
+                    f"guide characters must be GuideCharacter, got "
+                    f"{type(character).__name__}"
+                )
+            key = character.name.casefold()
+            if key not in seen:
+                seen.add(key)
+                characters.append(character)
+        sources = tuple(
+            dict.fromkeys(source.strip() for source in self.sources if str(source).strip())
+        )
+        object.__setattr__(self, "title", self.title.strip())
+        object.__setattr__(self, "characters", tuple(characters))
+        object.__setattr__(self, "sources", sources)
+
+    def __len__(self) -> int:
+        return len(self.characters)
+
+    def __bool__(self) -> bool:
+        return bool(self.characters)
+
+    @property
+    def label(self) -> str:
+        """Return the title with any season/episode marker, for prompts and reports."""
+
+        if self.season is None and self.episode is None:
+            return self.title
+        parts = []
+        if self.season is not None:
+            parts.append(f"season {self.season}")
+        if self.episode is not None:
+            parts.append(f"episode {self.episode}")
+        return f"{self.title} ({', '.join(parts)})" if self.title else ", ".join(parts)
+
+    def as_prompt_block(self) -> str:
+        """Render the guide as prompt lines, or an empty string when it has none."""
+
+        if not self.characters:
+            return ""
+        lines = [
+            f"RESEARCHED CHARACTERS FOR {self.label!r} "
+            "(external sources; supporting evidence only):"
+        ]
+        lines.extend(character.as_prompt_block() for character in self.characters)
+        lines.append(
+            "Use these names, spellings, relationships and reliably established genders "
+            "for who is addressed or referred to. They do not say which person is "
+            "speaking: the measured speaker_gender and the dialogue do that. Never "
+            "invent a name or a gender that a source does not establish."
+        )
+        return "\n".join(lines)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe view of the guide."""
+
+        return {
+            "title": self.title,
+            "season": self.season,
+            "episode": self.episode,
+            "characters": [character.as_dict() for character in self.characters],
+            "sources": list(self.sources),
+            "researched_at": self.researched_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "CharacterGuide":
+        """Build a guide from a stored mapping, or fail with a clear message."""
+
+        if not isinstance(payload, Mapping):
+            raise InvalidCharacterError(
+                f"a character guide must be a JSON object, got "
+                f"{type(payload).__name__}"
+            )
+        characters = payload.get("characters", ()) or ()
+        if not isinstance(characters, (list, tuple)):
+            raise InvalidCharacterError("guide characters must be a list")
+        return cls(
+            title=str(payload.get("title", "") or ""),
+            season=payload.get("season"),
+            episode=payload.get("episode"),
+            characters=tuple(GuideCharacter.from_dict(item) for item in characters),
+            sources=tuple(payload.get("sources", ()) or ()),
+            researched_at=str(payload.get("researched_at", "") or ""),
+        )
+
+    def save(self, path: str | Path) -> Path:
+        """Write the guide as JSON, so a later run of the same title reuses it."""
+
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(self.as_dict(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+        return target
+
+    @classmethod
+    def load(cls, path: str | Path) -> "CharacterGuide | None":
+        """Read a cached guide, treating a missing or unusable cache as no cache."""
+
+        source = Path(path)
+        if not source.is_file():
+            return None
+        try:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            guide = cls.from_dict(payload)
+        except (OSError, ValueError, InvalidCharacterError):
+            return None
+        return guide if guide.characters else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,6 +591,10 @@ class CharacterBible:
     """
 
     characters: Mapping[str, Character] = field(default_factory=dict)
+    #: Sourced research about the film's cast. Kept beside the operator-owned
+    #: characters rather than merged into them, because a researched name is not
+    #: evidence of which diarized speaker said a line.
+    guide: CharacterGuide | None = None
 
     def __post_init__(self) -> None:
         characters = dict(self.characters)
@@ -349,7 +613,18 @@ class CharacterBible:
                     f"the entry for {speaker_id} names itself "
                     f"{character.speaker_id!r}"
                 )
+        if self.guide is not None and not isinstance(self.guide, CharacterGuide):
+            raise InvalidCharacterError(
+                f"guide must be a CharacterGuide or None, got {type(self.guide).__name__}"
+            )
         object.__setattr__(self, "characters", characters)
+
+    def with_guide(self, guide: CharacterGuide | None) -> "CharacterBible":
+        """Return this bible with ``guide`` attached, leaving the cast untouched."""
+
+        if guide is None:
+            return self
+        return CharacterBible(characters=self.characters, guide=guide)
 
     def __len__(self) -> int:
         return len(self.characters)
@@ -383,6 +658,10 @@ class CharacterBible:
             )
             if character is not None
         ]
+        if self.guide is not None:
+            guide_block = self.guide.as_prompt_block()
+            if guide_block:
+                blocks.append(guide_block)
         return "\n".join(blocks)
 
     def as_dict(self) -> dict[str, Any]:
@@ -441,6 +720,7 @@ class CharacterBible:
                 relationships=dict(entry.get("relationships", {}) or {}),
                 terms=dict(entry.get("terms", {}) or {}),
                 notes=str(entry.get("notes", "") or ""),
+                sources=tuple(entry.get("sources", ()) or ()),
             )
         return cls(characters=characters)
 
@@ -851,6 +1131,8 @@ __all__ = [
     "BudgetVerdict",
     "Character",
     "CharacterBible",
+    "CharacterGuide",
+    "GuideCharacter",
     "DialogueContextError",
     "InvalidBudgetError",
     "InvalidCharacterError",

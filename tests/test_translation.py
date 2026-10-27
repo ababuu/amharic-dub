@@ -2441,3 +2441,67 @@ def test_the_prompt_demands_gender_and_scene_context():
     assert "speaker_gender" in prompt
     assert "CONTEXT" in prompt
     assert "ONE complete spoken sentence" in prompt
+
+# ---------------------------------------------------------------------------
+# Research context and surrounding dialogue
+# ---------------------------------------------------------------------------
+
+
+def test_the_request_carries_the_lines_either_side_of_the_batch(monkeypatch):
+    """A batch is a window, so its neighbours are sent as context, not translated."""
+
+    _patch(monkeypatch)
+    segments = [
+        _segment(start=0.0, end=1.0, text="First."),
+        _segment(start=1.1, end=2.0, text="Second."),
+        _segment(start=2.1, end=3.0, text="Third."),
+        _segment(start=3.1, end=4.0, text="Fourth."),
+    ]
+
+    adapt_dialogue(segments, settings=_settings(translation_batch_size=2))
+
+    first = _payload(FakeOpenAI.requests[0])["context"]
+    assert "NEXT LINES" in first
+    assert "Third." in first and "Fourth." in first
+    assert "PREVIOUS LINES" not in first
+
+    second = _payload(FakeOpenAI.requests[1])["context"]
+    assert "PREVIOUS LINES" in second
+    assert "First." in second and "Second." in second
+
+
+def test_a_researched_character_guide_reaches_the_prompt(monkeypatch):
+    from app.pipeline.dialogue_context import (
+        CharacterBible,
+        CharacterGuide,
+        GuideCharacter,
+    )
+
+    _patch(monkeypatch)
+    guide = CharacterGuide(
+        title="Breaking Bad",
+        season=4,
+        episode=6,
+        characters=(
+            GuideCharacter(
+                name="Walter White",
+                aliases=("Walt",),
+                gender="masculine",
+                relationships={"Skyler": "wife"},
+                sources=("https://example.com/walter",),
+                confidence=0.9,
+            ),
+        ),
+        sources=("https://example.com/walter",),
+    )
+
+    adapt_dialogue(
+        [_segment(text="I am the danger.")],
+        settings=_settings(),
+        bible=CharacterBible().with_guide(guide),
+    )
+
+    context = _payload(FakeOpenAI.requests[0])["context"]
+    assert "Walter White" in context
+    assert "https://example.com/walter" in context
+    assert "supporting evidence" in context

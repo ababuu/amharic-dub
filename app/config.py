@@ -334,6 +334,28 @@ DEFAULT_VOICE_PROFILE_DIR = DEFAULT_WORK_DIR / "voices"
 DEFAULT_DIALOGUE_BIBLE_FILENAME = "dialogue_bible.json"
 DEFAULT_DIALOGUE_BIBLE_PATH = DEFAULT_WORK_DIR / DEFAULT_DIALOGUE_BIBLE_FILENAME
 
+#: Cached, sourced character research for the film being dubbed. Kept separate from
+#: the operator's bible: research is evidence, not a hand-written casting decision.
+DEFAULT_CHARACTER_GUIDE_FILENAME = "character_guide.json"
+DEFAULT_CHARACTER_GUIDE_PATH = DEFAULT_WORK_DIR / DEFAULT_CHARACTER_GUIDE_FILENAME
+
+#: Whether the context-aware AI layer runs at all. It needs a DeepSeek key and
+#: degrades to no-ops when one is absent, so this is an escape hatch rather than a
+#: hard dependency.
+DEFAULT_CONTEXT_AI_ENABLED = True
+
+#: Minimum model-reported confidence before a speaker correction is applied. The
+#: evidence gate is checked as well; confidence alone never changes a label.
+DEFAULT_CONTEXT_AI_CONFIDENCE_THRESHOLD = 0.75
+
+#: Per-request timeout for character research, in seconds. Bounded so an unavailable
+#: search or fetch endpoint cannot stall a run.
+DEFAULT_CONTEXT_AI_TIMEOUT_SECONDS = 20.0
+
+#: DeepSeek's documented Search and Fetch endpoints, relative to its base URL.
+DEFAULT_DEEPSEEK_SEARCH_PATH = "/v1/tools/search"
+DEFAULT_DEEPSEEK_FETCH_PATH = "/v1/tools/fetch"
+
 #: Preferred length of a voice-cloning reference, in seconds. A short, clean
 #: prompt limits the amount of reference dialogue OmniVoice can echo; longer
 #: references remain available when no suitable shorter interval exists.
@@ -898,6 +920,12 @@ class Settings:
     voice_bank_voice_map: str = DEFAULT_VOICE_BANK_VOICE_MAP
     #: Persistent character/consistency state handed to dialogue adaptation.
     dialogue_bible_path: Path = DEFAULT_DIALOGUE_BIBLE_PATH
+    #: Cached character research and the settings that bound it. See
+    #: :mod:`app.pipeline.context_ai`.
+    character_guide_path: Path = DEFAULT_CHARACTER_GUIDE_PATH
+    context_ai_enabled: bool = DEFAULT_CONTEXT_AI_ENABLED
+    context_ai_confidence_threshold: float = DEFAULT_CONTEXT_AI_CONFIDENCE_THRESHOLD
+    context_ai_timeout_seconds: float = DEFAULT_CONTEXT_AI_TIMEOUT_SECONDS
     #: TTS settings for :mod:`app.pipeline.tts`: the Amharic speech adapter and the
     #: pause bounds of one synthesized line.
     tts_model: str = DEFAULT_TTS_MODEL
@@ -1069,6 +1097,19 @@ class Settings:
             ),
             dialogue_bible_path=_read_path(
                 "DIALOGUE_BIBLE_PATH", work_dir / DEFAULT_DIALOGUE_BIBLE_FILENAME
+            ),
+            character_guide_path=_read_path(
+                "CHARACTER_GUIDE_PATH", work_dir / DEFAULT_CHARACTER_GUIDE_FILENAME
+            ),
+            context_ai_enabled=_read_bool(
+                "CONTEXT_AI_ENABLED", DEFAULT_CONTEXT_AI_ENABLED
+            ),
+            context_ai_confidence_threshold=_read_float(
+                "CONTEXT_AI_CONFIDENCE_THRESHOLD",
+                DEFAULT_CONTEXT_AI_CONFIDENCE_THRESHOLD,
+            ),
+            context_ai_timeout_seconds=_read_float(
+                "CONTEXT_AI_TIMEOUT_SECONDS", DEFAULT_CONTEXT_AI_TIMEOUT_SECONDS
             ),
             tts_model=(_read_env("TTS_MODEL", DEFAULT_TTS_MODEL) or DEFAULT_TTS_MODEL),
             tts_engine=(
@@ -1271,6 +1312,10 @@ class Settings:
             "voice_bank_dir": str(self.voice_bank_dir),
             "voice_bank_voice_map": self.voice_bank_voice_map,
             "dialogue_bible_path": str(self.dialogue_bible_path),
+            "character_guide_path": str(self.character_guide_path),
+            "context_ai_enabled": self.context_ai_enabled,
+            "context_ai_confidence_threshold": self.context_ai_confidence_threshold,
+            "context_ai_timeout_seconds": self.context_ai_timeout_seconds,
             "tts_model": self.tts_model,
             "tts_engine": self.tts_engine,
             "omnivoice_model": self.omnivoice_model,
@@ -1308,6 +1353,13 @@ __all__ = [
     "DEFAULT_OMNIVOICE_TORCH_DTYPE",
     "DEFAULT_DIALOGUE_BIBLE_FILENAME",
     "DEFAULT_DIALOGUE_BIBLE_PATH",
+    "DEFAULT_CHARACTER_GUIDE_FILENAME",
+    "DEFAULT_CHARACTER_GUIDE_PATH",
+    "DEFAULT_CONTEXT_AI_ENABLED",
+    "DEFAULT_CONTEXT_AI_CONFIDENCE_THRESHOLD",
+    "DEFAULT_CONTEXT_AI_TIMEOUT_SECONDS",
+    "DEFAULT_DEEPSEEK_SEARCH_PATH",
+    "DEFAULT_DEEPSEEK_FETCH_PATH",
     "DEFAULT_DIARIZATION_MAX_SPEAKERS",
     "DEFAULT_DIARIZATION_MIN_SPEAKERS",
     "DEFAULT_DIARIZATION_MODEL",
