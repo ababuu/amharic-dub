@@ -1079,28 +1079,57 @@ def cast_plan(
     return PlanCasting(casts=tuple(casts))
 
 
+#: Longest extra silence a plan line may use beyond its own spoken span, in
+#: seconds. The plan's Amharic was written to be spoken, not to be squeezed into the
+#: English actor's window, so a line may run into the silence that follows it - but
+#: only a little of it, or a line would drift far from the face saying it.
+MAX_WINDOW_GROWTH_SECONDS = 3.0
+
+#: Silence kept before the next line so two voices never sound at once.
+MIN_WINDOW_GAP_SECONDS = 0.12
+
+
 def plan_dialogue(
     plan: DialoguePlan,
     scope: PlanScope,
     casting: PlanCasting,
+    *,
+    min_gap: float = MIN_WINDOW_GAP_SECONDS,
+    max_growth: float = MAX_WINDOW_GROWTH_SECONDS,
 ) -> tuple[AdaptedDialogue, ...]:
     """Return the plan's lines as the dialogue stage's own type.
 
     Only characters that were cast are returned. A line whose character has no
     measured voice is dropped here rather than given somebody else's.
+
+    Each line's ``end`` is its window for synthesis, and it is widened into the
+    silence before the next line. The plan's Amharic is written to be *spoken*, so a
+    faithful rendering is often longer than the English actor's window; without the
+    spare room the timing stage would stretch it - or give up and report it unfitted.
+    The line still begins where the actor began, and it still stops before the next
+    character starts, which is what keeps two voices from colliding.
     """
 
     mapping = casting.mapping
+    voiced = [cue for cue in scope.cues if mapping.get(cue.speaker)]
     lines: list[AdaptedDialogue] = []
-    for cue in scope.cues:
+    for position, cue in enumerate(voiced):
         speaker_id = mapping.get(cue.speaker)
         if speaker_id is None or not cue.amharic.strip():
             continue
+        end = cue.end
+        if position + 1 < len(voiced):
+            next_start = voiced[position + 1].start
+            room = next_start - min_gap
+            if room > end:
+                end = min(end + max_growth, room)
+        if end <= cue.start:
+            end = cue.end
         lines.append(
             AdaptedDialogue(
                 speaker_id=speaker_id,
                 start=cue.start,
-                end=cue.end,
+                end=end,
                 source_text=cue.source_text or cue.amharic,
                 amharic=cue.amharic,
                 emotion=cue.emotion or "neutral",
@@ -1117,7 +1146,11 @@ def dropped_cues(scope: PlanScope, casting: PlanCasting) -> int:
     """Return how many plan lines in scope have no cast voice."""
 
     mapping = casting.mapping
-    return sum(1 for cue in scope.cues if cue.speaker not in mapping)
+    return sum(
+        1
+        for cue in scope.cues
+        if mapping.get(cue.speaker) is None or not cue.amharic.strip()
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1140,6 +1173,8 @@ class PlanReport:
 
 
 __all__ = [
+    "MAX_WINDOW_GROWTH_SECONDS",
+    "MIN_WINDOW_GAP_SECONDS",
     "CharacterCast",
     "DialoguePlan",
     "PlanCasting",

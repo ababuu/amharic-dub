@@ -537,3 +537,72 @@ def test_authored_timings_on_the_wrong_grid_are_ignored_by_default():
     assert scope.cues[0].start == pytest.approx(7.52)
     assert scope.cues[1].start == pytest.approx(12.82)
     assert scope.cues[2].start == pytest.approx(14.14)
+
+def _casting(plan) -> "PlanCasting":
+    from app.pipeline.dialogue_plan import CharacterCast, PlanCasting
+
+    return PlanCasting(
+        casts=tuple(
+            CharacterCast(
+                character=name,
+                speaker_id=SKYLER if name == "Skyler" else WALTER,
+                gender="unknown",
+                speaker_gender="unknown",
+                share=1.0,
+                seconds=1.0,
+                runner_up=None,
+                reason="fixture",
+            )
+            for name in plan.speakers
+        )
+    )
+
+
+def test_a_plan_line_may_use_the_silence_before_the_next_line():
+    plan = plan_from_payload(
+        {
+            "dialogue": [
+                {
+                    "speaker": "Skyler",
+                    "start": 10.0,
+                    "end": 11.0,
+                    "amharic": "a",
+                },
+                {
+                    "speaker": "Walter",
+                    "start": 14.0,
+                    "end": 15.0,
+                    "amharic": "b",
+                },
+            ]
+        }
+    )
+    scope = scope_plan(plan)
+    casting = _casting(plan)
+
+    dialogue = plan_dialogue(plan, scope, casting, min_gap=0.12)
+
+    # The first line keeps its start and gains room for Amharic that needs longer;
+    # it still stops before the other character speaks.
+    assert dialogue[0].start == pytest.approx(10.0)
+    assert dialogue[0].end == pytest.approx(13.88)
+    assert dialogue[1].start == pytest.approx(14.0)
+    # A line with nowhere to grow is left exactly as it was.
+    assert dialogue[1].end == pytest.approx(15.0)
+
+
+def test_window_growth_is_capped_so_a_line_does_not_drift_to_its_neighbour():
+    plan = plan_from_payload(
+        {
+            "dialogue": [
+                {"speaker": "Skyler", "start": 10.0, "end": 11.0, "amharic": "a"},
+                {"speaker": "Walter", "start": 40.0, "end": 41.0, "amharic": "b"},
+            ]
+        }
+    )
+    scope = scope_plan(plan)
+    casting = _casting(plan)
+
+    dialogue = plan_dialogue(plan, scope, casting, min_gap=0.12, max_growth=3.0)
+
+    assert dialogue[0].end == pytest.approx(14.0)

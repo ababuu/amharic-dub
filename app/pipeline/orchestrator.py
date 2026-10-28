@@ -599,6 +599,46 @@ def _report_dialogue_fit(
         )
 
 
+def _report_plan_fit(
+    dialogue: Sequence[Any],
+    settings: Any,
+    report: Callable[[str], None],
+) -> None:
+    """Name the plan lines that cannot be spoken in the time the video gives them.
+
+    A plan is authored, so an overrun cannot be fixed by asking a model for a
+    shorter line - it is a line the operator has to edit. Naming the worst offenders
+    here means that edit is made against a measurement instead of by listening to a
+    finished dub and guessing which line sounded rushed.
+    """
+
+    rate = settings.translation_syllables_per_second
+    if rate <= 0 or not dialogue:
+        return
+    overruns: list[tuple[float, int, str]] = []
+    for index, line in enumerate(dialogue):
+        window = line.end - line.start
+        if window <= 0:
+            continue
+        over = count_syllables(line.amharic) / rate - window
+        if over > 0.25:
+            overruns.append((over, index, line.source_text))
+    if not overruns:
+        report("  dialogue fit: every plan line fits the time the video gives it")
+        return
+    overruns.sort(reverse=True)
+    total = sum(over for over, _, _ in overruns)
+    report(
+        f"  dialogue fit: {len(overruns)}/{len(dialogue)} plan line(s) need more time "
+        f"than the video gives them ({total:.1f}s over in total); the timing stage "
+        f"will speed them to {settings.timing_max_tempo:g}x and then let them run late"
+    )
+    for over, index, text in overruns[:5]:
+        report(f"        +{over:.1f}s line {index}: {text[:60]}")
+    if len(overruns) > 5:
+        report("        shorten these in the plan to keep the dub in sync")
+
+
 def run_pipeline(
     source: str | Path,
     *,
@@ -1096,7 +1136,15 @@ def run_pipeline(
                     f"  casting: {cast.character} -> {cast.speaker_id} "
                     f"({cast.speaker_gender}; {cast.reason})"
                 )
-        dialogue = dialogue_plan.plan_dialogue(plan, plan_scope, plan_casting)
+        dialogue = dialogue_plan.plan_dialogue(
+            plan,
+            plan_scope,
+            plan_casting,
+            # The plan's Amharic is meant to be spoken, so each line may use the
+            # silence before the next one; the configured gap is what keeps two
+            # voices from ever sounding at once.
+            min_gap=resolved.timing_min_line_gap,
+        )
         unvoiced = dialogue_plan.dropped_cues(plan_scope, plan_casting)
         if unvoiced:
             report(
@@ -1105,6 +1153,7 @@ def run_pipeline(
             )
         report("  adaptation: authored plan; no translation request")
         seconds["translation"] = 0.0
+        _report_plan_fit(dialogue, resolved, report)
     else:
         # Consistency state, not a guess: an absent bible yields an empty one, so a
         # first run works and a second run inherits whatever was filled in by hand.
