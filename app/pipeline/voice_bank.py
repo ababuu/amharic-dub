@@ -600,21 +600,32 @@ def assign_bank_voices(
         )
 
     used = {voice.voice_id for voice in chosen.values()}
+    # How often each voice was handed out. A bank smaller than the cast has to reuse,
+    # and reusing the *least used* voice spreads the sharing evenly instead of giving
+    # two extra characters whichever voice ranked first on pitch.
+    usage: Counter[str] = Counter(used)
 
     for request in ordered:
         if request.speaker_id in chosen:
             continue
 
-        best = _choose_voice(bank, request, used)
+        best = _choose_voice(bank, request, used, usage)
         chosen[request.speaker_id] = best
         used.add(best.voice_id)
+        usage[best.voice_id] += 1
 
     return {request.speaker_id: chosen[request.speaker_id] for request in ordered}
 
 
-def _choose_voice(bank: VoiceBank, request: VoiceRequest, used: set[str]) -> BankVoice:
+def _choose_voice(
+    bank: VoiceBank,
+    request: VoiceRequest,
+    used: set[str],
+    usage: Counter[str] | None = None,
+) -> BankVoice:
     """Return the best unused voice for one character, or a reuse when none is left."""
 
+    usage = usage if usage is not None else Counter(used)
     unused = [voice for voice in bank if voice.voice_id not in used]
 
     if request.gender == "unknown":
@@ -624,22 +635,39 @@ def _choose_voice(bank: VoiceBank, request: VoiceRequest, used: set[str]) -> Ban
         # diarization could not estimate presentations would be cast all-female. Ranking
         # by how often each gender has already been used keeps it mixed, and stays
         # deterministic because the tie-break is the voice id.
-        counts = Counter(voice.gender for voice in bank if voice.voice_id in used)
+        gender_counts = Counter(
+            voice.gender for voice in bank if voice.voice_id in used
+        )
         pool = unused or list(bank)
         return min(
-            pool, key=lambda voice: (counts.get(voice.gender, 0), voice.voice_id)
+            pool,
+            key=lambda voice: (
+                usage.get(voice.voice_id, 0),
+                gender_counts.get(voice.gender, 0),
+                voice.voice_id,
+            ),
         )
 
     matching = [voice for voice in unused if voice.gender == request.gender]
     if matching:
         # Closest pitch within the requested gender; ties break on voice id, so the
         # pairing never depends on manifest order.
-        return min(matching, key=lambda voice: (_pitch_distance(voice, request), voice.voice_id))
+        return min(
+            matching,
+            key=lambda voice: (_pitch_distance(voice, request), voice.voice_id),
+        )
 
     # No unused voice of this gender left: widen to the rest of the bank before
     # reusing a voice, and only reuse when the bank is smaller than the cast.
     pool = unused or [voice for voice in bank if voice.gender == request.gender] or list(bank)
-    return min(pool, key=lambda voice: (_pitch_distance(voice, request), voice.voice_id))
+    return min(
+        pool,
+        key=lambda voice: (
+            usage.get(voice.voice_id, 0),
+            _pitch_distance(voice, request),
+            voice.voice_id,
+        ),
+    )
 
 
 def _read_reference(path: Path) -> tuple[np.ndarray, int]:

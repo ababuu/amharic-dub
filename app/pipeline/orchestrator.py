@@ -2107,8 +2107,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_progress("  drive: not pushing (--no-push)")
     elif not rclone.drive_ready(settings):
         _print_progress(
-            "  drive: not pushing (no Drive remote configured; see "
-            "config/rclone.example.conf)"
+            f"  drive: not pushing (Drive remote {rclone.describe(settings)})"
         )
     else:
         try:

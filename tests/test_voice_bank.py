@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections import Counter
 
 import numpy as np
 import pytest
@@ -330,6 +331,30 @@ def test_a_bank_smaller_than_the_cast_reuses_voices(tmp_path) -> None:
         bank,
     )
     assert {voice.voice_id for voice in casting.values()} == {"am-m-one"}
+
+
+def test_reuse_is_spread_evenly_instead_of_stacking_on_the_closest_voice(tmp_path) -> None:
+    """One pitch pre-empts the audience's ear, so a short bank must rotate.
+
+    Ranking only by pitch distance would hand the same voice to every extra character
+    within reach of it; the counts keep the sharing even.
+    """
+
+    bank = VoiceBank(
+        directory=tmp_path,
+        voices=(
+            _bank_voice("am-m-low", gender="male", pitch=100.0, root=tmp_path),
+            _bank_voice("am-m-mid", gender="male", pitch=130.0, root=tmp_path),
+            _bank_voice("am-m-high", gender="male", pitch=170.0, root=tmp_path),
+        ),
+    )
+    requests = [VoiceRequest(f"CAST_{index}", "masculine", 128.0) for index in range(5)]
+
+    casting = assign_bank_voices(requests, bank)
+
+    counts = Counter(voice.voice_id for voice in casting.values())
+    assert sorted(counts.values()) == [1, 2, 2]
+
 
 
 def test_an_unknown_presentation_still_gets_a_mixed_cast(tmp_path) -> None:

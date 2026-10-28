@@ -47,6 +47,7 @@ from app.config import get_settings  # noqa: E402
 from app.pipeline.voice_bank import (  # noqa: E402
     DEFAULT_BANK_DATASET,
     DEFAULT_BANK_SPLIT,
+    SAMPLE_AUDIO_SUFFIXES,
     BankBuildError,
     BankFilters,
     HuggingFaceRowSource,
@@ -57,7 +58,10 @@ from app.pipeline.voice_bank import (  # noqa: E402
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build a native-Amharic voice bank from a public corpus.",
+        description=(
+            "Build a native-Amharic voice bank. Uses your own recordings from "
+            "VOICE_SAMPLE_DIR when they exist, and the public corpus otherwise."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -74,7 +78,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "build the bank from your own recordings and transcripts in DIR instead of "
             "a public corpus. Expects <name>.wav/.mp3 beside <name>.txt, with the name "
-            "starting male/female, and 4-10 second clips."
+            "starting male/female, and 4-10 second clips. Defaults to VOICE_SAMPLE_DIR "
+            "when it holds recordings, so an installation that supplied voices never "
+            "downloads a corpus by accident."
+        ),
+    )
+    parser.add_argument(
+        "--from-corpus",
+        action="store_true",
+        help=(
+            "build from the public corpus even when VOICE_SAMPLE_DIR holds recordings. "
+            "Only needed when deliberately replacing your own voices."
         ),
     )
     parser.add_argument(
@@ -142,18 +156,37 @@ def main(argv: list[str] | None = None) -> int:
             print(message, flush=True)
 
     try:
-        if args.from_dir is not None:
+        source_dir = args.from_dir
+        built_from_samples = False
+        if source_dir is None and not args.from_corpus:
+            # The same rule the orchestrator follows: an operator who supplied voices
+            # does not want a corpus download to replace them. Requesting more voices
+            # than the samples provide simply uses all of them.
+            sample_dir = Path(settings.voice_sample_dir)
+            if sample_dir.is_dir() and any(
+                path.is_file() and path.suffix.lower() in SAMPLE_AUDIO_SUFFIXES
+                for path in sample_dir.iterdir()
+            ):
+                source_dir = sample_dir
+
+        if source_dir is not None:
             # The operator's own recordings: no corpus, no network, no row filters. The
             # duration bounds do apply, because a clip that is too long cannot be used
             # without cutting the audio away from its transcript.
+            report(f"voice bank: using the recordings in {source_dir}")
             bank = build_voice_bank_from_samples(
-                args.from_dir,
+                source_dir,
                 destination=args.out,
                 settings=settings,
                 filters=filters,
                 report=report,
             )
+            built_from_samples = True
         else:
+            report(
+                f"voice bank: no recordings found, scanning {args.dataset} "
+                "[build one from your own clips with --from-dir for a native voice]"
+            )
             bank = build_voice_bank(
                 destination=args.out,
                 settings=settings,
@@ -185,6 +218,14 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print("Set VOICE_BANK_DIR to this directory to dub with these voices.")
+    if built_from_samples and args.voices > len(bank):
+        # --voices is a corpus-option; recordings are never duplicated or synthesised to
+        # reach a count. Casting reuses the least-used voice instead, which is what
+        # keeps a 22-character episode voiced from 18 recordings.
+        print(
+            f"--voices {args.voices} asked for more voices than the {len(bank)} "
+            "recordings provide; the cast will reuse them, least-used first."
+        )
     print("Listen to a clip before trusting the casting: no filter hears a microphone.")
     return 0
 

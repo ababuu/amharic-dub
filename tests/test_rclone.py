@@ -165,6 +165,51 @@ def test_describe_names_the_credential_source(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# A damaged token is named, not passed through
+# ---------------------------------------------------------------------------
+
+
+def test_a_stripped_environment_token_is_named_instead_of_being_passed_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The reported failure: the value lost its leading '{', and rclone's own message
+    ("invalid character 'a' looking for beginning of object key string") names neither
+    the variable nor the fix."""
+
+    monkeypatch.setenv("RCLONE_CONFIG_GDRIVE_TYPE", "drive")
+    monkeypatch.setenv(
+        "RCLONE_CONFIG_GDRIVE_TOKEN", 'access_token":"a","refresh_token":"r"}'
+    )
+    settings = _settings(tmp_path)
+
+    with pytest.raises(rclone.TransferError) as caught:
+        rclone.pull_command(settings, name="S01E01.mp4")
+
+    message = str(caught.value)
+    assert "RCLONE_CONFIG_GDRIVE_TOKEN" in message
+    assert "not valid JSON" in message
+    assert "single quotes" in message
+
+
+def test_a_correctly_quoted_token_is_used_as_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The fix for that failure is the quoting, so a sound token must just work."""
+
+    monkeypatch.setenv("RCLONE_CONFIG_GDRIVE_TYPE", "drive")
+    monkeypatch.setenv(
+        "RCLONE_CONFIG_GDRIVE_TOKEN",
+        '{"access_token":"a","token_type":"Bearer","refresh_token":"r"}',
+    )
+    settings = _settings(tmp_path)
+
+    assert rclone.malformed_env_token(settings) is None
+    command = rclone.pull_command(settings, name="S01E01.mp4")
+    assert "--config" not in command
+
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 

@@ -23,6 +23,7 @@ link fetch for the case where no remote is configured yet.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -57,6 +58,46 @@ def env_remote_configured(settings: Settings) -> bool:
         return False
     prefix = f"{ENV_CONFIG_PREFIX}{remote}_"
     return any(name.startswith(prefix) for name in os.environ)
+
+
+def malformed_env_token(settings: Settings) -> str | None:
+    """Return a description of a broken ``RCLONE_CONFIG_<REMOTE>_TOKEN``, if any.
+
+    rclone's own message for a damaged token - ``invalid character 'a' looking for
+    beginning of object key string`` - names neither the variable nor the cause, which
+    turns a quoting mistake into a hunt. The variable and the likely cause are reported
+    here instead.
+    """
+
+    remote = (settings.drive_remote or "").strip().rstrip(":").upper()
+    if not remote:
+        return None
+    raw = os.environ.get(f"{ENV_CONFIG_PREFIX}{remote}_TOKEN")
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return f"{ENV_CONFIG_PREFIX}{remote}_TOKEN is set but empty"
+    try:
+        parsed = json.loads(text)
+    except ValueError as exc:
+        hint = ""
+        if not text.startswith("{"):
+            hint = (
+                f" Its value starts with {text[:1]!r} instead of '{{', so the outer "
+                "braces or quotes were removed before rclone saw it."
+            )
+        return (
+            f"{ENV_CONFIG_PREFIX}{remote}_TOKEN is not valid JSON ({exc}).{hint} "
+            "Paste it as one line, wrapped in single quotes, with the braces and the "
+            "double quotes around each key intact."
+        )
+    if not isinstance(parsed, dict):
+        return (
+            f"{ENV_CONFIG_PREFIX}{remote}_TOKEN must be a JSON object, got "
+            f"{type(parsed).__name__}"
+        )
+    return None
 
 
 def config_source(settings: Settings) -> tuple[str, str]:
@@ -125,6 +166,9 @@ def base_command(settings: Settings) -> list[str]:
     if kind == "file":
         command += ["--config", detail]
     elif kind == "none":
+        broken = malformed_env_token(settings)
+        if broken is not None:
+            raise TransferError(broken)
         raise TransferError(
             "the Drive remote is not configured: there is no rclone config at "
             f"{detail} and no {ENV_CONFIG_PREFIX}* variables in the environment. "
@@ -140,7 +184,11 @@ def base_command(settings: Settings) -> list[str]:
             f"{ENV_CONFIG_PREFIX}* variables, or create that file."
         )
     # Environment-configured: rclone reads RCLONE_CONFIG_<REMOTE>_* itself, so no
-    # --config argument belongs here.
+    # --config argument belongs here. Anything malformed in those variables is named
+    # here rather than surfacing as rclone's own JSON parse error.
+    broken = malformed_env_token(settings)
+    if broken is not None:
+        raise TransferError(broken)
     return command
 
 
@@ -384,6 +432,7 @@ __all__ = [
     "fetch_command",
     "fetch_remote_file",
     "looks_like_remote_path",
+    "malformed_env_token",
     "pull_command",
     "pull_episode",
     "push_command",
