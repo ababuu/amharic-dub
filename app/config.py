@@ -365,6 +365,19 @@ DEFAULT_CONTEXT_AI_SCRIPT_TIMEOUT_SECONDS = 120.0
 DEFAULT_DEEPSEEK_SEARCH_PATH = "/v1/tools/search"
 DEFAULT_DEEPSEEK_FETCH_PATH = "/v1/tools/fetch"
 
+#: Google Drive transfer through rclone. The episode is far too large to live in git,
+#: so it comes down from Drive and the finished dub goes back up. ``rclone`` is the
+#: only mover: it resumes, verifies and handles Drive's own download handshakes.
+#: The remote name here must match a remote in the rclone config file.
+DEFAULT_DRIVE_REMOTE = "gdrive"
+#: Folder inside that remote holding source episodes, and one for finished dubs.
+DEFAULT_DRIVE_SOURCE_FOLDER = ""
+DEFAULT_DRIVE_OUTPUT_FOLDER = "amharic-dubs"
+#: Where the rclone config lives on the worker. Kept outside the repository because
+#: it holds an OAuth refresh token, and copied there once during setup.
+DEFAULT_RCLONE_CONFIG_PATH = Path("/workspace/rclone.conf")
+DEFAULT_RCLONE_BIN = "rclone"
+
 #: Preferred length of a voice-cloning reference, in seconds. A short, clean
 #: prompt limits the amount of reference dialogue OmniVoice can echo; longer
 #: references remain available when no suitable shorter interval exists.
@@ -939,6 +952,12 @@ class Settings:
     context_ai_script_timeout_seconds: float = (
         DEFAULT_CONTEXT_AI_SCRIPT_TIMEOUT_SECONDS
     )
+    #: Google Drive transfer settings, used by ``scripts/drive_sync.py``.
+    drive_remote: str = DEFAULT_DRIVE_REMOTE
+    drive_source_folder: str = DEFAULT_DRIVE_SOURCE_FOLDER
+    drive_output_folder: str = DEFAULT_DRIVE_OUTPUT_FOLDER
+    rclone_config: Path = DEFAULT_RCLONE_CONFIG_PATH
+    rclone_bin: str = DEFAULT_RCLONE_BIN
     #: TTS settings for :mod:`app.pipeline.tts`: the Amharic speech adapter and the
     #: pause bounds of one synthesized line.
     tts_model: str = DEFAULT_TTS_MODEL
@@ -1130,6 +1149,21 @@ class Settings:
             context_ai_script_timeout_seconds=_read_float(
                 "CONTEXT_AI_SCRIPT_TIMEOUT_SECONDS",
                 DEFAULT_CONTEXT_AI_SCRIPT_TIMEOUT_SECONDS,
+            ),
+            drive_remote=(
+                _read_env("DRIVE_REMOTE", DEFAULT_DRIVE_REMOTE) or DEFAULT_DRIVE_REMOTE
+            ),
+            drive_source_folder=(
+                _read_env("DRIVE_SOURCE_FOLDER", DEFAULT_DRIVE_SOURCE_FOLDER)
+                or DEFAULT_DRIVE_SOURCE_FOLDER
+            ),
+            drive_output_folder=(
+                _read_env("DRIVE_OUTPUT_FOLDER", DEFAULT_DRIVE_OUTPUT_FOLDER)
+                or DEFAULT_DRIVE_OUTPUT_FOLDER
+            ),
+            rclone_config=_read_path("RCLONE_CONFIG", DEFAULT_RCLONE_CONFIG_PATH),
+            rclone_bin=(
+                _read_env("RCLONE_BIN", DEFAULT_RCLONE_BIN) or DEFAULT_RCLONE_BIN
             ),
             tts_model=(_read_env("TTS_MODEL", DEFAULT_TTS_MODEL) or DEFAULT_TTS_MODEL),
             tts_engine=(
@@ -1340,6 +1374,11 @@ class Settings:
             "context_ai_script_timeout_seconds": (
                 self.context_ai_script_timeout_seconds
             ),
+            "drive_remote": self.drive_remote,
+            "drive_source_folder": self.drive_source_folder,
+            "drive_output_folder": self.drive_output_folder,
+            "rclone_config": str(self.rclone_config),
+            "rclone_bin": self.rclone_bin,
             "tts_model": self.tts_model,
             "tts_engine": self.tts_engine,
             "omnivoice_model": self.omnivoice_model,
@@ -1387,6 +1426,11 @@ __all__ = [
     "DEFAULT_CONTEXT_AI_TIMEOUT_SECONDS",
     "DEFAULT_DEEPSEEK_SEARCH_PATH",
     "DEFAULT_DEEPSEEK_FETCH_PATH",
+    "DEFAULT_DRIVE_REMOTE",
+    "DEFAULT_DRIVE_SOURCE_FOLDER",
+    "DEFAULT_DRIVE_OUTPUT_FOLDER",
+    "DEFAULT_RCLONE_CONFIG_PATH",
+    "DEFAULT_RCLONE_BIN",
     "DEFAULT_DIARIZATION_MAX_SPEAKERS",
     "DEFAULT_DIARIZATION_MIN_SPEAKERS",
     "DEFAULT_DIARIZATION_MODEL",

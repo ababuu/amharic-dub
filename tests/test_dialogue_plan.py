@@ -288,7 +288,9 @@ def test_a_line_the_transcript_missed_is_kept_between_its_neighbours():
                     "speaker": "Skyler",
                     "start": 7.0,
                     "end": 12.0,
-                    "source_text": "I've said it before. If you are in danger, we go to the police.",
+                    "source_text": (
+                        "I've said it before. If you are in danger, we go to the police."
+                    ),
                     "amharic": "a",
                 },
                 {
@@ -434,7 +436,7 @@ def test_two_characters_never_share_one_voice():
     assert len(casting.mapping) == 1
 
 
-def test_a_gender_contradiction_is_reported_not_hidden():
+def test_the_authored_gender_decides_which_voice_a_character_gets():
     plan = plan_from_payload(
         {
             "characters": [{"name": "Skyler", "gender": "masculine"}],
@@ -446,11 +448,32 @@ def test_a_gender_contradiction_is_reported_not_hidden():
 
     casting = cast_plan(plan, plan.cues, turns=_turns(), registers=_registers())
 
-    # The timing evidence is unanimous, so the voice is kept - but the run says the
-    # authored gender disagrees with the measured one instead of hiding it.
-    assert casting.mapping == {"Skyler": SKYLER}
+    # The only voice carrying this line measures feminine, so it contradicts the
+    # gender the plan states and is not used.
+    assert casting.mapping == {}
     assert "the plan says masculine" in casting.casts[0].reason
-    assert "verify" in casting.casts[0].reason
+
+
+def test_the_authored_gender_rejects_the_other_register_even_when_it_dominates():
+    """Two characters can share a register; the authored gender breaks the tie."""
+
+    plan = plan_from_payload(
+        {
+            "characters": [{"name": "Skyler", "gender": "masculine"}],
+            "dialogue": [
+                {"speaker": "Skyler", "start": 7.5, "end": 11.9, "amharic": "x"},
+                {"speaker": "Skyler", "start": 12.9, "end": 14.3, "amharic": "y"},
+            ],
+        }
+    )
+    turns = [
+        SimpleNamespace(start=7.52, end=11.93, speaker_id=SKYLER),
+        SimpleNamespace(start=12.82, end=14.38, speaker_id=WALTER),
+    ]
+
+    casting = cast_plan(plan, plan.cues, turns=turns, registers=_registers())
+
+    assert casting.mapping == {"Skyler": WALTER}
 
 
 def test_no_diarized_turns_means_no_casting():
@@ -508,7 +531,9 @@ def test_authored_timings_on_the_wrong_grid_are_ignored_by_default():
                     "speaker": "Skyler",
                     "start": 5.88,
                     "end": 7.88,
-                    "source_text": "I've said it before. If you are in danger, we go to the police.",
+                    "source_text": (
+                        "I've said it before. If you are in danger, we go to the police."
+                    ),
                     "amharic": "x",
                 },
                 {
@@ -606,3 +631,46 @@ def test_window_growth_is_capped_so_a_line_does_not_drift_to_its_neighbour():
     dialogue = plan_dialogue(plan, scope, casting, min_gap=0.12, max_growth=3.0)
 
     assert dialogue[0].end == pytest.approx(14.0)
+
+def test_an_unvoiced_plan_character_is_cast_from_the_bank_by_its_gender():
+    from app.pipeline.dialogue_plan import bank_speaker_id, assign_bank_voices
+
+    plan = plan_from_payload(
+        {
+            "characters": [{"name": "Gus", "gender": "masculine"}],
+            "dialogue": [
+                {"speaker": "Gus", "start": 200.0, "end": 202.0, "amharic": "x"}
+            ],
+        }
+    )
+    casting = cast_plan(plan, plan.cues, turns=_turns(), registers=_registers())
+
+    assert casting.mapping == {}
+    bank_cast = assign_bank_voices(casting)
+
+    assert bank_cast.mapping == {"Gus": bank_speaker_id("Gus")}
+    assert bank_cast.bank_casts[0].gender == "masculine"
+    assert "voice bank" in bank_cast.bank_casts[0].reason
+
+
+def test_a_bank_cast_character_still_voices_its_lines():
+    from app.pipeline.dialogue_plan import assign_bank_voices, bank_speaker_id
+
+    plan = plan_from_payload(
+        {
+            "characters": [{"name": "Gus", "gender": "masculine"}],
+            "dialogue": [
+                {"speaker": "Gus", "start": 10.0, "end": 12.0, "amharic": "ሰላም።"}
+            ],
+        }
+    )
+    scope = scope_plan(plan)
+    casting = assign_bank_voices(
+        cast_plan(plan, scope.cues, turns=_turns(), registers=_registers())
+    )
+
+    dialogue = plan_dialogue(plan, scope, casting)
+
+    assert len(dialogue) == 1
+    assert dialogue[0].speaker_id == bank_speaker_id("Gus")
+    assert dropped_cues(scope, casting) == 0

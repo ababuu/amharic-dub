@@ -791,6 +791,19 @@ def scope_plan(
     )
 
 
+#: Prefix for a character who has no measured voice in the film and is instead
+#: voiced from the native-Amharic bank. The id is synthetic but stable, so a profile
+#: and its clip directory are reused between runs.
+BANK_SPEAKER_PREFIX = "CAST_"
+
+
+def bank_speaker_id(character: str) -> str:
+    """Return the synthetic speaker id used for a bank-cast character."""
+
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", character).strip("_").upper()
+    return f"{BANK_SPEAKER_PREFIX}{slug or 'CHARACTER'}"
+
+
 @dataclass(frozen=True, slots=True)
 class CharacterCast:
     """One plan character and the measured voice it was given."""
@@ -803,11 +816,15 @@ class CharacterCast:
     seconds: float
     runner_up: str | None
     reason: str
+    #: ``film`` when the voice was measured in this audio, ``voice_bank`` when the
+    #: character had no measured voice and the native-Amharic bank supplied one.
+    source: str = "film"
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "character": self.character,
             "speaker_id": self.speaker_id,
+            "source": self.source,
             "gender": self.gender,
             "speaker_gender": self.speaker_gender,
             "share": round(self.share, 3),
@@ -839,6 +856,12 @@ class PlanCasting:
     def unassigned(self) -> tuple[CharacterCast, ...]:
         return tuple(cast for cast in self.casts if cast.speaker_id is None)
 
+    @property
+    def bank_casts(self) -> tuple[CharacterCast, ...]:
+        """Characters voiced from the bank because the film gave them no voice."""
+
+        return tuple(cast for cast in self.casts if cast.source == "voice_bank")
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "cast": [cast.as_dict() for cast in self.casts],
@@ -865,6 +888,38 @@ def _presentation(value: object) -> str:
 
 def _overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
     return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def assign_bank_voices(casting: PlanCasting) -> PlanCasting:
+    """Give a synthetic speaker id to every character the film could not voice.
+
+    A character who never speaks alone in this footage has no measurable voice, but
+    the plan still has lines for them. Dropping those lines would edit the dialogue,
+    so each gets a stable synthetic id instead and the native-Amharic bank supplies
+    the voice - matched by the gender the plan states for them.
+    """
+
+    if not casting.unassigned:
+        return casting
+    resolved: list[CharacterCast] = []
+    for cast in casting.casts:
+        if cast.speaker_id is not None:
+            resolved.append(cast)
+            continue
+        resolved.append(
+            CharacterCast(
+                character=cast.character,
+                speaker_id=bank_speaker_id(cast.character),
+                gender=cast.gender,
+                speaker_gender=cast.gender,
+                share=cast.share,
+                seconds=cast.seconds,
+                runner_up=cast.runner_up,
+                reason=f"{cast.reason}; voiced from the voice bank",
+                source="voice_bank",
+            )
+        )
+    return PlanCasting(casts=tuple(resolved), skipped=casting.skipped)
 
 
 def cast_plan(
@@ -969,6 +1024,40 @@ def cast_plan(
                 )
             )
             continue
+
+        # The plan states each character's gender, so a voice that contradicts it is
+        # not a candidate at all: on a full episode two characters can share a
+        # register, and the authored gender is the stronger evidence about who is who.
+        if gender in ("masculine", "feminine"):
+            matching = {
+                speaker_id: seconds
+                for speaker_id, seconds in bucket.items()
+                if speaker_id not in register_values
+                or _presentation(register_values[speaker_id]) in (gender, "unknown", "uncertain")
+            }
+            if matching:
+                bucket = Counter(matching)
+            else:
+                casts.append(
+                    CharacterCast(
+                        character=character,
+                        speaker_id=None,
+                        gender=gender,
+                        speaker_gender=_presentation(
+                            register_values[bucket.most_common(1)[0][0]]
+                        )
+                        if bucket.most_common(1)[0][0] in register_values
+                        else "unknown",
+                        share=0.0,
+                        seconds=bucket.most_common(1)[0][1],
+                        runner_up=None,
+                        reason=(
+                            f"the plan says {gender}, and none of the voices carrying "
+                            "this character measures that way"
+                        ),
+                    )
+                )
+                continue
 
         total = sum(bucket.values())
         ranked = bucket.most_common()
@@ -1183,6 +1272,8 @@ __all__ = [
     "PlanError",
     "PlanReport",
     "PlanScope",
+    "assign_bank_voices",
+    "bank_speaker_id",
     "cast_plan",
     "discover_plan",
     "dropped_cues",

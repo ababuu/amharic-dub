@@ -84,6 +84,7 @@ from app.pipeline.translation import AdaptedDialogue
 from app.pipeline.tts import SkippedLine, TtsClip
 from app.pipeline.video import MuxResult
 from app.pipeline.voice_profiles import VoiceProfile, portable_path
+from app.utils import drive, rclone
 
 #: Manifest written next to a run's artifacts.
 MANIFEST_FILENAME = "manifest.json"
@@ -1110,6 +1111,12 @@ def run_pipeline(
                 f"{len(sentences)} sentence(s)"
             )
 
+    # A bank is a fallback, never the default: a character keeps the actor's own
+    # voice unless the film cannot supply a reference that is safe to clone. It is
+    # loaded here because whether one exists decides what happens to a plan
+    # character the film never lets speak alone: voiced from the bank, or reported.
+    bank = voice_bank.load_voice_bank(settings=resolved)
+
     # With a plan the characters are already named and the Amharic is already
     # written. The one thing left to decide is which measured voice belongs to each
     # of them, and that is casting rather than translation - so no request is made.
@@ -1128,13 +1135,18 @@ def run_pipeline(
         )
         if plan_casting.skipped:
             report(f"  casting: {plan_casting.skipped}")
+        if plan_casting.unassigned and bank is not None:
+            # The plan has lines for these characters, so they are voiced from the
+            # native-Amharic bank - matched by the gender the plan states - rather
+            # than being dropped from the dub.
+            plan_casting = dialogue_plan.assign_bank_voices(plan_casting)
         for cast in plan_casting.casts:
             if cast.speaker_id is None:
                 report(f"  casting: {cast.character}: unassigned ({cast.reason})")
             else:
                 report(
                     f"  casting: {cast.character} -> {cast.speaker_id} "
-                    f"({cast.speaker_gender}; {cast.reason})"
+                    f"[{cast.source}] ({cast.speaker_gender}; {cast.reason})"
                 )
         dialogue = dialogue_plan.plan_dialogue(
             plan,
@@ -1236,9 +1248,6 @@ def run_pipeline(
     # TTS stage's own contract, asked rather than assumed here.
     needs_profiles = tts.engine_needs_profiles(resolved.tts_engine)
     profiles: Mapping[str, VoiceProfile] = {}
-    # A bank is a fallback, never the default: a character keeps the actor's own
-    # voice unless the film cannot supply a reference that is safe to clone.
-    bank = voice_bank.load_voice_bank(settings=resolved)
     if not needs_profiles:
         seconds["voice_profiles"] = 0.0
         report(f"  voice profiles: skipped ({resolved.tts_engine} is single-voice)")
@@ -1295,10 +1304,21 @@ def run_pipeline(
             registers=attribution.after if attribution is not None else None,
         )
         if not profiles and not unusable:
-            raise EmptyStageError(
-                "no voice profile could be built from the dialogue stem; the TTS stage "
-                "needs one identity reference per speaker"
-            )
+            # A plan whose characters are all voiced from the bank legitimately has
+            # no film profile, so only an empty result with nothing to fall back to
+            # is an empty stage.
+            bank_cast_ids = [
+                cast.speaker_id
+                for cast in (
+                    plan_casting.bank_casts if plan_casting is not None else ()
+                )
+                if cast.speaker_id
+            ]
+            if not bank_cast_ids or bank is None:
+                raise EmptyStageError(
+                    "no voice profile could be built from the dialogue stem; the TTS "
+                    "stage needs one identity reference per speaker"
+                )
         if unusable and bank is None:
             # Every character has to sound like someone, and an unusable window is
             # not a voice. Failing here names the character and says how to fix it;
@@ -1352,6 +1372,42 @@ def run_pipeline(
                 raise StageError(
                     "the voice_profiles stage failed while casting "
                     f"{len(unusable)} character(s) from the voice bank: {exc}"
+                ) from exc
+
+        # A plan character the film never let speak alone has no measured voice; the
+        # bank supplies one, chosen by the gender the plan states for that character.
+        bank_requests = [
+            voice_bank.VoiceRequest(
+                speaker_id=cast.speaker_id, presentation=cast.gender
+            )
+            for cast in (plan_casting.bank_casts if plan_casting is not None else ())
+            if cast.speaker_id
+        ]
+        if bank_requests:
+            if bank is None:
+                raise StageError(
+                    f"{len(bank_requests)} plan character(s) have no measurable voice "
+                    "in this footage and no voice bank is configured to voice them "
+                    "(build one with `python scripts/build_voice_bank.py`). Add a "
+                    "gender to every character in the plan so the fallback can pick "
+                    "the right register."
+                )
+            try:
+                profiles = voice_bank.apply_voice_bank(
+                    profiles,
+                    settings=resolved,
+                    bank=bank,
+                    requests=bank_requests,
+                    reasons={
+                        cast.speaker_id: "the film never lets this character speak alone"
+                        for cast in plan_casting.bank_casts  # type: ignore[union-attr]
+                        if cast.speaker_id
+                    },
+                )
+            except voice_bank.VoiceBankError as exc:
+                raise StageError(
+                    "the voice_profiles stage failed while casting "
+                    f"{len(bank_requests)} plan character(s) from the voice bank: {exc}"
                 ) from exc
 
         film_ids = [
@@ -1832,6 +1888,63 @@ def ensure_voice_bank(
     return built
 
 
+def _fetch_source_link(
+    link: str, *, settings: Settings, name: str | None = None
+) -> Path:
+    """Download a share link into ``INPUT_DIR`` and return the local path."""
+
+    settings.ensure_directories()
+    filename = drive.safe_filename(name) if name else "episode.mp4"
+    destination = Path(settings.input_dir) / filename
+
+    def progress(written: int, total: int) -> None:
+        if total > 0:
+            share = written / total
+            _print_progress(
+                f"  download: {written / 1e6:.0f} of {total / 1e6:.0f} MB "
+                f"({share:.0%})"
+            )
+        else:
+            _print_progress(f"  download: {written / 1e6:.0f} MB")
+
+    _print_progress(f"fetching {link} -> {destination}")
+    path = drive.download_file(link, destination, progress=progress)
+    _print_progress(f"  download: saved {path} ({path.stat().st_size / 1e6:.0f} MB)")
+    return path
+
+
+def _resolve_source(
+    source: str,
+    *,
+    settings: Settings,
+    name: str | None = None,
+    report: Callable[[str], None],
+) -> Path:
+    """Return a local path for ``source``, fetching it from Drive when it is remote.
+
+    Three forms are accepted, so the episode never has to be in the repository:
+
+    * a local path, used as it is;
+    * ``remote:folder/file``, fetched through rclone;
+    * an ``https://drive.google.com/...`` share link, downloaded directly.
+
+    In every case the file lands in ``INPUT_DIR``, which is what the plan, the title
+    file and any later run are keyed to.
+    """
+
+    text = source.strip()
+    if rclone.looks_like_remote_path(text):
+        if name:
+            report(
+                "  source: --source-name applies to share links; a remote path keeps "
+                "the file's own name"
+            )
+        return rclone.fetch_remote_file(settings, text, report=report)
+    if text.lower().startswith(("http://", "https://")):
+        return _fetch_source_link(text, settings=settings, name=name)
+    return Path(text)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Command-line entry point: ``python -m app.pipeline.orchestrator SOURCE``."""
 
@@ -1842,7 +1955,41 @@ def main(argv: list[str] | None = None) -> int:
             "original picture with an Amharic dialogue track."
         ),
     )
-    parser.add_argument("source", type=Path, help="source video to dub")
+    parser.add_argument(
+        "source",
+        type=str,
+        help=(
+            "source video to dub: a local path, an rclone path such as "
+            "gdrive:amharic-dub/input/S04E06.mkv, or a Google Drive share link. A "
+            "remote one is fetched into INPUT_DIR first, so the episode never has to "
+            "be committed to git."
+        ),
+    )
+    parser.add_argument(
+        "--source-name",
+        default=None,
+        metavar="NAME",
+        help=(
+            "filename to save a downloaded share link as (default: episode.mp4). Use "
+            "it when the plan is named after the video."
+        ),
+    )
+    parser.add_argument(
+        "--no-push",
+        action="store_true",
+        help=(
+            "do not upload the finished run to DRIVE_OUTPUT_FOLDER. Without this flag "
+            "a run is pushed whenever the Drive remote is configured, so the dub "
+            "reaches Drive without a second command."
+        ),
+    )
+    parser.add_argument(
+        "--rclone-config",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="rclone config to use for this run (default: RCLONE_CONFIG)",
+    )
     parser.add_argument(
         "--out",
         type=Path,
@@ -1896,7 +2043,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    settings = get_settings()
+    settings = rclone.with_config(get_settings(), args.rclone_config)
+
+    # The episode itself is far too large to live in git, so it usually arrives from
+    # Google Drive. Accepting a Drive path or share link as the source keeps that to
+    # one command, and it lands in INPUT_DIR so every later step - the plan, the title
+    # file, a second run - finds it exactly where a copied file would be.
+    try:
+        video_path = _resolve_source(
+            str(args.source),
+            settings=settings,
+            name=args.source_name,
+            report=_print_progress,
+        )
+    except (drive.DriveError, rclone.TransferError) as exc:
+        print(f"\nFAILED: could not fetch the source video: {exc}", file=sys.stderr)
+        return 1
+
     if args.cast_from_bank is not None:
         directory = Path(args.cast_from_bank) if args.cast_from_bank else Path(
             settings.voice_bank_dir
@@ -1910,7 +2073,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         result = run_pipeline(
-            args.source,
+            video_path,
             output_dir=args.out,
             settings=settings,
             max_lines=args.max_lines,
@@ -1932,8 +2095,33 @@ def main(argv: list[str] | None = None) -> int:
             "each one under run.tts.skipped_lines.",
             file=sys.stderr,
         )
-        return 2
-    return 0
+        code = 2
+    else:
+        code = 0
+
+    # A dub that never leaves the pod has not been delivered, and the pod is
+    # disposable. Pushing here means one command does the whole job; --no-push is
+    # for a run whose artifact you want to inspect locally first, and an
+    # unconfigured remote simply skips it.
+    if args.no_push:
+        _print_progress("  drive: not pushing (--no-push)")
+    elif not rclone.drive_ready(settings):
+        _print_progress(
+            "  drive: not pushing (no Drive remote configured; see "
+            "config/rclone.example.conf)"
+        )
+    else:
+        try:
+            _print_progress(f"  drive: pushing {result.output_dir.name} "
+                            f"({rclone.describe(settings)})")
+            rclone.push_run(settings, result.output_dir, report=_print_progress)
+        except rclone.TransferError as exc:
+            # The dub exists on the pod and in the manifest; a failed upload must not
+            # turn a finished run into a failed one, but it must be loud.
+            print(f"\nUPLOAD FAILED: the dub is at {result.final_video} but was not "
+                  f"pushed to Drive: {exc}", file=sys.stderr)
+            return 3
+    return code
 
 
 if __name__ == "__main__":

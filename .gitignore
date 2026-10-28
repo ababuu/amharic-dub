@@ -1,9 +1,16 @@
 # ---------------------------------------------------------------------------
-# Secrets - NEVER commit real credentials
+# Credentials and machine-local config - NEVER commit
 # ---------------------------------------------------------------------------
 .env
 .env.*
 !.env.example
+# rclone's config holds an OAuth refresh token, which is a credential. Only the
+# template is tracked.
+rclone.conf
+*.rclone.conf
+config/rclone.conf
+service-account.json
+config/service-account.json
 
 # ---------------------------------------------------------------------------
 # Python
