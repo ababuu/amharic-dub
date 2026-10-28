@@ -71,6 +71,23 @@ class ResearchUnavailable(ContextAiError):
 #: Longest title a ``.txt`` file may contain. A title is a name, not an essay.
 MAX_TITLE_CHARS = 200
 
+#: Local, operator-supplied sources. A file here removes the corresponding web
+#: research entirely: it is deterministic input, not something to pay a model to
+#: rediscover.
+LOCAL_SCRIPT_SUFFIXES = (".script.txt", ".transcript.txt", ".srt", ".vtt")
+LOCAL_CAST_SUFFIXES = (".cast.json", ".characters.json", ".character.json")
+MIN_LOCAL_SCRIPT_LINES = 3
+MAX_LOCAL_SCRIPT_LINES = 5_000
+
+#: Words that appear in stage directions and sound cues, never as a speaker name.
+_STAGE_CUE_WORDS = frozenset(
+    """
+    applause beat birds breathing chuckle coughing cries crying cut door fades
+    footsteps gunshot gunshots laughs laughter music pause phone rings screams
+    silence sighs slams thunder tv
+    """.split()
+)
+
 #: Longest page excerpt kept from one Fetch response, and the total sent to the
 #: extraction model. Both bound a request whose input is controlled by the web.
 MAX_FETCH_CHARS = 6_000
@@ -208,7 +225,12 @@ def discover_title(
     directory = Path(input_dir)
     if not directory.is_dir():
         return None
-    candidates = sorted(path for path in directory.glob("*.txt") if path.is_file())
+    candidates = sorted(
+        path
+        for path in directory.glob("*.txt")
+        if path.is_file()
+        and not path.name.casefold().endswith((".script.txt", ".transcript.txt"))
+    )
     if not candidates:
         return None
 
@@ -226,12 +248,16 @@ def discover_title(
 
     if source is not None:
         stem = Path(source).stem.casefold()
-        for path, title, raw in usable:
-            if path.stem.casefold() == stem:
-                season, episode = _season_episode(raw + "\n" + path.stem)
-                return TitleInfo(
-                    title=title, path=path, season=season, episode=episode
-                )
+        named = [
+            entry
+            for entry in usable
+            if entry[0].stem.casefold() in (stem, f"{stem}.title")
+        ]
+        if named:
+            named.sort(key=lambda entry: entry[0].stem.casefold() != f"{stem}.title")
+            path, title, raw = named[0]
+            season, episode = _season_episode(raw + "\n" + path.stem)
+            return TitleInfo(title=title, path=path, season=season, episode=episode)
 
     distinct = {title.casefold() for _, title, _ in usable}
     if len(usable) > 1 and len(distinct) > 1:
@@ -247,6 +273,391 @@ def discover_title(
     path, title, raw = usable[0]
     season, episode = _season_episode(raw + "\n" + path.stem)
     return TitleInfo(title=title, path=path, season=season, episode=episode)
+
+
+# ---------------------------------------------------------------------------
+# Local, operator-supplied sources
+# ---------------------------------------------------------------------------
+
+
+def _clean_cue_text(text: str) -> str:
+    """Strip subtitle markup and normalise a cue's text."""
+
+    cleaned = re.sub(r"<[^>]+>", "", text or "")
+    cleaned = re.sub(r"\{\\[^}]*\}", "", cleaned)
+    cleaned = cleaned.replace("&nbsp;", " ").replace("&amp;", "&")
+    cleaned = cleaned.replace("\u2019", "'")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _clean_name(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().strip("\"'“”‘’[]:")
+
+
+def _is_stage_direction(text: str) -> bool:
+    return bool(re.fullmatch(r"[\[\(].*[\]\)]", text.strip()))
+
+
+def _looks_like_name(value: str) -> bool:
+    name = _clean_name(value)
+    if not name or len(name) > 60 or any(character.isdigit() for character in name):
+        return False
+    if len(name.split()) > 4:
+        return False
+    lowered = name.casefold()
+    if lowered in _STAGE_CUE_WORDS or lowered.startswith(("http", "www")):
+        return False
+    return True
+
+
+def _label_and_text(raw: str) -> tuple[str, str] | None:
+    """Return ``(speaker, text)`` from one labelled cue line, or ``None``."""
+
+    webvtt = re.match(r"^\s*<v(?:\.[^\s>]+)*\s+([^>]+)>(.*)$", raw, re.I)
+    if webvtt is not None:
+        name = _clean_name(webvtt.group(1))
+        text = _clean_cue_text(webvtt.group(2))
+        if _looks_like_name(name) and text:
+            return name, text
+        return None
+
+    cleaned = _clean_cue_text(raw)
+    if not cleaned or _is_stage_direction(cleaned):
+        return None
+    bracketed = re.match(r"^\s*\[([^\]\n]{1,60})\]\s*(.+)$", cleaned)
+    if bracketed is not None:
+        name = _clean_name(bracketed.group(1))
+        text = bracketed.group(2).strip()
+        if _looks_like_name(name) and text:
+            return name, text
+    prefixed = re.match(r"^\s*([A-Za-z][\w .'\-]{0,60}?)\s*:\s*(.+)$", cleaned)
+    if prefixed is not None:
+        name = _clean_name(prefixed.group(1))
+        text = prefixed.group(2).strip()
+        if _looks_like_name(name) and text:
+            return name, text
+    return None
+
+
+def _parse_local_lines(
+    raw_lines: Sequence[str],
+) -> tuple[list[tuple[str, str]], int, int]:
+    """Parse labelled dialogue lines, carrying a speaker across unlabelled lines.
+
+    Screenplay transcripts often label a speaker only when the speaker changes. A
+    local file is operator-controlled, so carrying the previous speaker forward is
+    preferable to dropping the line; ``carried`` is reported so a wrongly formatted
+    script is visible instead of silently accepted.
+    """
+
+    entries: list[tuple[str, str]] = []
+    last: str | None = None
+    pending: str | None = None
+    explicit = 0
+    carried = 0
+    for raw in raw_lines:
+        cleaned = _clean_cue_text(raw)
+        if not cleaned or _is_stage_direction(cleaned):
+            continue
+        if (
+            cleaned.endswith(":")
+            and len(cleaned[:-1].split()) <= 4
+            and _looks_like_name(cleaned[:-1])
+        ):
+            pending = _clean_name(cleaned[:-1])
+            continue
+        labelled = _label_and_text(raw)
+        if labelled is not None:
+            speaker, body = labelled
+            explicit += 1
+        elif pending is not None:
+            speaker, body = pending, cleaned
+            pending = None
+        elif last is not None:
+            speaker, body = last, cleaned
+            carried += 1
+        else:
+            continue
+        if not body:
+            continue
+        last = speaker
+        entries.append((speaker, body[:1_000]))
+    return entries, explicit, carried
+
+
+def _subtitle_lines(text: str) -> list[str]:
+    """Return the dialogue lines of an SRT/VTT file, without indexes or timings."""
+
+    blocks = re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n"))
+    lines: list[str] = []
+    for block in blocks:
+        block_lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not block_lines:
+            continue
+        if block_lines[0].upper().startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
+            continue
+        for line in block_lines:
+            if line.isdigit() or "-->" in line:
+                continue
+            lines.append(line)
+    return lines
+
+
+def _local_path(
+    input_dir: str | Path,
+    source: str | Path,
+    suffixes: Sequence[str],
+    *,
+    fallbacks: Sequence[str] = (),
+) -> Path | None:
+    """Find a stem-named local file, or the only matching file in the directory."""
+
+    directory = Path(input_dir)
+    if not directory.is_dir():
+        return None
+    stem = Path(source).stem
+    for suffix in suffixes:
+        candidate = directory / f"{stem}{suffix}"
+        if candidate.is_file():
+            return candidate
+    for name in fallbacks:
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    matches = [
+        path
+        for path in sorted(directory.iterdir())
+        if path.is_file() and path.name.casefold().endswith(tuple(suffixes))
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _local_script_candidates(
+    input_dir: str | Path, source: str | Path
+) -> list[Path]:
+    """Return possible local scripts in priority order, keyed to the video."""
+
+    directory = Path(input_dir)
+    if not directory.is_dir():
+        return []
+    stem = Path(source).stem
+    candidates: list[Path] = []
+    for suffix in LOCAL_SCRIPT_SUFFIXES:
+        candidate = directory / f"{stem}{suffix}"
+        if candidate.is_file():
+            candidates.append(candidate)
+    plain = directory / f"{stem}.txt"
+    if plain.is_file() and _valid_title_file(plain) is None:
+        candidates.append(plain)
+    if not candidates:
+        matches = [
+            path
+            for path in sorted(directory.iterdir())
+            if path.is_file()
+            and path.name.casefold().endswith(tuple(LOCAL_SCRIPT_SUFFIXES))
+        ]
+        if len(matches) == 1:
+            candidates.append(matches[0])
+    return list(dict.fromkeys(candidates))
+
+
+def _read_local_script(
+    path: Path, *, title: TitleInfo | None
+) -> tuple[EpisodeScript | None, int, int]:
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None, 0, 0
+    raw_lines = (
+        _subtitle_lines(text)
+        if path.suffix.casefold() in (".srt", ".vtt")
+        else text.splitlines()
+    )
+    entries, explicit, carried = _parse_local_lines(raw_lines)
+    deduped: list[ScriptLine] = []
+    for speaker, body in entries:
+        line = ScriptLine(speaker=speaker, text=body)
+        if deduped and deduped[-1].speaker == line.speaker and deduped[-1].text == line.text:
+            continue
+        deduped.append(line)
+        if len(deduped) >= MAX_LOCAL_SCRIPT_LINES:
+            break
+    speakers = {line.speaker for line in deduped if line.speaker.casefold() != "unknown"}
+    if (
+        len(deduped) < MIN_LOCAL_SCRIPT_LINES
+        or len(speakers) < 2
+        or explicit < 2
+    ):
+        return None, explicit, carried
+    return (
+        EpisodeScript(
+            title=title.title if title is not None else "",
+            season=title.season if title is not None else None,
+            episode=title.episode if title is not None else None,
+            lines=tuple(deduped),
+            sources=(str(path),),
+            extracted_at="local",
+        ),
+        explicit,
+        carried,
+    )
+
+
+def local_script_for_run(
+    source: str | Path,
+    *,
+    settings: Settings,
+    report: Callable[[str], None] | None = None,
+) -> EpisodeScript | None:
+    """Return a speaker-labelled script supplied in ``data/input``, if present.
+
+    This path is deliberately free: no Search, Fetch or LLM extraction. Supported
+    names are ``<video>.script.txt``, ``<video>.transcript.txt``, ``<video>.srt``
+    and ``<video>.vtt``; a single differently named file is also accepted.
+    """
+
+    candidates = _local_script_candidates(settings.input_dir, source)
+    if not candidates:
+        return None
+    title = discover_title(settings.input_dir, source=source)
+    for path in candidates:
+        script, explicit, carried = _read_local_script(path, title=title)
+        if script is None:
+            if report is not None:
+                report(
+                    f"  script: local {path.name} has {explicit} labelled line(s) "
+                    "but needs at least two speakers and three usable lines; trying "
+                    "the next local source"
+                )
+            continue
+        if report is not None:
+            report(
+                f"  script: local {path.name}: {len(script)} line(s), "
+                f"{len({line.speaker for line in script.lines})} speaker(s), "
+                f"{carried} unlabelled line(s) carried forward; no research request"
+            )
+        return script
+    return None
+
+
+def _guide_from_cast(
+    payload: object, path: Path, title: TitleInfo | None
+) -> CharacterGuide | None:
+    if isinstance(payload, Mapping) and isinstance(payload.get("characters"), list):
+        items = payload["characters"]
+    elif isinstance(payload, Mapping):
+        items = []
+        for name, value in payload.items():
+            if isinstance(value, Mapping):
+                items.append({"name": name, **value})
+            elif isinstance(value, str):
+                items.append({"name": name, "gender": value})
+            else:
+                items.append({"name": name})
+    elif isinstance(payload, list):
+        items = [
+            {"name": item} if isinstance(item, str) else item for item in payload
+        ]
+    else:
+        return None
+
+    characters: list[GuideCharacter] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        characters.append(
+            GuideCharacter(
+                name=name,
+                aliases=tuple(item.get("aliases", ()) or ()),
+                gender=str(item.get("gender", "unknown") or "unknown"),
+                relationships=item.get("relationships", {}) or {},
+                notes=str(item.get("notes", "") or ""),
+                sources=tuple(item.get("sources", ()) or ()) or (str(path),),
+                confidence=item.get("confidence", 1.0),
+            )
+        )
+    if not characters:
+        return None
+    return CharacterGuide(
+        title=title.title if title is not None else "",
+        season=title.season if title is not None else None,
+        episode=title.episode if title is not None else None,
+        characters=tuple(characters),
+        sources=(str(path),),
+        researched_at="local",
+    )
+
+
+def local_cast_for_run(
+    source: str | Path,
+    *,
+    settings: Settings,
+    report: Callable[[str], None] | None = None,
+) -> CharacterGuide | None:
+    """Return a locally supplied cast file, if present.
+
+    Accepted names: ``<video>.cast.json``, ``<video>.characters.json``,
+    ``<video>.character.json`` and ``cast.json``. No API call is made.
+    """
+
+    path = _local_path(
+        settings.input_dir,
+        source,
+        LOCAL_CAST_SUFFIXES,
+        fallbacks=("cast.json",),
+    )
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        if report is not None:
+            report(f"  characters: local {path.name} is unreadable ({exc})")
+        return None
+    guide = _guide_from_cast(payload, path, discover_title(settings.input_dir, source=source))
+    if guide is None:
+        if report is not None:
+            report(f"  characters: local {path.name} lists no usable character")
+        return None
+    if report is not None:
+        report(
+            f"  characters: local {path.name}: {len(guide)} character(s); "
+            "no research request"
+        )
+    return guide
+
+
+def _guide_from_script(script: EpisodeScript, path: Path) -> CharacterGuide | None:
+    names = list(
+        dict.fromkeys(
+            line.speaker
+            for line in script.lines
+            if line.speaker and line.speaker.casefold() != "unknown"
+        )
+    )
+    if not names:
+        return None
+    return CharacterGuide(
+        title=script.title,
+        season=script.season,
+        episode=script.episode,
+        characters=tuple(
+            GuideCharacter(
+                name=name,
+                gender="unknown",
+                sources=(str(path),),
+                confidence=1.0,
+            )
+            for name in names
+        ),
+        sources=script.sources or (str(path),),
+        researched_at="local",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1073,8 +1484,11 @@ def episode_script_for_run(
     chat_client: Any | None = None,
     report: Callable[[str], None] | None = None,
 ) -> EpisodeScript | None:
-    """Discover the title of ``source`` and return its cached or fetched script."""
+    """Discover the title of ``source`` and return a local, cached or fetched script."""
 
+    local = local_script_for_run(source, settings=settings, report=report)
+    if local is not None:
+        return local
     if not settings.context_ai_enabled:
         return None
     title = discover_title(settings.input_dir, source=source)
@@ -1677,13 +2091,34 @@ def character_guide_for_run(
     source: str | Path,
     *,
     settings: Settings,
+    script: EpisodeScript | None = None,
     refresh: bool = False,
     tools: DeepSeekTools | None = None,
     chat_client: Any | None = None,
     report: Callable[[str], None] | None = None,
 ) -> CharacterGuide | None:
-    """Discover the title of ``source`` and return its cached or researched guide."""
+    """Return a local, cached or researched character guide.
 
+    Local files win because they cost nothing: a ``.cast.json`` supplies explicit
+    names and genders, and a local script supplies at least the names. Only when
+    neither exists does the DeepSeek research path run.
+    """
+
+    local = local_cast_for_run(source, settings=settings, report=report)
+    if local is not None:
+        return local
+    if script is None:
+        script = local_script_for_run(source, settings=settings, report=report)
+    if script is not None:
+        path = Path(script.sources[0]) if script.sources else Path(source)
+        guide = _guide_from_script(script, path)
+        if guide is not None:
+            if report is not None:
+                report(
+                    f"  characters: derived {len(guide)} name(s) from the local "
+                    "script; add a .cast.json for explicit genders; no research request"
+                )
+            return guide
     if not settings.context_ai_enabled:
         return None
     title = discover_title(settings.input_dir, source=source)
@@ -1730,5 +2165,7 @@ __all__ = [
     "collect_evidence",
     "discover_title",
     "episode_script_for_run",
+    "local_cast_for_run",
+    "local_script_for_run",
     "review_speaker_attribution",
 ]

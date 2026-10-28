@@ -1567,3 +1567,72 @@ def test_a_sentence_report_is_not_printed_when_nothing_was_joined(
     run_pipeline(_source(tmp_path), settings=_settings(tmp_path), progress=messages.append)
 
     assert "assembled into" not in " ".join(messages)
+
+# ---------------------------------------------------------------------------
+# Authored dialogue plan
+# ---------------------------------------------------------------------------
+
+
+def _plan_file(root: Path, *, amharic: str = "እወድሃለሁ።") -> Path:
+    path = root / "movie.plan.json"
+    path.write_text(
+        json.dumps(
+            {
+                "characters": [{"name": "Walter"}, {"name": "Skyler"}],
+                "dialogue": [
+                    {
+                        "cue": 1,
+                        "speaker": "Walter",
+                        "start": 1.0,
+                        "end": 4.0,
+                        "source_text": "I love you.",
+                        "amharic": amharic,
+                        "emotion": "tender",
+                        "intensity": 0.7,
+                        "delivery": "soft",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_plan_skips_translation_and_casts_the_character(
+    tmp_path: Path, stages: Stages
+) -> None:
+    _plan_file(tmp_path)
+
+    result = run_pipeline(
+        _source(tmp_path),
+        settings=_settings(tmp_path),
+        progress=lambda _message: None,
+    )
+
+    # The Amharic came from the plan, so no adaptation request was made at all.
+    assert "translation" not in stages.order
+    assert result.dialogue[0].amharic == "እወድሃለሁ።"
+    assert result.dialogue[0].emotion == "tender"
+    # The character was tied to the measured voice that carries its line.
+    assert result.plan is not None
+    assert result.plan.casting.mapping == {"Walter": SPEAKER}
+    assert result.dialogue[0].speaker_id == SPEAKER
+
+
+def test_a_plan_is_recorded_in_the_manifest(tmp_path: Path, stages: Stages) -> None:
+    _plan_file(tmp_path)
+
+    result = run_pipeline(
+        _source(tmp_path),
+        settings=_settings(tmp_path),
+        progress=lambda _message: None,
+    )
+
+    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    plan = payload["run"]["plan"]
+    assert plan["authored_cues"] == 1
+    assert plan["voiced"] == 1
+    assert plan["casting"]["mapping"] == {"Walter": SPEAKER}
+    assert payload["run"]["translation"]["lines"] == 1

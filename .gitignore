@@ -102,6 +102,21 @@ data/**/*.json
 *.amharic.json
 *.dub.json
 
+# Inputs the operator authors or supplies are not processing artifacts. The title
+# file, the local transcript/cast files and the authored dialogue plan are small
+# text inputs the GPU worker needs, so they are committed with the repository - the
+# plan in particular is the whole point of shipping one instead of paying a model to
+# write the Amharic again. These negations must stay below both `data/input/*` and
+# `data/**/*.json`, because the last matching pattern wins.
+!data/input/*.txt
+!data/input/*.srt
+!data/input/*.vtt
+!data/input/*.plan.json
+!data/input/*.dialogue.json
+!data/input/*.cast.json
+!data/input/*.characters.json
+!data/input/*.character.json
+
 # ---------------------------------------------------------------------------
 # OS / editor noise
 # ---------------------------------------------------------------------------

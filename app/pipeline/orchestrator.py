@@ -51,10 +51,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import soundfile
+
 from app.config import Settings, get_settings
 from app.pipeline import (
     context_ai,
     dialogue_context,
+    dialogue_plan,
     diarization,
     evaluation,
     mixing,
@@ -171,6 +174,9 @@ class PipelineResult:
     #: them, and the result of that reconciliation.
     episode_script: script_reconciliation.EpisodeScript | None = None
     script_reconciliation: script_reconciliation.ScriptReconciliation | None = None
+    #: The authored dialogue plan a run was given, how much of it belongs to this
+    #: audio, and which measured voice each character was cast with.
+    plan: dialogue_plan.PlanReport | None = None
     #: The AI speaker-attribution review: what was corrected and what was left for
     #: QC. ``None`` when the review was disabled or never had evidence to review.
     attribution_review: context_ai.AttributionReview | None = None
@@ -361,6 +367,7 @@ class PipelineResult:
             "script": (
                 None if self.episode_script is None else self.episode_script.summary()
             ),
+            "plan": None if self.plan is None else self.plan.as_dict(),
             "tts": {
                 "clips": [clip.to_dict() for clip in self.clips],
                 # Lines the stage could not voice. Recorded because a line missing
@@ -443,6 +450,47 @@ def _print_progress(message: str) -> None:
     """Default progress sink: one flushed line per stage."""
 
     print(message, flush=True)
+
+
+def _audio_seconds(path: str | Path) -> float | None:
+    """Return the duration of an audio file, or ``None`` when it cannot be read."""
+
+    try:
+        info = soundfile.info(str(path))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return float(info.duration) if info.frames else None
+
+
+def _plan_profile_turns(
+    scope: dialogue_plan.PlanScope, casting: dialogue_plan.PlanCasting
+) -> list[SpeakerSegment]:
+    """Return each cast character's lines as the runs a voice reference is cut from.
+
+    The plan's own timings are the most precise statement available about when a
+    character was speaking, so they are what the reference window is chosen from.
+    """
+
+    mapping = casting.mapping
+    by_speaker: dict[str, list[tuple[float, float]]] = {}
+    for cue in scope.cues:
+        speaker_id = mapping.get(cue.speaker)
+        if speaker_id is None:
+            continue
+        by_speaker.setdefault(speaker_id, []).append((cue.start, cue.end))
+
+    turns: list[SpeakerSegment] = []
+    for speaker_id, spans in by_speaker.items():
+        spans.sort()
+        start, end = spans[0]
+        for next_start, next_end in spans[1:]:
+            if next_start - end <= 0.5:
+                end = max(end, next_end)
+            else:
+                turns.append(SpeakerSegment(speaker_id, start, end))
+                start, end = next_start, next_end
+        turns.append(SpeakerSegment(speaker_id, start, end))
+    return turns
 
 
 def _stage(
@@ -557,6 +605,8 @@ def run_pipeline(
     output_dir: str | Path | None = None,
     settings: Settings | None = None,
     max_lines: int | None = None,
+    plan_file: str | Path | None = None,
+    plan_keep_timing: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> PipelineResult:
     """Run every implemented stage on ``source`` and return what they produced.
@@ -574,6 +624,15 @@ def run_pipeline(
     max_lines:
         Synthesize only the first ``N`` adapted lines. A cost control for the
         first run of a long film; every earlier stage still runs in full.
+    plan_file:
+        An authored dialogue plan (``<video>.plan.json`` in ``INPUT_DIR`` by
+        default) whose lines already carry the speaker, timing and Amharic. When
+        one is used the sentence and translation stages are skipped, and each
+        character is cast to a measured voice from the diarization.
+    plan_keep_timing:
+        Keep the plan's own timings instead of taking each line's timing from the
+        transcribed speech. Only useful when the plan was timed against this exact
+        video; otherwise the video is the source of truth for when a line is spoken.
     progress:
         Callable receiving one line per stage. Defaults to printing.
 
@@ -743,36 +802,106 @@ def run_pipeline(
             "diarization)"
         )
 
+    # An authored plan already contains the sentences, their speakers and the
+    # Amharic, so it replaces the sentence and translation stages outright. What it
+    # cannot contain is which measured voice each character has: that is a property
+    # of the audio and is cast from the diarization below.
+    plan: dialogue_plan.DialoguePlan | None = None
+    plan_scope = dialogue_plan.PlanScope()
+    joined = (
+        Path(plan_file)
+        if plan_file is not None
+        else dialogue_plan.discover_plan(resolved.input_dir, video_path)
+    )
+    if joined is not None:
+        try:
+            plan = dialogue_plan.load_plan(joined)
+        except dialogue_plan.PlanError as exc:
+            report(f"  plan: ignored {joined.name} ({exc})")
+            plan = None
+        else:
+            plan_scope = dialogue_plan.scope_plan(
+                plan,
+                transcript=lines,
+                audio_duration=_audio_seconds(stems.speech),
+                retime=not plan_keep_timing,
+            )
+            report(
+                f"  plan: {joined.name}: {len(plan)} authored line(s), "
+                f"{len(plan_scope)} in this audio ({plan_scope.method})"
+            )
+            if plan_scope.dropped_outside:
+                report(
+                    f"  plan: {plan_scope.dropped_outside} line(s) fall outside this "
+                    "audio and belong to another part of the episode"
+                )
+            if plan_scope.dropped_unmatched:
+                report(
+                    f"  plan: {plan_scope.dropped_unmatched} line(s) have no matching "
+                    "speech in this audio"
+                )
+            if not plan_scope.cues:
+                report("  plan: nothing in it applies to this audio; ignoring it")
+                plan = None
+    if plan is not None and plan_scope.interpolated:
+        report(
+            f"  plan: {plan_scope.interpolated} line(s) the transcript did not "
+            "recognise were placed between their neighbours"
+        )
+
+    # With a plan the run owes a model nothing: the Amharic is already written and
+    # every character's name is already stated. Research stays available for its
+    # free, local inputs only.
+    research_settings = (
+        resolved if plan is None else replace(resolved, context_ai_enabled=False)
+    )
+
     # The film's own title is the only dependable way to know who its characters
     # are. It is read from a .txt file discovered in the input directory (never a
     # hard-coded name), researched through DeepSeek's Search and Fetch endpoints,
     # and cached so the whole run - and the next run of the same episode - shares
     # one sourced guide. Missing title, missing key or an unavailable endpoint is a
     # note, never a failed run.
+    # A script the operator drops into data/input is free and authoritative. It is
+    # discovered before any research, so the paid Search/Fetch/extraction path is
+    # skipped entirely when one is present.
+    local_script: script_reconciliation.EpisodeScript | None = None
+    try:
+        local_script = context_ai.local_script_for_run(
+            video_path, settings=research_settings, report=report
+        )
+    except Exception as exc:
+        report(f"  script: local file unreadable ({type(exc).__name__}: {exc})")
+
     guide: dialogue_context.CharacterGuide | None = None
     try:
         guide = context_ai.character_guide_for_run(
-            video_path, settings=resolved, report=report
+            video_path,
+            settings=research_settings,
+            script=local_script,
+            report=report,
         )
     except Exception as exc:  # research must never be the reason a film fails
         report(f"  characters: unavailable ({type(exc).__name__}: {exc}); continuing")
 
     # The script is the other half of the research: a sourced, speaker-labelled
     # transcript lets the reconciliation below recover the lines diarization merged
-    # into one character's long turn. Fetched once and cached per episode.
-    script: script_reconciliation.EpisodeScript | None = None
-    try:
-        script = context_ai.episode_script_for_run(
-            video_path,
-            settings=resolved,
-            guide=guide,
-            # The clip's own words validate a fetched transcript before it is used:
-            # a page for the wrong episode shares almost none of its phrases.
-            transcript=[line.text for line in lines],
-            report=report,
-        )
-    except Exception as exc:  # a missing script degrades, never fails
-        report(f"  script: unavailable ({type(exc).__name__}: {exc}); continuing")
+    # into one character's long turn. A local file is used as-is; otherwise it is
+    # fetched once and cached per episode.
+    script = local_script
+    if script is None:
+        try:
+            script = context_ai.episode_script_for_run(
+                video_path,
+                settings=research_settings,
+                guide=guide,
+                # The clip's own words validate a fetched transcript before it is
+                # used: a page for the wrong episode shares almost none of its phrases.
+                transcript=[line.text for line in lines],
+                report=report,
+            )
+        except Exception as exc:  # a missing script degrades, never fails
+            report(f"  script: unavailable ({type(exc).__name__}: {exc}); continuing")
 
     # Who is speaking, measured from the voice itself. Diarization usually gets the
     # clusters right and a handful of turns wrong, and one wrong turn is enough to
@@ -874,7 +1003,7 @@ def run_pipeline(
         try:
             lines, speaker_review = context_ai.review_speaker_attribution(
                 lines,
-                settings=resolved,
+                settings=research_settings,
                 turns=turns,
                 verified=diarized.verified,
                 crosstalk=crosstalk,
@@ -925,62 +1054,100 @@ def run_pipeline(
             for speaker_id, median in speaker_registers.items()
         }
 
-    def _group_sentences(fragments):
-        return translation.group_transcript_sentences(
-            fragments, settings=resolved, on_progress=report
-        )
-
-    sentences = tuple(
-        transcription.assemble_sentences(lines, grouper=_group_sentences)
-    )
-    if sentences and len(sentences) != len(lines):
-        report(
-            f"  dialogue: {len(lines)} transcribed segment(s) assembled into "
-            f"{len(sentences)} sentence(s)"
-        )
-
-    # Consistency state, not a guess: an absent bible yields an empty one, so a
-    # first run works and a second run inherits whatever was filled in by hand.
-    # The researched guide travels beside the operator's cast so every translation
-    # request in the run sees the same sourced names and genders.
-    bible = dialogue_context.CharacterBible.load(
-        resolved.dialogue_bible_path
-    ).with_guide(guide)
-    # The script reconciliation also established which diarized voice is which
-    # character. That is exactly the state translation needs for gendered forms and
-    # address, so it fills any speaker the operator's bible did not already name.
-    if script_review is not None and script_review.mapping:
-        cast = dict(bible.characters)
-        for found in script_review.mapping:
-            if not found.speaker_id or found.speaker_id in cast:
-                continue
-            cast[found.speaker_id] = dialogue_context.Character(
-                speaker_id=found.speaker_id,
-                name=found.character,
-                gender=found.gender if found.gender != "unknown" else "",
-                sources=tuple(script.sources[:1]) if script is not None else (),
+    sentences: tuple[Any, ...] = ()
+    if plan is None:
+        def _group_sentences(fragments):
+            return translation.group_transcript_sentences(
+                fragments, settings=resolved, on_progress=report
             )
-        bible = dialogue_context.CharacterBible(characters=cast, guide=guide)
 
-    dialogue = tuple(
-        _stage(
-            "translation",
-            seconds,
-            report,
-            translation.adapt_dialogue,
-            sentences,
-            settings=resolved,
-            bible=bible,
-            # Measured from the film's own voices: Amharic marks gender on verbs and
-            # pronouns, and the model must not have to guess it from a name.
-            speaker_genders=speaker_genders,
-            enforce_budget=resolved.translation_enforce_budget,
-            enforce_fidel_loanwords=resolved.translation_enforce_fidel_loanwords,
-            maximum_reduction_attempts=resolved.translation_max_reduction_attempts,
-            on_progress=report,
+        sentences = tuple(
+            transcription.assemble_sentences(lines, grouper=_group_sentences)
         )
-    )
-    if resolved.translation_backend == "nllb":
+        if sentences and len(sentences) != len(lines):
+            report(
+                f"  dialogue: {len(lines)} transcribed segment(s) assembled into "
+                f"{len(sentences)} sentence(s)"
+            )
+
+    # With a plan the characters are already named and the Amharic is already
+    # written. The one thing left to decide is which measured voice belongs to each
+    # of them, and that is casting rather than translation - so no request is made.
+    plan_casting: dialogue_plan.PlanCasting | None = None
+    bible: dialogue_context.CharacterBible | None = None
+    if plan is not None:
+        plan_casting = dialogue_plan.cast_plan(
+            plan,
+            plan_scope.cues,
+            turns=turns,
+            registers=(
+                attribution.after if attribution is not None else speaker_registers
+            ),
+            crosstalk=crosstalk,
+            verified=diarized.verified,
+        )
+        if plan_casting.skipped:
+            report(f"  casting: {plan_casting.skipped}")
+        for cast in plan_casting.casts:
+            if cast.speaker_id is None:
+                report(f"  casting: {cast.character}: unassigned ({cast.reason})")
+            else:
+                report(
+                    f"  casting: {cast.character} -> {cast.speaker_id} "
+                    f"({cast.speaker_gender}; {cast.reason})"
+                )
+        dialogue = dialogue_plan.plan_dialogue(plan, plan_scope, plan_casting)
+        unvoiced = dialogue_plan.dropped_cues(plan_scope, plan_casting)
+        if unvoiced:
+            report(
+                f"  casting: {unvoiced} plan line(s) left unvoiced because their "
+                "character has no measured voice in this audio"
+            )
+        report("  adaptation: authored plan; no translation request")
+        seconds["translation"] = 0.0
+    else:
+        # Consistency state, not a guess: an absent bible yields an empty one, so a
+        # first run works and a second run inherits whatever was filled in by hand.
+        # The researched guide travels beside the operator's cast so every translation
+        # request in the run sees the same sourced names and genders.
+        bible = dialogue_context.CharacterBible.load(
+            resolved.dialogue_bible_path
+        ).with_guide(guide)
+        # The script reconciliation also established which diarized voice is which
+        # character. That is exactly the state translation needs for gendered forms and
+        # address, so it fills any speaker the operator's bible did not already name.
+        if script_review is not None and script_review.mapping:
+            named = dict(bible.characters)
+            for found in script_review.mapping:
+                if not found.speaker_id or found.speaker_id in named:
+                    continue
+                named[found.speaker_id] = dialogue_context.Character(
+                    speaker_id=found.speaker_id,
+                    name=found.character,
+                    gender=found.gender if found.gender != "unknown" else "",
+                    sources=tuple(script.sources[:1]) if script is not None else (),
+                )
+            bible = dialogue_context.CharacterBible(characters=named, guide=guide)
+
+        dialogue = tuple(
+            _stage(
+                "translation",
+                seconds,
+                report,
+                translation.adapt_dialogue,
+                sentences,
+                settings=resolved,
+                bible=bible,
+                # Measured from the film's own voices: Amharic marks gender on verbs
+                # and pronouns, and the model must not have to guess it from a name.
+                speaker_genders=speaker_genders,
+                enforce_budget=resolved.translation_enforce_budget,
+                enforce_fidel_loanwords=resolved.translation_enforce_fidel_loanwords,
+                maximum_reduction_attempts=resolved.translation_max_reduction_attempts,
+                on_progress=report,
+            )
+        )
+    if plan is None and resolved.translation_backend == "nllb":
         # NLLB is a sentence-level translation model: it is handed one line at a time
         # and cannot be asked for a shorter rewrite, so the scene/character context,
         # the syllable-budget re-ask and the script check have nothing to act on here.
@@ -993,7 +1160,7 @@ def run_pipeline(
         # that decides whether the dub fits or has to be squashed, so it is measured and
         # stated here rather than left to be discovered from the timing report later.
         _report_dialogue_fit(dialogue, resolved, report)
-    else:
+    elif plan is None:
         # Which model produced the Amharic, and how hard it was asked to think, are the
         # first things to know when comparing two runs. The provider also decides whether
         # the requested thinking level was even available, which a bare model name would
@@ -1011,10 +1178,9 @@ def run_pipeline(
         # having applied one.
         if bible:
             report(f"  dialogue bible: {len(bible)} character(s) applied")
+
     if not dialogue:
         raise EmptyStageError("adaptation produced no lines; nothing to synthesize")
-
-    # Voice profiles answer "what should this character sound like?" - a question only
     # an engine that reads a per-speaker reference can act on. A single-voice engine
     # speaks everyone the same way, so building identities for it would be work whose
     # only result is a set of references nothing reads. Which engines those are is the
@@ -1038,11 +1204,16 @@ def run_pipeline(
     else:
         # Runs measured from the repaired transcript rather than from the raw
         # diarization: a turn that contains two people cannot describe one voice, and
-        # the transcript's own word timings are the more precise boundary.
-        profile_turns = [
-            SpeakerSegment(speaker_id, start, end)
-            for speaker_id, start, end in register.contiguous_turns(lines)
-        ]
+        # the transcript's own word timings are the more precise boundary. With a
+        # plan, the plan's own line timings are more precise still, so they define
+        # the window each reference is cut from.
+        if plan_casting is not None:
+            profile_turns = _plan_profile_turns(plan_scope, plan_casting)
+        else:
+            profile_turns = [
+                SpeakerSegment(speaker_id, start, end)
+                for speaker_id, start, end in register.contiguous_turns(lines)
+            ]
         unusable: dict[str, voice_profiles.NoUsableReferenceError] = {}
         # Built from every transcribed line, not from a shortened run: a profile is a
         # character's identity and is reused across runs, so it is never truncated.
@@ -1357,6 +1528,15 @@ def run_pipeline(
         episode_script=script,
         script_reconciliation=script_review,
         attribution_review=speaker_review,
+        plan=(
+            None
+            if plan is None
+            else dialogue_plan.PlanReport(
+                plan=plan,
+                scope=plan_scope,
+                casting=plan_casting or dialogue_plan.PlanCasting(),
+            )
+        ),
     )
 
     # Measured, not assumed: the model-free quality report is part of every run.
@@ -1630,6 +1810,27 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--plan",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=(
+            "authored dialogue plan (JSON) that is the source of truth for the lines, "
+            "their speakers and the Amharic. Timing is taken from the video's own "
+            "transcription, and each character is cast to a measured voice from the "
+            "film. Default: <INPUT_DIR>/<video>.plan.json when that file exists."
+        ),
+    )
+    parser.add_argument(
+        "--plan-keep-timing",
+        action="store_true",
+        help=(
+            "keep the plan's own timings instead of taking each line's timing from "
+            "the transcribed speech. Only use it when the plan was timed against this "
+            "exact video; by default the video decides when each line is spoken."
+        ),
+    )
+    parser.add_argument(
         "--cast-from-bank",
         nargs="?",
         const="",
@@ -1664,6 +1865,8 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.out,
             settings=settings,
             max_lines=args.max_lines,
+            plan_file=args.plan,
+            plan_keep_timing=args.plan_keep_timing,
         )
     except OrchestrationError as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)
