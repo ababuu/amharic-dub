@@ -40,6 +40,198 @@ SECOND_SPEAKER = "SPEAKER_01"
 RATE = 48_000
 
 
+# ---------------------------------------------------------------------------
+# The separation cache
+# ---------------------------------------------------------------------------
+# Separation is the longest stage by far and a rented pod's container disk is gone
+# with the pod, so the stems are cached on Drive and restored instead of recomputed.
+
+
+def _stem_track(tmp_path: Path) -> Path:
+    """Write a track whose stems the cache path will recognise."""
+
+    import soundfile as sf
+
+    track = tmp_path / "stages" / "S01E01_mix.wav"
+    track.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(
+        str(track),
+        np.zeros((RATE, 1), dtype=np.float32),
+        RATE,
+        subtype="FLOAT",
+    )
+    return track
+
+
+def test_stems_already_in_the_run_are_not_separated_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import soundfile as sf
+
+    track = _stem_track(tmp_path)
+    stages = track.parent
+    for name in ("S01E01_mix_speech.wav", "S01E01_mix_music.wav"):
+        sf.write(str(stages / name), np.zeros((RATE, 1), dtype=np.float32), RATE)
+    called: list[str] = []
+    monkeypatch.setattr(
+        orchestrator.separation,
+        "separate_stems",
+        lambda *a, **k: called.append("separated"),
+    )
+
+    stems = orchestrator._obtain_stems(track, stages, _settings(tmp_path), {}, print)
+
+    assert called == []
+    assert stems.speech.name == "S01E01_mix_speech.wav"
+
+
+def test_cached_stems_are_restored_instead_of_separating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pod that runs second has no stems on disk, only the cache on Drive."""
+
+    import soundfile as sf
+
+    track = _stem_track(tmp_path)
+    stages = track.parent
+    settings = _settings(
+        tmp_path, drive_remote="gdrive", drive_stem_folder="amharic-dub-cache/stems"
+    )
+    monkeypatch.setattr(orchestrator.rclone, "drive_ready", lambda _s: True)
+    restored_calls: list[str] = []
+
+    def restore(_settings_, *, folder, stem, destination, names, report=None):
+        restored_calls.append(folder)
+        for name in ("S01E01_mix_speech.wav", "S01E01_mix_music.wav"):
+            sf.write(
+                str(Path(destination) / name),
+                np.zeros((RATE, 1), dtype=np.float32),
+                RATE,
+            )
+        return [Path(destination) / "S01E01_mix_speech.wav"]
+
+    monkeypatch.setattr(orchestrator.rclone, "restore_stems", restore)
+    monkeypatch.setattr(
+        orchestrator.separation,
+        "separate_stems",
+        lambda *a, **k: pytest.fail("separated again despite a cached copy"),
+    )
+
+    stems = orchestrator._obtain_stems(track, stages, settings, {}, print)
+
+    assert restored_calls == ["amharic-dub-cache/stems"]
+    assert stems.speech.exists()
+
+
+def test_a_fresh_separation_is_cached_for_the_next_pod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import soundfile as sf
+
+    track = _stem_track(tmp_path)
+    stages = track.parent
+    settings = _settings(
+        tmp_path, drive_remote="gdrive", drive_stem_folder="amharic-dub-cache/stems"
+    )
+    monkeypatch.setattr(orchestrator.rclone, "drive_ready", lambda _s: True)
+    monkeypatch.setattr(
+        orchestrator.rclone, "restore_stems", lambda *a, **k: []
+    )
+    cached: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        orchestrator.rclone,
+        "cache_stems",
+        lambda _s, *, folder, stem, files, report=None: cached.append(
+            tuple(Path(path).name for path in files)
+        ),
+    )
+
+    def fake_separate(track_path, *, output_dir, settings, on_progress=None):
+        from app.pipeline.separation import StemPaths
+
+        for name in ("_speech.wav", "_music.wav", "_effects.wav"):
+            (Path(output_dir) / f"{Path(track_path).stem}{name}").write_bytes(b"x")
+        return StemPaths(
+            speech=Path(output_dir) / "S01E01_mix_speech.wav",
+            music=Path(output_dir) / "S01E01_mix_music.wav",
+            effects=Path(output_dir) / "S01E01_mix_effects.wav",
+        )
+
+    monkeypatch.setattr(orchestrator.separation, "separate_stems", fake_separate)
+
+    orchestrator._obtain_stems(track, stages, settings, {}, print)
+
+    assert cached, "the freshly separated stems were not offered to the cache"
+    assert "S01E01_mix_speech.wav" in cached[0]
+
+
+def test_a_failed_cache_upload_does_not_fail_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An hour of separation must not be lost because the upload failed."""
+
+    track = _stem_track(tmp_path)
+    stages = track.parent
+    settings = _settings(
+        tmp_path, drive_remote="gdrive", drive_stem_folder="amharic-dub-cache/stems"
+    )
+    monkeypatch.setattr(orchestrator.rclone, "drive_ready", lambda _s: True)
+    monkeypatch.setattr(orchestrator.rclone, "restore_stems", lambda *a, **k: [])
+
+    def boom(*_args, **_kwargs):
+        raise orchestrator.rclone.TransferError("quota exceeded")
+
+    monkeypatch.setattr(orchestrator.rclone, "cache_stems", boom)
+
+    def fake_separate(track_path, *, output_dir, settings, on_progress=None):
+        from app.pipeline.separation import StemPaths
+
+        return StemPaths(
+            speech=Path(output_dir) / "S01E01_mix_speech.wav",
+            music=Path(output_dir) / "S01E01_mix_music.wav",
+            effects=Path(output_dir) / "S01E01_mix_effects.wav",
+        )
+
+    monkeypatch.setattr(orchestrator.separation, "separate_stems", fake_separate)
+    messages: list[str] = []
+
+    stems = orchestrator._obtain_stems(track, stages, settings, {}, messages.append)
+
+    assert stems.speech.name == "S01E01_mix_speech.wav"
+    assert any("not cached" in message for message in messages)
+
+
+def test_no_stem_cache_skips_the_remote_entirely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    track = _stem_track(tmp_path)
+    stages = track.parent
+    settings = _settings(
+        tmp_path, drive_remote="gdrive", drive_stem_folder="amharic-dub-cache/stems"
+    )
+    monkeypatch.setattr(orchestrator.rclone, "drive_ready", lambda _s: True)
+    monkeypatch.setattr(
+        orchestrator.rclone,
+        "restore_stems",
+        lambda *a, **k: pytest.fail("the cache was consulted with --no-stem-cache"),
+    )
+    monkeypatch.setattr(
+        orchestrator.separation,
+        "separate_stems",
+        lambda track_path, *, output_dir, settings, on_progress=None: (
+            orchestrator.separation.StemPaths(
+                speech=Path(output_dir) / "S01E01_mix_speech.wav",
+                music=Path(output_dir) / "S01E01_mix_music.wav",
+                effects=Path(output_dir) / "S01E01_mix_effects.wav",
+            )
+        ),
+    )
+
+    orchestrator._obtain_stems(
+        track, stages, settings, {}, print, cache_on_drive=False
+    )
+
+
 def _settings(root: Path, **overrides: object) -> Settings:
     """Return settings pointing every directory at ``root``."""
 

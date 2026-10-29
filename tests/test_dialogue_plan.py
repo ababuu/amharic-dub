@@ -653,6 +653,38 @@ def test_an_unvoiced_plan_character_is_cast_from_the_bank_by_its_gender():
     assert "voice bank" in bank_cast.bank_casts[0].reason
 
 
+def test_the_bank_never_takes_a_voice_the_film_supplied():
+    """The actor is the identity: a character with usable film audio keeps it.
+
+    The bank exists only for characters the film cannot voice - never as a
+    replacement, and never as an ambiguity tie-breaker.
+    """
+
+    from app.pipeline.dialogue_plan import assign_bank_voices
+
+    plan = plan_from_payload(
+        {
+            "characters": [
+                {"name": "Walter", "gender": "masculine"},
+                {"name": "Gus", "gender": "masculine"},
+            ],
+            "dialogue": [
+                {"speaker": "Walter", "start": 10.0, "end": 14.0, "amharic": "x"},
+                {"speaker": "Gus", "start": 200.0, "end": 202.0, "amharic": "y"},
+            ],
+        }
+    )
+    casting = cast_plan(plan, plan.cues, turns=_turns(), registers=_registers())
+    assert casting.mapping["Walter"] is not None
+
+    bank_cast = assign_bank_voices(casting)
+
+    assert bank_cast.mapping["Walter"] == casting.mapping["Walter"]
+    assert [cast.character for cast in bank_cast.bank_casts] == ["Gus"]
+    assert all(cast.source == "film" for cast in bank_cast.casts
+               if cast.character == "Walter")
+
+
 def test_a_bank_cast_character_still_voices_its_lines():
     from app.pipeline.dialogue_plan import assign_bank_voices, bank_speaker_id
 

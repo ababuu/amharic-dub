@@ -307,8 +307,15 @@ def test_a_budget_is_capped() -> None:
     assert syllable_budget(600.0, rate=4.0, maximum=20).syllables == 20
 
 
-def test_the_default_rate_is_the_documented_prior() -> None:
-    assert DEFAULT_SYLLABLES_PER_SECOND == 4.0
+def test_the_default_rate_is_the_measured_one() -> None:
+    """The budget must be computed from the rate the engine really speaks at.
+
+    It was 4.0, the literature figure for a syllable-timed language - roughly half
+    what this pipeline's own TTS produces (median 7.67, mean 7.02 measured from real
+    output), which halved every budget and reported lines as too long when they fitted.
+    """
+
+    assert DEFAULT_SYLLABLES_PER_SECOND == 6.5
     assert syllable_budget(1.0).rate == DEFAULT_SYLLABLES_PER_SECOND
 
 
@@ -381,7 +388,9 @@ def test_a_budget_needs_a_positive_window() -> None:
 
 def test_a_film_that_already_fits_is_delivered_at_its_natural_pace() -> None:
     # 8 syllables at 4/second is 2 seconds, exactly the window, for every line.
-    plan = plan_pacing([(2.0, 8)] * 20, minimum=0.8, maximum=1.25)
+    plan = plan_pacing(
+        [(2.0, 8)] * 20, minimum=0.8, maximum=1.25, syllables_per_second=4.0
+    )
 
     assert plan.film_rate == 1.0
     assert plan.rate_for(seconds=2.0, syllables=8) is None
@@ -391,7 +400,9 @@ def test_a_systematically_long_film_is_speeded_up_once_not_per_line() -> None:
     """The bias belongs to the film, so it is paid once as one delivery speed."""
 
     # Every line needs 4 s of speech in 2 s of window.
-    plan = plan_pacing([(2.0, 16)] * 20, minimum=0.8, maximum=1.25)
+    plan = plan_pacing(
+        [(2.0, 16)] * 20, minimum=0.8, maximum=1.25, syllables_per_second=4.0
+    )
 
     assert plan.film_rate == 1.25
     assert plan.rate_for(seconds=2.0, syllables=16) == 1.25
@@ -401,7 +412,9 @@ def test_a_typical_line_barely_moves_when_the_film_carries_the_bias() -> None:
     """This is the whole point of two levels: the usual line stays near the film rate."""
 
     # 9 syllables in 2 s is a mild systematic overshoot.
-    plan = plan_pacing([(2.0, 9)] * 20, minimum=0.8, maximum=1.25)
+    plan = plan_pacing(
+        [(2.0, 9)] * 20, minimum=0.8, maximum=1.25, syllables_per_second=4.0
+    )
 
     assert plan.film_rate == 1.125
     typical = plan.rate_for(seconds=2.0, syllables=9)
@@ -415,7 +428,9 @@ def test_a_typical_line_barely_moves_when_the_film_carries_the_bias() -> None:
 def test_no_line_is_ever_asked_for_more_than_the_global_band_allows() -> None:
     """The request and the later stretch share one limit, so neither can exceed it."""
 
-    plan = plan_pacing([(2.0, 40)] * 20, minimum=0.8, maximum=1.25)
+    plan = plan_pacing(
+        [(2.0, 40)] * 20, minimum=0.8, maximum=1.25, syllables_per_second=4.0
+    )
 
     for syllables in (1, 4, 8, 16, 64):
         rate = plan.rate_for(seconds=2.0, syllables=syllables)
@@ -426,7 +441,9 @@ def test_no_line_is_ever_asked_for_more_than_the_global_band_allows() -> None:
 def test_a_film_whose_translation_came_out_short_is_measured_but_not_drawled() -> None:
     """A film that runs short is reported as such; fitting it down is timing's job."""
 
-    plan = plan_pacing([(4.0, 4)] * 20, minimum=0.8, maximum=1.25)
+    plan = plan_pacing(
+        [(4.0, 4)] * 20, minimum=0.8, maximum=1.25, syllables_per_second=4.0
+    )
 
     assert plan.film_rate == 0.8
     # No request is made: asking the model to speak slowly buys nothing over letting the
@@ -455,6 +472,7 @@ def test_unusable_measurements_are_ignored_rather_than_skewing_the_plan() -> Non
         [(2.0, 8), (0.0, 8), (2.0, 0), (-1.0, 8)],
         minimum=0.8,
         maximum=1.25,
+        syllables_per_second=4.0,
     )
 
     assert plan.film_rate == 1.0
@@ -471,7 +489,9 @@ def test_a_line_with_no_window_or_no_text_asks_for_nothing() -> None:
 def test_the_plan_is_reportable() -> None:
     """A run says what rate it asked for instead of leaving it to be inferred."""
 
-    plan = plan_pacing([(2.0, 9)] * 20, minimum=0.8, maximum=1.25)
+    plan = plan_pacing(
+        [(2.0, 9)] * 20, minimum=0.8, maximum=1.25, syllables_per_second=4.0
+    )
     payload = plan.as_dict()
 
     assert payload["film_rate"] == 1.125

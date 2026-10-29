@@ -765,6 +765,48 @@ def _reusable_stems(
     return StemPaths(speech=speech, music=music, effects=effects)
 
 
+def stems_available(
+    source: str | Path,
+    output_dir: str | Path,
+    *,
+    settings: Settings | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> StemPaths | None:
+    """Return the stems already present for ``source``, or ``None``.
+
+    Public because the orchestrator asks before it decides whether a cached copy is
+    worth downloading: a second run in the same pod has them on disk already.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    path = Path(source)
+    try:
+        info = sf.info(str(path))
+    except (OSError, RuntimeError):
+        return None
+    if info.frames <= 0:
+        return None
+    return _reusable_stems(
+        path,
+        Path(output_dir),
+        info,
+        settings=resolved,
+        on_progress=on_progress,
+    )
+
+
+def stem_filenames(source: str | Path) -> tuple[str, ...]:
+    """Return the file names separation writes for ``source``."""
+
+    stem = Path(source).stem
+    return (
+        f"{stem}_speech.wav",
+        f"{stem}_music.wav",
+        f"{stem}_effects.wav",
+        f"{stem}_stems.json",
+    )
+
+
 def separate_stems(
     input_path: str | Path,
     output_dir: str | Path | None = None,

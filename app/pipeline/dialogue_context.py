@@ -74,13 +74,20 @@ DEFAULT_SCENE_MAX_SECONDS = 90.0
 #: Syllables a character of spoken Amharic delivers per second, used to turn an
 #: original line's duration into the budget its Amharic replacement must respect.
 #:
-#: This is an **initial prior, not a measurement**, and it is the one number in this
-#: module that wants calibrating: run a film, read the `syllables_per_second`
-#: figures the qc block reports for the lines that did fit, and set this to their
-#: median. 4.0 is the general speech rate the literature uses for a
-#: syllable-timed language and sits inside the plausible band the qc module checks,
-#: so it is a safe starting point rather than a claim about Amharic specifically.
-DEFAULT_SYLLABLES_PER_SECOND = 4.0
+#: This is **measured, not assumed**. Running the pipeline's own TTS over a plan and
+#: reading `run.timing.segments[].speech_duration` against the Amharic's syllable
+#: count gives a natural rate (tempo divided back out) with a median of 7.67 and a
+#: mean of 7.02 syllables/second. The earlier value of 4.0 was the general figure the
+#: literature quotes for a syllable-timed language, and it is roughly half what this
+#: engine actually speaks at: every budget it produced was half the real one, so
+#: lines were requested far shorter than they needed to be (losing meaning) and
+#: "does not fit" reports were issued for lines that fit easily. 6.5 keeps a small
+#: margin under the measured mean, because a budget that is too generous produces a
+#: line the timing stage has to rush.
+#:
+#: Re-measure after changing the TTS engine or its speaker: the constant is only as
+#: good as the voice it was measured from.
+DEFAULT_SYLLABLES_PER_SECOND = 6.5
 
 #: How far over budget a line may be before it is sent back to be rewritten. Ten
 #: percent is inside the band `timing.py` can absorb without an audible stretch, so

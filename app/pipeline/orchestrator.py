@@ -640,6 +640,78 @@ def _report_plan_fit(
         report("        shorten these in the plan to keep the dub in sync")
 
 
+def _obtain_stems(
+    track: Path,
+    stages_dir: Path,
+    settings: Any,
+    seconds: dict[str, float],
+    report: Callable[[str], None],
+    *,
+    cache_on_drive: bool = True,
+) -> separation.StemPaths:
+    """Return the stems for ``track``, separating only when there is no other source.
+
+    Separation is the most expensive stage - over an hour for a feature-length
+    episode - and a rented pod's container disk is destroyed with the pod, so caching
+    it only on that disk would never help the next run. Three places are tried in
+    order: what is already in this run's stages directory, then the copy cached on
+    Drive, then separating. The stems are pushed to Drive only when they were made
+    here, so a restored run uploads nothing.
+    """
+
+    cached = separation.stems_available(
+        track, stages_dir, settings=settings, on_progress=report
+    )
+    if cached is not None:
+        return cached
+
+    folder = (settings.drive_stem_folder or "").strip()
+    caching = bool(folder) and cache_on_drive and rclone.drive_ready(settings)
+    names = separation.stem_filenames(track)
+    if caching:
+        report(f"  separation: looking for cached stems in {folder}")
+        restored = rclone.restore_stems(
+            settings,
+            folder=folder,
+            stem=track.stem,
+            destination=stages_dir,
+            names=names,
+            report=report,
+        )
+        if restored:
+            cached = separation.stems_available(
+                track, stages_dir, settings=settings, on_progress=report
+            )
+            if cached is not None:
+                return cached
+            report("  separation: the cached stems do not match this audio; separating")
+
+    stems = _stage(
+        "separation",
+        seconds,
+        report,
+        separation.separate_stems,
+        track,
+        output_dir=stages_dir,
+        settings=settings,
+        on_progress=report,
+    )
+    if caching:
+        try:
+            rclone.cache_stems(
+                settings,
+                folder=folder,
+                stem=track.stem,
+                files=[stages_dir / name for name in names],
+                report=report,
+            )
+        except rclone.TransferError as exc:
+            # The run is unaffected and the dub is still correct; the cost is paid by
+            # the next pod, so say so rather than failing an hour of work.
+            report(f"  stems: not cached ({exc})")
+    return stems
+
+
 def run_pipeline(
     source: str | Path,
     *,
@@ -649,6 +721,7 @@ def run_pipeline(
     plan_file: str | Path | None = None,
     plan_keep_timing: bool = False,
     progress: Callable[[str], None] | None = None,
+    cache_stems_on_drive: bool = True,
 ) -> PipelineResult:
     """Run every implemented stage on ``source`` and return what they produced.
 
@@ -726,15 +799,13 @@ def run_pipeline(
         stages_dir / f"{video_path.stem}{video.DEFAULT_TRACK_SUFFIX}",
         settings=resolved,
     )
-    stems = _stage(
-        "separation",
+    stems = _obtain_stems(
+        track,
+        stages_dir,
+        resolved,
         seconds,
         report,
-        separation.separate_stems,
-        track,
-        output_dir=stages_dir,
-        settings=resolved,
-        on_progress=report,
+        cache_on_drive=cache_stems_on_drive,
     )
 
     diarized = _stage(
@@ -1984,6 +2055,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--no-stem-cache",
+        action="store_true",
+        help=(
+            "do not use the separation cache in DRIVE_STEM_FOLDER. Stems are cached "
+            "there so a pod whose container disk is gone does not separate the same "
+            "episode again - roughly an hour and a quarter per episode. Use this only "
+            "to test the separator itself, or after changing SEPARATION_BACKEND."
+        ),
+    )
+    parser.add_argument(
         "--rclone-config",
         type=Path,
         default=None,
@@ -2079,6 +2160,7 @@ def main(argv: list[str] | None = None) -> int:
             max_lines=args.max_lines,
             plan_file=args.plan,
             plan_keep_timing=args.plan_keep_timing,
+            cache_stems_on_drive=not args.no_stem_cache,
         )
     except OrchestrationError as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)

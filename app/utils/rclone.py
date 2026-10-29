@@ -306,6 +306,125 @@ def run_command(
     return subprocess.run(list(command), check=False).returncode
 
 
+def remote_sizes(settings: Settings, folder: str) -> dict[str, int]:
+    """Return ``{name: bytes}`` for the files in a remote folder.
+
+    An unreachable remote returns an empty mapping rather than raising: this is only
+    ever used to decide whether a cached file is worth re-sending, and a failed
+    listing must not be the thing that ends a run.
+    """
+
+    command = base_command(settings) + [
+        "lsjson",
+        remote_path(settings, folder),
+        "--files-only",
+        "--no-modtime",
+    ]
+    try:
+        completed = subprocess.run(
+            command, check=False, capture_output=True, text=True
+        )
+    except OSError:
+        return {}
+    if completed.returncode != 0:
+        return {}
+    try:
+        entries = json.loads(completed.stdout or "[]")
+    except ValueError:
+        return {}
+    sizes: dict[str, int] = {}
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("Name") or "")
+        size = entry.get("Size")
+        if name and isinstance(size, int):
+            sizes[name] = size
+    return sizes
+
+
+def cache_stems(
+    settings: Settings,
+    *,
+    folder: str,
+    stem: str,
+    files: Sequence[Path],
+    report: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Upload cached files for ``stem``, skipping the ones already stored.
+
+    Separation costs over an hour for a feature-length episode and a rented pod's
+    container disk dies with the pod, so the stems are what makes a second run cheap.
+    Comparing sizes means a rerun with the same audio uploads nothing.
+    """
+
+    say = report if report is not None else (lambda message: print(message, flush=True))
+    existing = remote_sizes(settings, folder)
+    uploaded: list[str] = []
+    for path in files:
+        local = Path(path)
+        if not local.is_file():
+            continue
+        if existing.get(local.name) == local.stat().st_size:
+            continue
+        destination = remote_path(settings, folder, local.name)
+        command = base_command(settings) + [
+            "copyto",
+            str(local),
+            destination,
+            "--progress",
+            "--stats-one-line",
+            "--stats",
+            "30s",
+        ]
+        if run_command(command, report=say) != 0:
+            raise TransferError(
+                f"could not cache {local.name} in {folder}; the run is unaffected but "
+                "the next pod will separate again"
+            )
+        uploaded.append(local.name)
+    if uploaded:
+        say(f"  stems cached: {len(uploaded)} file(s) in {folder} ({stem})")
+    return uploaded
+
+
+def restore_stems(
+    settings: Settings,
+    *,
+    folder: str,
+    stem: str,
+    destination: str | Path,
+    names: Sequence[str],
+    report: Callable[[str], None] | None = None,
+) -> list[Path]:
+    """Download the cached files for ``stem`` into ``destination``, best effort."""
+
+    say = report if report is not None else (lambda message: print(message, flush=True))
+    target = Path(destination)
+    target.mkdir(parents=True, exist_ok=True)
+    available = remote_sizes(settings, folder)
+    wanted = [name for name in names if name in available]
+    if not wanted:
+        return []
+    restored: list[Path] = []
+    for name in wanted:
+        command = base_command(settings) + [
+            "copyto",
+            remote_path(settings, folder, name),
+            str(target / name),
+            "--progress",
+            "--stats-one-line",
+            "--stats",
+            "30s",
+        ]
+        if run_command(command, report=say) != 0:
+            say(f"  stems: could not restore {name}; separating instead")
+            return []
+        restored.append(target / name)
+    say(f"  stems restored from {folder} ({stem}): {len(restored)} file(s)")
+    return restored
+
+
 def verify_downloaded_episode(settings: Settings, name: str = "") -> Path | None:
     """Return the pulled episode, after checking it really is a video."""
 
@@ -425,6 +544,7 @@ __all__ = [
     "EPISODE_SUFFIXES",
     "TransferError",
     "base_command",
+    "cache_stems",
     "config_source",
     "describe",
     "drive_ready",
@@ -433,6 +553,8 @@ __all__ = [
     "fetch_remote_file",
     "looks_like_remote_path",
     "malformed_env_token",
+    "remote_sizes",
+    "restore_stems",
     "pull_command",
     "pull_episode",
     "push_command",

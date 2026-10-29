@@ -580,8 +580,8 @@ def test_user_message_carries_id_speaker_duration_and_text(monkeypatch):
             "speaker": "SPEAKER_07",
             "duration": 4.0,
             "text": "Line one",
-            # Four seconds at the default rate of four syllables a second.
-            "syllable_budget": 16,
+            # Four seconds at the measured rate of 6.5 syllables a second.
+            "syllable_budget": 26,
         }
     ]
 
@@ -1140,8 +1140,8 @@ def test_the_request_carries_the_syllable_budget(monkeypatch):
     )
 
     line = _sent_lines(FakeOpenAI.requests[0])[0]
-    # 2.5s at the default four syllables a second.
-    assert line["syllable_budget"] == 10
+    # 2.5s at the measured rate: 6.5 syllables a second, rounded.
+    assert line["syllable_budget"] == 16
 
 
 def test_a_line_talked_over_is_marked_simultaneous_and_budgeted_to_its_window(
@@ -1168,8 +1168,8 @@ def test_a_line_talked_over_is_marked_simultaneous_and_budgeted_to_its_window(
     assert lines[0]["simultaneous"] is True
     assert lines[1]["simultaneous"] is True
     # Not 3.0s of room and not the other line's time: the line's own window.
-    assert lines[0]["syllable_budget"] == 12
-    assert lines[1]["syllable_budget"] == 4
+    assert lines[0]["syllable_budget"] == 20
+    assert lines[1]["syllable_budget"] == 6
 
 
 def test_a_turn_taking_script_is_not_marked_simultaneous(monkeypatch):
@@ -1187,7 +1187,7 @@ def test_a_turn_taking_script_is_not_marked_simultaneous(monkeypatch):
     lines = _sent_lines(FakeOpenAI.requests[0])
     assert all("simultaneous" not in line for line in lines)
     # The room after a line still belongs to it, so the first budget is 1.1s worth.
-    assert lines[0]["syllable_budget"] == 4
+    assert lines[0]["syllable_budget"] == 6
 
 
 def test_the_prompt_says_what_a_simultaneous_line_means():

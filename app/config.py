@@ -310,12 +310,13 @@ DEFAULT_TRANSLATION_LENGTH_PENALTY = 1.0
 DEFAULT_TRANSLATION_SHORTEN_PENALTY = 0.6
 
 #: Syllables per second an Amharic performer delivers, used to turn a span of time into a
-#: syllable budget. Measured at about 4.6 syllables/second on real synthesized output, and
-#: kept a little slower than that on purpose: asking a line to fit when it comfortably
-#: can is harmless, while asking one to fit when it cannot leads to it being cut.
+#: syllable budget. Measured from this pipeline's own synthesized output: reading
+#: `run.timing.segments[].speech_duration` against the Amharic syllable count, with the
+#: applied tempo divided back out, gives a median of 7.67 and a mean of 7.02
+#: syllables/second. 6.5 keeps a small margin under that mean.
 #: ``app.pipeline.dialogue_context.DEFAULT_SYLLABLES_PER_SECOND`` holds the same prior
 #: for the adaptation prompt, and a test keeps the two in step.
-DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND = 4.0
+DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND = 6.5
 
 #: Maximum number of rewrite requests for lines that miss the syllable budget or
 #: contain Roman-script text. Zero keeps each batch to one hosted model call, avoiding
@@ -391,6 +392,11 @@ DEFAULT_DRIVE_REMOTE = "gdrive"
 #: Folder inside that remote holding source episodes, and one for finished dubs.
 DEFAULT_DRIVE_SOURCE_FOLDER = ""
 DEFAULT_DRIVE_OUTPUT_FOLDER = "amharic-dubs"
+#: Folder holding cached separation stems. A rented pod's container disk dies with
+#: the pod and separation costs more than an hour per episode, so the stems are kept
+#: on Drive and dropped back into the run's stages directory. Empty means "keep them
+#: under the output folder", i.e. caching is still on.
+DEFAULT_DRIVE_STEM_FOLDER = "amharic-dubs-cache/stems"
 #: Where the rclone config lives on the worker. Kept outside the repository because
 #: it holds an OAuth refresh token, and copied there once during setup.
 DEFAULT_RCLONE_CONFIG_PATH = Path("/workspace/rclone.conf")
@@ -980,6 +986,8 @@ class Settings:
     drive_remote: str = DEFAULT_DRIVE_REMOTE
     drive_source_folder: str = DEFAULT_DRIVE_SOURCE_FOLDER
     drive_output_folder: str = DEFAULT_DRIVE_OUTPUT_FOLDER
+    #: Where the separation stems are cached between pods. Empty disables the cache.
+    drive_stem_folder: str = DEFAULT_DRIVE_STEM_FOLDER
     rclone_config: Path = DEFAULT_RCLONE_CONFIG_PATH
     rclone_bin: str = DEFAULT_RCLONE_BIN
     #: TTS settings for :mod:`app.pipeline.tts`: the Amharic speech adapter and the
@@ -1195,6 +1203,11 @@ class Settings:
             drive_output_folder=(
                 _read_env("DRIVE_OUTPUT_FOLDER", DEFAULT_DRIVE_OUTPUT_FOLDER)
                 or DEFAULT_DRIVE_OUTPUT_FOLDER
+            ),
+            drive_stem_folder=(
+                _read_env("DRIVE_STEM_FOLDER", DEFAULT_DRIVE_STEM_FOLDER)
+                if "DRIVE_STEM_FOLDER" in os.environ
+                else DEFAULT_DRIVE_STEM_FOLDER
             ),
             rclone_config=_read_path("RCLONE_CONFIG", DEFAULT_RCLONE_CONFIG_PATH),
             rclone_bin=(
@@ -1415,6 +1428,7 @@ class Settings:
             "drive_remote": self.drive_remote,
             "drive_source_folder": self.drive_source_folder,
             "drive_output_folder": self.drive_output_folder,
+            "drive_stem_folder": self.drive_stem_folder,
             "rclone_config": str(self.rclone_config),
             "rclone_bin": self.rclone_bin,
             "tts_model": self.tts_model,
@@ -1467,6 +1481,7 @@ __all__ = [
     "DEFAULT_DRIVE_REMOTE",
     "DEFAULT_DRIVE_SOURCE_FOLDER",
     "DEFAULT_DRIVE_OUTPUT_FOLDER",
+    "DEFAULT_DRIVE_STEM_FOLDER",
     "DEFAULT_RCLONE_CONFIG_PATH",
     "DEFAULT_RCLONE_BIN",
     "DEFAULT_DIARIZATION_MAX_SPEAKERS",

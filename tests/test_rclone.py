@@ -8,6 +8,7 @@ remote - a config file and the pod's environment variables.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -291,6 +292,151 @@ def test_a_missing_rclone_is_reported_clearly(tmp_path: Path, monkeypatch):
 
     with pytest.raises(rclone.TransferError, match="rclone was not found"):
         rclone.pull_command(settings, name="x.mkv")
+
+
+# ---------------------------------------------------------------------------
+# The separation cache
+# ---------------------------------------------------------------------------
+# A rented pod's container disk dies with the pod, and separation costs over an hour
+# per episode, so the stems are kept on Drive and dropped back into the run.
+
+
+def _separator_settings(root: Path) -> Settings:
+    configured = _with_config(_settings(root), root)
+    return dataclasses.replace(configured, drive_stem_folder="amharic-dub-cache/stems")
+
+
+def _record_remote(monkeypatch: pytest.MonkeyPatch, sizes: dict[str, int]) -> None:
+    """Make the remote listing return ``sizes`` without running rclone."""
+
+    monkeypatch.setattr(rclone, "remote_sizes", lambda _settings, _folder: dict(sizes))
+
+
+def test_a_stem_already_cached_is_not_uploaded_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    settings = _separator_settings(tmp_path)
+    stem = tmp_path / "S01E01_speech.wav"
+    stem.write_bytes(b"1234")
+    _record_remote(monkeypatch, {"S01E01_speech.wav": 4})
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        rclone, "run_command", lambda command, **_kw: commands.append(command) or 0
+    )
+
+    uploaded = rclone.cache_stems(
+        settings, folder=settings.drive_stem_folder, stem="S01E01", files=[stem]
+    )
+
+    assert uploaded == []
+    assert commands == []
+
+
+def test_a_stem_missing_from_the_cache_is_uploaded_with_copyto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    settings = _separator_settings(tmp_path)
+    stem = tmp_path / "S01E01_speech.wav"
+    stem.write_bytes(b"1234")
+    _record_remote(monkeypatch, {})
+    commands: dict[str, list[str]] = {}
+
+    def record(command, **_kwargs):
+        commands[Path(command[-1]).name if command[-1].startswith("/") else command[1]] = (
+            command
+        )
+        return 0
+
+    monkeypatch.setattr(rclone, "run_command", record)
+
+    uploaded = rclone.cache_stems(
+        settings, folder=settings.drive_stem_folder, stem="S01E01", files=[stem]
+    )
+
+    assert uploaded == ["S01E01_speech.wav"]
+    (command,) = commands.values()
+    assert "copyto" in command
+    assert "gdrive:amharic-dub-cache/stems/S01E01_speech.wav" in command
+
+
+def test_a_failed_cache_upload_names_the_consequence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    settings = _separator_settings(tmp_path)
+    stem = tmp_path / "S01E01_speech.wav"
+    stem.write_bytes(b"1234")
+    _record_remote(monkeypatch, {})
+    monkeypatch.setattr(rclone, "run_command", lambda command, **_kw: 1)
+
+    with pytest.raises(rclone.TransferError, match="separate again"):
+        rclone.cache_stems(
+            settings, folder=settings.drive_stem_folder, stem="S01E01", files=[stem]
+        )
+
+
+def test_restoring_copies_only_the_files_the_cache_has(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    settings = _separator_settings(tmp_path)
+    target = tmp_path / "stages"
+    _record_remote(
+        monkeypatch,
+        {"S01E01_speech.wav": 10, "S01E01_music.wav": 10},
+    )
+    copied: list[str] = []
+
+    def record(command, **_kwargs):
+        copied.append(command[1])
+        Path(command[2]).write_bytes(b"x")
+        return 0
+
+    monkeypatch.setattr(rclone, "run_command", record)
+
+    restored = rclone.restore_stems(
+        settings,
+        folder=settings.drive_stem_folder,
+        stem="S01E01",
+        destination=target,
+        names=("S01E01_speech.wav", "S01E01_music.wav", "S01E01_effects.wav"),
+    )
+
+    assert [path.name for path in restored] == ["S01E01_speech.wav", "S01E01_music.wav"]
+    # The effects stem is regenerated locally, so it is never downloaded.
+    assert all("effects" not in source for source in copied)
+
+
+def test_restoring_nothing_cached_is_not_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    settings = _separator_settings(tmp_path)
+    _record_remote(monkeypatch, {})
+
+    assert (
+        rclone.restore_stems(
+            settings,
+            folder=settings.drive_stem_folder,
+            stem="S01E01",
+            destination=tmp_path / "stages",
+            names=("S01E01_speech.wav",),
+        )
+        == []
+    )
+
+
+def test_an_unreachable_remote_lists_no_sizes_instead_of_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A failed listing must cost the cache, not the run."""
+
+    settings = _separator_settings(tmp_path)
+
+    class Failing:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(rclone.subprocess, "run", lambda *a, **k: Failing())
+
+    assert rclone.remote_sizes(settings, "amharic-dub-cache/stems") == {}
 
 
 # ---------------------------------------------------------------------------
