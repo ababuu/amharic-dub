@@ -352,6 +352,59 @@ def test_the_engine_is_resolved_once_for_the_whole_run(
     assert len(rig.engine.calls) == 3
 
 
+def test_tts_reports_progress_so_a_long_stage_is_not_a_black_box(
+    rig: Rig,
+) -> None:
+    """Eleven minutes of silence looked like a hang, not a stage.
+
+    The report counts what was voiced, what came from a previous run, and an estimate
+    of what is left, so the console says whether the pod is working.
+    """
+
+    messages: list[str] = []
+    lines = [_line(start=2.0 + 2 * i, end=4.0 + 2 * i) for i in range(30)]
+
+    tts.synthesize_dialogue_detailed(
+        lines,
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        tts_engine=rig.engine,
+        report=messages.append,
+    )
+
+    assert any("left" in message for message in messages)
+    assert any("voiced at" in message for message in messages)
+    assert tts.TTS_PROGRESS_EVERY <= len(lines)
+
+
+def test_a_rerun_reuses_the_takes_already_on_disk(rig: Rig) -> None:
+    """Synthesis is the longest stage, and its output is deterministic per line."""
+
+    first = tts.synthesize_dialogue_detailed(
+        [_line()],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        tts_engine=rig.engine,
+    )
+    calls_after_first = len(rig.engine.calls)
+    messages: list[str] = []
+
+    second = tts.synthesize_dialogue_detailed(
+        [_line()],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+        tts_engine=rig.engine,
+        report=messages.append,
+    )
+
+    assert len(rig.engine.calls) == calls_after_first, "a take was re-synthesized"
+    assert second.clips[0].audio_path == first.clips[0].audio_path
+    assert any("1 reused" in message for message in messages)
+
+
 def test_an_injected_engine_is_used_without_loading_the_default_one(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

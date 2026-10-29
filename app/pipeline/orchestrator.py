@@ -1705,6 +1705,7 @@ def run_pipeline(
         stems.speech,
         profiles or None,
         settings=resolved,
+        report=report,
     )
     clips = tuple(synthesized.clips)
     skipped = tuple(synthesized.skipped)

@@ -72,6 +72,7 @@ import hashlib
 import inspect
 import json
 import math
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -1910,8 +1911,14 @@ def pacing_plan_for(
     )
 
 
-def _synthesize_line_cloned(
-    index: int,
+#: How many lines are synthesized between progress reports. A feature episode has
+#: several hundred, each costing about a second of model inference, so a stage that
+#: said nothing for eleven minutes looked hung. Utterances that are already on disk
+#: are counted but not re-synthesized, which is what makes a resumed run fast.
+TTS_PROGRESS_EVERY = 25
+
+
+def _synthesize_line_cloned(    index: int,
     dialogue: AdaptedDialogue,
     *,
     name: str,
@@ -1999,6 +2006,7 @@ def synthesize_dialogue_detailed(
     output_dir: str | Path | None = None,
     settings: Settings | None = None,
     tts_engine: TextToSpeechEngine | VoiceCloningEngine | None = None,
+    report: Callable[[str], None] | None = None,
 ) -> SynthesisResult:
     """Synthesize every dubbable line, and report the ones that could not be.
 
@@ -2155,7 +2163,19 @@ def synthesize_dialogue_detailed(
     clips: list[TtsClip] = []
     skipped: list[SkippedLine] = []
     short_windows: list[int] = []
+    started_at = time.perf_counter()
+    reused = 0
     for index, line in enumerate(lines):
+        if report is not None and index and index % TTS_PROGRESS_EVERY == 0:
+            elapsed = time.perf_counter() - started_at
+            done = index - len(skipped)
+            remaining = len(lines) - index
+            eta = (elapsed / done * remaining) if done else 0.0
+            report(
+                f"  tts: {index}/{len(lines)} line(s), {done} voiced "
+                f"({reused} reused from a previous run), {elapsed:.0f}s elapsed, "
+                f"~{eta:.0f}s left"
+            )
         reason = _skip_reason(line)
         if reason is not None:
             skipped.append(
@@ -2174,12 +2194,23 @@ def synthesize_dialogue_detailed(
             short_windows.append(index)
 
         try:
+            artifact = _line_artifact_name(
+                line,
+                model=artifact_model,
+                **(
+                    {}
+                    if engine is not None
+                    else {"voice_identity": voice_identities[line.speaker_id]}
+                ),
+            )
+            if _usable_audio(directories.takes / f"{artifact}.wav"):
+                reused += 1
             if engine is not None:
                 clips.append(
                     _synthesize_line_single_voice(
                         index,
                         line,
-                        name=_line_artifact_name(line, model=artifact_model),
+                        name=artifact,
                         directories=directories,
                         engine=engine,
                         settings=resolved,
@@ -2191,11 +2222,7 @@ def synthesize_dialogue_detailed(
                 _synthesize_line_cloned(
                     index,
                     line,
-                    name=_line_artifact_name(
-                        line,
-                        model=artifact_model,
-                        voice_identity=voice_identities[line.speaker_id],
-                    ),
+                    name=artifact,
                     directories=directories,
                     engine=cloning_engine,
                     profile=profiles[line.speaker_id],
@@ -2233,6 +2260,16 @@ def synthesize_dialogue_detailed(
             f"{min_line_seconds:g}s engine minimum (line(s) {shown}); they were "
             "synthesized and the timing stage moves the lines after them, because "
             "dropping them would leave real dialogue unsaid"
+        )
+
+    if report is not None:
+        elapsed = time.perf_counter() - started_at
+        voiced = len(clips)
+        per_line = elapsed / voiced if voiced else 0.0
+        report(
+            f"  tts: {len(lines)} line(s) in {elapsed:.0f}s "
+            f"({voiced} voiced at {per_line:.2f}s each, {reused} reused, "
+            f"{len(skipped)} skipped)"
         )
 
     return SynthesisResult(

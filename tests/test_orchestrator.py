@@ -500,6 +500,7 @@ class Stages:
         profiles: object,
         *,
         settings: Settings,
+        report: object = None,
     ):  # noqa: ANN201
         from app.pipeline.tts import SynthesisResult
 
