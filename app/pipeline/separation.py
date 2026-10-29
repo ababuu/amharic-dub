@@ -356,6 +356,53 @@ def _run_audio_separator(
             logger.warning("Could not empty the CUDA cache after separation: %s", exc)
 
 
+def _reusable_stems(
+    source: Path,
+    destination: Path,
+    info: Any,
+    *,
+    on_progress: Callable[[str], None] | None,
+) -> StemPaths | None:
+    """Return the stems already sitting beside ``source``, or ``None`` to separate.
+
+    Separation is deterministic and costs about 1.3x real time, so re-running it for
+    the same audio is pure waste - and a run that dies in a later stage would pay it
+    again. Stems are reused only when both exist, were written after the source, and
+    describe the same audio; anything else means separating for real.
+    """
+
+    speech = destination / f"{source.stem}_speech.wav"
+    music = destination / f"{source.stem}_music.wav"
+    effects = destination / f"{source.stem}_effects.wav"
+    try:
+        source_mtime = source.stat().st_mtime
+    except OSError:
+        return None
+    for path in (speech, music):
+        try:
+            stat = path.stat()
+            if stat.st_size == 0 or stat.st_mtime < source_mtime:
+                return None
+            stem_info = sf.info(str(path))
+        except (OSError, RuntimeError):
+            return None
+        if stem_info.samplerate != info.samplerate:
+            return None
+        # One second of slack: a writer may pad or trim the tail, but a stem of a
+        # different length is a different film.
+        if abs(stem_info.frames - info.frames) > info.samplerate:
+            return None
+
+    if not effects.is_file() or effects.stat().st_size == 0:
+        _write_silence(effects, info)
+    if on_progress is not None:
+        on_progress(
+            f"  separation reused the stems already in {destination} "
+            "(delete them to separate again)"
+        )
+    return StemPaths(speech=speech, music=music, effects=effects)
+
+
 def separate_stems(
     input_path: str | Path,
     output_dir: str | Path | None = None,
@@ -390,6 +437,10 @@ def separate_stems(
             f"  separation audio ready ({info.frames / info.samplerate:.1f}s, "
             f"{info.channels} channel(s))"
         )
+
+    reused = _reusable_stems(source, destination, info, on_progress=on_progress)
+    if reused is not None:
+        return reused
 
     started = time.perf_counter()
     speech, music = _run_audio_separator(

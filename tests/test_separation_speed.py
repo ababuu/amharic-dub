@@ -207,6 +207,46 @@ def test_two_stems_map_to_existing_contract_and_effects_are_silent(
     assert separator_ref() is None
 
 
+def test_stems_already_beside_the_source_are_reused_instead_of_separated_again(
+    fake_separator: tuple[FakeCuda, Path],
+) -> None:
+    """Separation costs over an hour for a feature film, so a rerun must not redo it."""
+
+    _, root = fake_separator
+    source = _write_audio(root / "clip.wav")
+    out = root / "out"
+    first = separate_stems(source, out, settings=_settings(root))
+    FakeSeparator.instances.clear()
+
+    second = separate_stems(source, out, settings=_settings(root))
+
+    assert second.speech == first.speech
+    assert second.music == first.music
+    # No model was loaded and no inference ran.
+    assert FakeSeparator.instances == []
+
+
+def test_a_stem_older_than_the_source_is_separated_again(
+    fake_separator: tuple[FakeCuda, Path],
+) -> None:
+    """A stem that predates the audio may belong to a different cut of the film."""
+
+    import os
+
+    _, root = fake_separator
+    source = _write_audio(root / "clip.wav")
+    out = root / "out"
+    separate_stems(source, out, settings=_settings(root))
+    FakeSeparator.instances.clear()
+
+    # The source is replaced by a newer file of the same length.
+    later = source.stat().st_mtime + 60
+    os.utime(source, (later, later))
+    separate_stems(source, out, settings=_settings(root))
+
+    assert FakeSeparator.instances != []
+
+
 def test_cuda_is_mandatory_and_device_fallback_is_rejected(
     fake_separator: tuple[FakeCuda, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

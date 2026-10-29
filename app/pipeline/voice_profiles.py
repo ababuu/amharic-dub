@@ -1022,6 +1022,16 @@ class _StemReader:
         first = max(0, int(round(start * self._sample_rate)))
         last = max(first, int(round(end * self._sample_rate)))
 
+        # A window may run past the end of the stem - the last line of a plan can end
+        # after the audio does - and libsndfile refuses to seek beyond EOF with
+        # ``Internal psf_fseek() failed``. Clip to the file: past it there is no audio,
+        # and an empty array is the honest answer the callers already read as silence.
+        total = int(self._handle.frames)
+        first = min(first, total)
+        last = min(max(first, last), total)
+        if last <= first:
+            return np.zeros(0, dtype=np.float64)
+
         try:
             self._handle.seek(first)
             frames = self._handle.read(last - first, dtype="float32", always_2d=True)

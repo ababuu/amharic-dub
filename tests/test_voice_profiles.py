@@ -656,6 +656,28 @@ def test_unreadable_audio_is_reported(tmp_path: Path, ffmpeg: FakeFfmpeg) -> Non
         )
 
 
+def test_a_window_past_the_end_of_the_stem_is_silence_not_a_failure(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """A plan's last line can end after the audio does.
+
+    libsndfile refuses to seek past EOF ("Internal psf_fseek() failed"), so asking for
+    a window beyond the stem must read what exists rather than end the run.
+    """
+
+    stem = _write_stem(tmp_path / "speech.wav", [(0.5, 1.5, LOUD)])
+
+    with voice_profiles._StemReader(stem) as reader:
+        inside = reader.read(0.5, 1.0)
+        clipped = reader.read(1.4, 3.0)
+        beyond = reader.read(2.0, 3.0)
+
+    assert inside.size > 0
+    # One second of stem, so the straddling read returns only its last 0.1s.
+    assert 0 < clipped.size <= int(round(0.1 * STEM_RATE)) + 1
+    assert beyond.size == 0
+
+
 # ---------------------------------------------------------------------------
 # build_voice_profiles: reference selection
 # ---------------------------------------------------------------------------
