@@ -576,6 +576,15 @@ DEFAULT_TIMING_MIN_LINE_GAP = 0.12
 #: Set it true to trade a clipped word for a guaranteed gap between lines.
 DEFAULT_TIMING_TRIM_TO_FIT = False
 
+#: Whether a line that is *shorter* than its window may be slowed to fill it.
+#:
+#: **Off by default.** Filling a long window by dragging the delivery is what makes a
+#: dub sound wrong, and on a plan run it is not an edge case: authored windows are
+#: routinely longer than the Amharic needs, so 380 of 571 lines were held at the 0.8
+#: floor and the whole episode played 25% slow. A line that finishes early should be
+#: followed by silence, which is what the picture already has.
+DEFAULT_TIMING_ALLOW_SLOWDOWN = False
+
 #: Level of the dubbed dialogue in the final mix, in dB relative to the clips the
 #: TTS stage produced. Never a boost by default: the dialogue was generated at a
 #: consistent level, so raising it here would only invite clipping.
@@ -1017,6 +1026,9 @@ class Settings:
     timing_max_overlap_seconds: float = DEFAULT_TIMING_MAX_OVERLAP_SECONDS
     timing_min_line_gap: float = DEFAULT_TIMING_MIN_LINE_GAP
     timing_trim_to_fit: bool = DEFAULT_TIMING_TRIM_TO_FIT
+    #: Whether a line shorter than its window may be slowed down to fill it. Off by
+    #: default: silence after a short line is correct, a dragged delivery is not.
+    timing_allow_slowdown: bool = DEFAULT_TIMING_ALLOW_SLOWDOWN
     #: Mix settings for :mod:`app.pipeline.mixing`: the dialogue level and how far
     #: the music and effects are ducked under it.
     mix_dialogue_gain_db: float = DEFAULT_MIX_DIALOGUE_GAIN_DB
@@ -1257,6 +1269,9 @@ class Settings:
             timing_trim_to_fit=_read_bool(
                 "TIMING_TRIM_TO_FIT", DEFAULT_TIMING_TRIM_TO_FIT
             ),
+            timing_allow_slowdown=_read_bool(
+                "TIMING_ALLOW_SLOWDOWN", DEFAULT_TIMING_ALLOW_SLOWDOWN
+            ),
             mix_dialogue_gain_db=_read_signed_float(
                 "MIX_DIALOGUE_GAIN_DB", DEFAULT_MIX_DIALOGUE_GAIN_DB
             ),
@@ -1449,6 +1464,7 @@ class Settings:
             "timing_max_overlap_seconds": self.timing_max_overlap_seconds,
             "timing_min_line_gap": self.timing_min_line_gap,
             "timing_trim_to_fit": self.timing_trim_to_fit,
+            "timing_allow_slowdown": self.timing_allow_slowdown,
             "mix_dialogue_gain_db": self.mix_dialogue_gain_db,
             "mix_duck_db": self.mix_duck_db,
         }
@@ -1528,6 +1544,7 @@ __all__ = [
     "DEFAULT_TIMING_MAX_TEMPO",
     "DEFAULT_TIMING_MIN_LINE_GAP",
     "DEFAULT_TIMING_TRIM_TO_FIT",
+    "DEFAULT_TIMING_ALLOW_SLOWDOWN",
     "DEFAULT_TIMING_MIN_TEMPO",
     "DEFAULT_VOICE_PROFILE_DIR",
     "DEFAULT_VOICE_REFERENCE_MAX_DURATION",

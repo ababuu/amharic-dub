@@ -72,6 +72,12 @@ TEMPO_SEAM_LIMIT = 0.20
 ATEMPO_MIN = 0.5
 ATEMPO_MAX = 2.0
 
+#: How far past its own window a line may reach into the following silence, in
+#: seconds. The gap to the next line is not room: an interpolated line can be a
+#: minute away from its neighbours, and a fitter told it has a minute will compute a
+#: tempo of 0.02 and report the line as short while the dub drifts.
+MAX_ROOM_GROWTH_SECONDS = 3.0
+
 #: Length of the fade applied to the tail of a line that has to be cut short, in
 #: seconds. Long enough that the cut is inaudible, short enough not to lose a syllable.
 TRIM_FADE_SECONDS = 0.025
@@ -531,7 +537,17 @@ def align_clip(
     target = window if speech <= window else max(window, min(limit, speech))
     required = speech / target
     within_tolerance = abs(speech - window) <= EXACT_FIT_TOLERANCE_SECONDS
-    tempo = 1.0 if within_tolerance else _clamp(required, minimum, maximum)
+    # A line that is already shorter than the window it replaces is *finished*, not
+    # unfinished: filling the rest of the window by slowing the delivery down is what
+    # makes a dub drag, and it was doing exactly that on plan runs, where an authored
+    # window is often far longer than the Amharic needs (380 of 571 lines were being
+    # held at the 0.8 floor). Slowing is only ever a way to make a line that is too
+    # long fit, which is the `required > 1` case below.
+    already_fits = (
+        speech <= window + EXACT_FIT_TOLERANCE_SECONDS
+        and not resolved.timing_allow_slowdown
+    )
+    tempo = 1.0 if (within_tolerance or already_fits) else _clamp(required, minimum, maximum)
 
     stretched, rate = _stretched_speech(
         clip,
@@ -577,6 +593,13 @@ def align_clip(
     if within_tolerance:
         # Close enough that a filter would only add its own rounding.
         notes.append("already within the fit tolerance; no stretching applied")
+    elif already_fits and trimmed == 0.0:
+        # Left at its natural pace on purpose: the window is longer than the line, and
+        # silence after it is the correct result, not a slower delivery.
+        notes.append(
+            f"the line is {abs(residual):.3f}s shorter than its window and is left at "
+            "its natural pace; the silence after it stays silent"
+        )
     elif abs(residual) > EXACT_FIT_TOLERANCE_SECONDS and trimmed == 0.0:
         # Judged on the audio that was actually produced, not on the arithmetic that
         # asked for it, so a clamp is only reported when it really shows.
@@ -757,6 +780,19 @@ def align_dialogue(
         rooms[position] = (
             None if deadline is None else deadline - clip.dialogue.start - clip.rendered_pause_after
         )
+
+    # A gap to the next line is not room. When a line's neighbours are far away - which
+    # happens for every line the transcript did not recognize and that was placed by
+    # interpolation - the raw gap claims minutes of room, the fitter then computes a
+    # tempo of 0.02 against it, and reports the line as "short of its window" while
+    # everything downstream drifts. A window may borrow the silence after it, but only
+    # a bounded amount of it.
+    for position, room in rooms.items():
+        if room is None:
+            continue
+        ceiling = ordered[position].dialogue.duration + MAX_ROOM_GROWTH_SECONDS
+        if room > ceiling:
+            rooms[position] = ceiling
 
     aligned: dict[int, AlignedClip] = {}
     for position, clip in enumerate(ordered):

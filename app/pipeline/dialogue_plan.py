@@ -649,6 +649,14 @@ def _best_offset(
 #: lines are re-timed from the transcript instead of being voiced at the wrong times.
 MIN_AUTHORED_FIT = 0.60
 
+#: Share of plan lines that must be *found* in the transcript before the transcript's
+#: timings are trusted over the plan's. Below this there are too few anchors to
+#: interpolate between: on a real episode 70 of 571 lines matched, 501 were then
+#: invented, and every later stage - casting, windows, tempo - inherited the error.
+#: A plan nobody could match to the audio is a plan whose own times are the better
+#: evidence, so it is used as written and the problem is reported instead.
+MIN_RETIME_MATCH_FRACTION = 0.50
+
 
 def _authored_fit(
     cues: Sequence[PlanCue],
@@ -674,6 +682,15 @@ def _authored_fit(
                 matched += 1
                 break
     return matched / len(cues)
+
+
+def _inside_audio(cues: Sequence[PlanCue], audio_duration: float | None) -> tuple[PlanCue, ...]:
+    """Return the cues that fall inside ``audio_duration``, in order."""
+
+    if audio_duration is None:
+        return tuple(cues)
+    limit = audio_duration + 0.25
+    return tuple(cue for cue in cues if cue.start < limit and cue.end <= limit)
 
 
 def scope_plan(
@@ -721,12 +738,36 @@ def scope_plan(
                 method="no plan line could be placed in this audio",
                 dropped_unmatched=unmatched,
             )
-        detail = f"{len(cues) - placed_between} matched to the transcript"
+        matched = len(cues) - placed_between
+        if matched < MIN_RETIME_MATCH_FRACTION * len(plan.cues):
+            # Too few anchors to interpolate from. Voicing 501 invented timings is
+            # what put the previous episode 3 minutes out of step, so the plan's own
+            # times are kept - they are the only evidence left - and the caller is told
+            # the match failed rather than being handed a silent approximation.
+            offset, votes = _best_offset(plan, transcript)
+            shifted = [cue.shifted(offset) for cue in plan.cues]
+            kept = _inside_audio(shifted, audio_duration)
+            detail = (
+                f"only {matched} of {len(plan.cues)} line(s) were found in the "
+                "transcript, which is too few to re-time from; the plan's own "
+                "timings are used"
+            )
+            if offset:
+                detail += f", shifted {offset:+.2f}s by {votes} matched line(s)"
+            detail += ". Check that the plan belongs to this video"
+            return PlanScope(
+                cues=kept,
+                offset=offset,
+                matched=votes,
+                dropped_outside=max(0, len(shifted) - len(kept)),
+                method=detail,
+            )
+        detail = f"{matched} matched to the transcript"
         if placed_between:
             detail += f", {placed_between} placed between their neighbours"
         return PlanScope(
             cues=cues,
-            matched=len(cues) - placed_between,
+            matched=matched,
             interpolated=placed_between,
             dropped_unmatched=unmatched,
             dropped_outside=max(0, dropped_outside),
@@ -797,11 +838,25 @@ def scope_plan(
 BANK_SPEAKER_PREFIX = "CAST_"
 
 
+#: Prefix for a character the plan names but the diarization could not tie to one
+#: measured voice. Their own authored windows are still the best evidence available,
+#: so the reference is cut from those under this stable id rather than immediately
+#: borrowing a bank voice.
+FILM_SPEAKER_PREFIX = "FILM_"
+
+
 def bank_speaker_id(character: str) -> str:
     """Return the synthetic speaker id used for a bank-cast character."""
 
     slug = re.sub(r"[^A-Za-z0-9]+", "_", character).strip("_").upper()
     return f"{BANK_SPEAKER_PREFIX}{slug or 'CHARACTER'}"
+
+
+def film_speaker_id(character: str) -> str:
+    """Return the stable id for a character voiced from their own plan windows."""
+
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", character).strip("_").upper()
+    return f"{FILM_SPEAKER_PREFIX}{slug or 'CHARACTER'}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -888,6 +943,46 @@ def _presentation(value: object) -> str:
 
 def _overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
     return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def assign_film_identities(casting: PlanCasting) -> PlanCasting:
+    """Give every unmapped character an identity cut from their own plan windows.
+
+    The plan states who speaks and when, so a character the diarization could not tie
+    to one measured voice is still measurable directly: their own lines are where they
+    spoke. Cutting the reference from those windows is the actor's voice - the thing a
+    dub is supposed to preserve - while dropping straight to a bank voice makes the
+    character somebody else entirely.
+
+    The reference is only cut if it is clean; :mod:`app.pipeline.voice_profiles`
+    decides that and reports what it refused, and only then does the bank apply.
+    """
+
+    if not casting.unassigned:
+        return casting
+    resolved: list[CharacterCast] = []
+    for cast in casting.casts:
+        if cast.speaker_id is not None:
+            resolved.append(cast)
+            continue
+        resolved.append(
+            CharacterCast(
+                character=cast.character,
+                speaker_id=film_speaker_id(cast.character),
+                gender=cast.gender,
+                speaker_gender=cast.speaker_gender,
+                share=cast.share,
+                seconds=cast.seconds,
+                runner_up=cast.runner_up,
+                reason=(
+                    f"{cast.reason}; the reference is cut from this character's own "
+                    "authored lines, and the voice bank is used only if they supply no "
+                    "clean window"
+                ),
+                source="film",
+            )
+        )
+    return PlanCasting(casts=tuple(resolved), skipped=casting.skipped)
 
 
 def assign_bank_voices(casting: PlanCasting) -> PlanCasting:
@@ -1273,10 +1368,12 @@ __all__ = [
     "PlanReport",
     "PlanScope",
     "assign_bank_voices",
+    "assign_film_identities",
     "bank_speaker_id",
     "cast_plan",
     "discover_plan",
     "dropped_cues",
+    "film_speaker_id",
     "load_plan",
     "parse_time",
     "plan_dialogue",

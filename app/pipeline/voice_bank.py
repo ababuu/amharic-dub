@@ -657,9 +657,25 @@ def _choose_voice(
             key=lambda voice: (_pitch_distance(voice, request), voice.voice_id),
         )
 
-    # No unused voice of this gender left: widen to the rest of the bank before
-    # reusing a voice, and only reuse when the bank is smaller than the cast.
-    pool = unused or [voice for voice in bank if voice.gender == request.gender] or list(bank)
+    # No unused voice of this gender is left. A right-register voice that is already
+    # in use beats an unused voice in the wrong register: the audience hears a woman's
+    # voice coming out of a man long before it notices two minor characters sharing
+    # one, and the run used to do the opposite and then warn that the register was
+    # wrong. Novelty is the thing to give up here, not register.
+    same_gender = [voice for voice in bank if voice.gender == request.gender]
+    if same_gender:
+        return min(
+            same_gender,
+            key=lambda voice: (
+                usage.get(voice.voice_id, 0),
+                _pitch_distance(voice, request),
+                voice.voice_id,
+            ),
+        )
+
+    # The bank has nothing in this register at all: widen to the rest of it rather
+    # than leave the character silent, and reuse the least-used voice.
+    pool = unused or list(bank)
     return min(
         pool,
         key=lambda voice: (

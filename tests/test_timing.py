@@ -246,13 +246,35 @@ def test_line_is_stretched_to_its_window(tmp_path: Path, ffmpeg: FakeFfmpeg) -> 
     assert aligned.original_window == pytest.approx(0.8)
 
 
-def test_slow_down_is_also_pitch_preserving(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
-    aligned = align_dialogue([_clip(tmp_path, start=2.0, end=3.25)], settings=_settings(tmp_path))[0]
+def test_slow_down_is_available_but_opt_in(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
+    """Slowing a line to fill a long window is a deliberate choice, not the default.
+
+    An authored window is routinely longer than the Amharic needs; dragging the
+    delivery to fill it made a whole episode play 25% slow.
+    """
+
+    aligned = align_dialogue(
+        [_clip(tmp_path, start=2.0, end=3.25)],
+        settings=_settings(tmp_path, timing_allow_slowdown=True),
+    )[0]
 
     assert ffmpeg.filters == ["atempo=0.800000"]
     assert aligned.tempo < 1.0
     assert aligned.speech_duration == pytest.approx(1.25, abs=0.01)
     assert aligned.fits
+
+
+def test_a_line_shorter_than_its_window_is_left_at_its_natural_pace(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """Default: the silence after a short line stays silent."""
+
+    aligned = align_dialogue([_clip(tmp_path, start=2.0, end=3.25)], settings=_settings(tmp_path))[0]
+
+    assert ffmpeg.filters == []
+    assert aligned.tempo == pytest.approx(1.0)
+    assert aligned.speech_duration == pytest.approx(1.0, abs=0.01)
+    assert any("natural pace" in note for note in aligned.notes)
 
 
 def test_a_line_that_already_fits_is_left_alone(
@@ -651,9 +673,27 @@ def test_a_line_may_use_the_silence_after_it(tmp_path: Path) -> None:
     )
 
     first = aligned[0]
-    assert first.available is not None and first.available > 2.0
+    # The silence after a line is room, but only up to a bounded amount of it: a gap
+    # to a distant neighbour is not an invitation to stretch the line out.
+    assert first.available is not None
+    assert 0.8 < first.available <= 0.8 + timing.MAX_ROOM_GROWTH_SECONDS
     assert first.tempo == pytest.approx(1.0, abs=0.01)
     assert first.trimmed == 0.0
+
+
+def test_a_gap_to_a_distant_neighbour_does_not_become_room(tmp_path: Path) -> None:
+    """The failure this bounds: ``available: 140.4s`` for a 2.35s line."""
+
+    clips = _pair(tmp_path, first_speech=1.0, first_window=0.8, gap=140.0)
+
+    aligned = align_dialogue(
+        clips, output_dir=tmp_path / "w", settings=_settings(tmp_path)
+    )
+
+    first = aligned[0]
+    assert first.available == pytest.approx(
+        0.8 + timing.MAX_ROOM_GROWTH_SECONDS, abs=0.01
+    )
 
 
 def test_a_line_still_too_long_is_cut_only_when_that_is_asked_for(

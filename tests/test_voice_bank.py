@@ -300,7 +300,13 @@ def test_casting_is_deterministic(tmp_path) -> None:
     assert first["SPEAKER_00"].voice_id == "am-m-a"
 
 
-def test_no_voice_is_reused_while_an_unused_one_remains(tmp_path) -> None:
+def test_register_beats_novelty_when_the_bank_runs_out(tmp_path) -> None:
+    """A reused right-register voice is better than an unused wrong-register one.
+
+    Two characters sharing a voice is a small cost; a man sounding like a woman is
+    not. The run used to prefer novelty and then warn that the register was wrong.
+    """
+
     bank = VoiceBank(
         directory=tmp_path,
         voices=(
@@ -315,10 +321,26 @@ def test_no_voice_is_reused_while_an_unused_one_remains(tmp_path) -> None:
         ],
         bank,
     )
-    # The second masculine character takes the unused female voice rather than
-    # sharing the first character's voice: two characters must not sound alike.
+
     assert casting["SPEAKER_00"].voice_id == "am-m-one"
-    assert casting["SPEAKER_01"].voice_id == "am-f-one"
+    # The only other voice is feminine, so the masculine voice is shared instead of
+    # handing a man's part a woman's voice.
+    assert casting["SPEAKER_01"].voice_id == "am-m-one"
+    assert casting["SPEAKER_01"].gender == "male"
+
+
+def test_the_only_voice_left_is_used_rather_than_leaving_a_character_silent(
+    tmp_path,
+) -> None:
+    bank = VoiceBank(
+        directory=tmp_path,
+        voices=(_bank_voice("am-f-one", gender="female", pitch=210.0, root=tmp_path),),
+    )
+    casting = assign_bank_voices(
+        [VoiceRequest("SPEAKER_00", "masculine", 120.0)], bank
+    )
+
+    assert casting["SPEAKER_00"].voice_id == "am-f-one"
 
 
 def test_a_bank_smaller_than_the_cast_reuses_voices(tmp_path) -> None:

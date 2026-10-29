@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
 import time
 import traceback
@@ -379,6 +380,7 @@ class PipelineResult:
             "timing": {
                 "lines": len(self.alignment),
                 "unfitted": len(self.unfitted_lines),
+                "health": timing_health(self.alignment),
                 "segments": [line.to_dict() for line in self.alignment],
             },
             "mixing": self.mix.to_dict(),
@@ -597,6 +599,71 @@ def _report_dialogue_fit(
             "        - the Amharic is longer than the film's dialogue time; the timing "
             "stage will use the silence between lines first, then speed lines up to "
             f"{settings.timing_max_tempo:g}x, and only then cut a line short"
+        )
+
+
+def timing_health(alignment: Sequence[AlignedClip]) -> dict[str, Any]:
+    """Return the delivery measurements a run has to be judgeable by.
+
+    A dub can be wrong in ways no stage fails on: every line slowed to the tempo
+    floor, lines placed where nobody speaks, two thirds of the timeline silent. Those
+    are arithmetic on the aligned clips, so they are computed here, printed once, and
+    stored in the manifest - the previous episode played 25% slow and 380 of 571 lines
+    were dragged to the floor without any of it being stated.
+    """
+
+    if not alignment:
+        return {"lines": 0}
+    tempos = [line.tempo for line in alignment]
+    slowed = [line for line in alignment if line.tempo < 1.0 - 1e-9]
+    sped = [line for line in alignment if line.tempo > 1.0 + 1e-9]
+    speech = sum(line.speech_duration for line in alignment)
+    first = min(line.start for line in alignment)
+    last = max(line.start + line.speech_duration for line in alignment)
+    span = max(1e-9, last - first)
+    return {
+        "lines": len(alignment),
+        "slowed": len(slowed),
+        "sped_up": len(sped),
+        "at_natural_pace": len(alignment) - len(slowed) - len(sped),
+        "median_tempo": round(statistics.median(tempos), 4),
+        "slowest_tempo": round(min(tempos), 4),
+        "fastest_tempo": round(max(tempos), 4),
+        "speech_seconds": round(speech, 2),
+        "span_seconds": round(span, 2),
+        # The share of the timeline that actually carries dialogue. A dub sitting far
+        # below the film's own occupancy is silence where somebody was talking.
+        "occupancy": round(speech / span, 4),
+        "unfitted": sum(1 for line in alignment if not line.fits),
+        "worst_overrun": round(max((line.overrun for line in alignment), default=0.0), 3),
+    }
+
+
+def _report_timing_health(alignment: Sequence[AlignedClip], report: Any) -> None:
+    """Print the delivery measurements in one line, naming anything alarming."""
+
+    health = timing_health(alignment)
+    if not health.get("lines"):
+        return
+    report(
+        f"  delivery: {health['at_natural_pace']}/{health['lines']} line(s) at natural "
+        f"pace, {health['sped_up']} sped up, {health['slowed']} slowed; "
+        f"tempo median {health['median_tempo']:.2f} "
+        f"[{health['slowest_tempo']:.2f}, {health['fastest_tempo']:.2f}]; "
+        f"speech occupies {health['occupancy'] * 100:.0f}% of "
+        f"{health['span_seconds']:.0f}s"
+    )
+    if health["slowed"] > health["lines"] // 4:
+        report(
+            "        WARNING most lines are slower than the actor performed them; a "
+            "dub dragged to fill long windows sounds wrong even when it fits. Check "
+            "TIMING_ALLOW_SLOWDOWN and whether the plan's windows are the video's."
+        )
+    if health["occupancy"] < 0.5 and health["span_seconds"] > 300:
+        report(
+            "        WARNING under half the timeline carries dialogue, so the dub is "
+            "mostly silence where the film had speech - the plan's timings are the "
+            "first thing to check"
         )
 
 
@@ -1206,11 +1273,17 @@ def run_pipeline(
         )
         if plan_casting.skipped:
             report(f"  casting: {plan_casting.skipped}")
-        if plan_casting.unassigned and bank is not None:
+        if plan_casting.unassigned:
             # The plan has lines for these characters, so they are voiced from the
-            # native-Amharic bank - matched by the gender the plan states - rather
-            # than being dropped from the dub.
-            plan_casting = dialogue_plan.assign_bank_voices(plan_casting)
+            # film: their own authored windows are where they spoke, and a reference
+            # cut from those is the actor's voice. The bank is only reached when
+            # voice_profiles reports that a character supplied no clean window at all.
+            missed = len(plan_casting.unassigned)
+            plan_casting = dialogue_plan.assign_film_identities(plan_casting)
+            report(
+                f"  casting: {missed} character(s) could not be tied to one measured "
+                "voice; their own plan windows supply the reference instead"
+            )
         for cast in plan_casting.casts:
             if cast.speaker_id is None:
                 report(f"  casting: {cast.character}: unassigned ({cast.reason})")
@@ -1605,6 +1678,7 @@ def run_pipeline(
             settings=resolved,
         )
     )
+    _report_timing_health(alignment, report)
 
     # Measured, because the one way the source language can survive into a finished
     # dub is the separator leaving it in the music or effects, which are re-mixed
