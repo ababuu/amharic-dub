@@ -8,6 +8,8 @@ three-path contract without mixing the instrumental twice.
 from __future__ import annotations
 
 import gc
+import inspect
+import json
 import logging
 import math
 import time
@@ -19,13 +21,29 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 
-from app.config import Settings, get_settings
+from app.config import (
+    DEFAULT_SEPARATION_BACKEND,
+    DEFAULT_SEPARATION_DEMUCS_MODEL,
+    SEPARATION_BACKENDS,
+    Settings,
+    get_settings,
+)
 
 logger = logging.getLogger(__name__)
 
 MODEL_FILENAME = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 REQUIRED_SAMPLE_RATE = 48_000
 STEM_NAMES: tuple[str, ...] = ("speech", "music", "effects")
+
+#: How many short windows are compared between the source and the stems to prove the
+#: split kept its energy. A separator that silently returns near-silence - a model that
+#: is unstable in half precision, or a checkpoint that loaded wrong - would otherwise
+#: reach the mixer as a bed with the music missing.
+ENERGY_PROBE_WINDOWS = 5
+ENERGY_PROBE_SECONDS = 10.0
+
+#: Below this share of the source's energy, the two stems together have lost audio.
+MIN_ENERGY_SHARE = 0.5
 
 
 class SeparationError(RuntimeError):
@@ -222,7 +240,27 @@ def _write_silence(path: Path, info: Any) -> None:
         raise InvalidAudioError(f"could not write silent effects stem {path}: {exc}") from exc
 
 
-def _run_audio_separator(
+def _accepted_kwargs(factory: Any, desired: dict[str, Any]) -> dict[str, Any]:
+    """Return only the ``desired`` options that ``factory`` actually declares.
+
+    audio-separator's constructor gains and loses options between minor releases, and
+    passing one it does not know is a TypeError that would end the run. Filtering by
+    the installed signature keeps the adapter working across the pinned range.
+    """
+
+    try:
+        parameters = inspect.signature(factory).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins and C callables
+        return {}
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return dict(desired)
+    return {name: value for name, value in desired.items() if name in parameters}
+
+
+def _run_roformer(
     source: Path,
     destination: Path,
     settings: Settings,
@@ -246,17 +284,28 @@ def _run_audio_separator(
     try:
         if on_progress is not None:
             on_progress("  separation CUDA available; loading BS-Roformer model")
-        separator = Separator(
-            model_file_dir=str(cache_dir),
-            output_dir=str(destination),
-            output_format="WAV",
-            sample_rate=REQUIRED_SAMPLE_RATE,
-            use_soundfile=True,
+        options = {
+            "model_file_dir": str(cache_dir),
+            "output_dir": str(destination),
+            "output_format": "WAV",
+            "sample_rate": REQUIRED_SAMPLE_RATE,
+            "use_soundfile": True,
             # Keep file-level chunking disabled: the BS-Roformer MDXC implementation
             # already uses overlapping model segments, while the wrapper's optional
             # file chunker rejoins chunks with simple concatenation.
-            chunk_duration=None,
-        )
+            "chunk_duration": None,
+            # Half precision halves the memory traffic through this network. It is
+            # off unless asked for: a model unstable in fp16 returns a hollow stem
+            # rather than an error, which is a quality fault, not a crash.
+            "use_autocast": bool(settings.separation_autocast),
+        }
+        accepted = _accepted_kwargs(Separator.__init__, options)
+        if settings.separation_autocast and "use_autocast" not in accepted:
+            logger.info(
+                "The installed audio-separator does not accept use_autocast; "
+                "SEPARATION_AUTOCAST is ignored"
+            )
+        separator = Separator(**accepted)
         device = _configure_cuda_device(torch, separator, settings.device)
         device_name = torch.cuda.get_device_name(device)
         logger.info(
@@ -322,26 +371,7 @@ def _run_audio_separator(
                 + ", ".join(missing)
                 + f"; returned paths: {returned_paths}"
             )
-        for name, output in (("speech/vocals", speech), ("music/instrumental", music)):
-            if output.stat().st_size == 0:
-                raise InvalidAudioError(
-                    f"audio-separator produced a zero-byte {name} file: {output}"
-                )
-            try:
-                output_info = sf.info(str(output))
-            except (OSError, RuntimeError) as exc:
-                raise InvalidAudioError(
-                    f"could not read audio-separator {name} output {output}: {exc}"
-                ) from exc
-            if output_info.frames <= 0 or output_info.channels <= 0:
-                raise InvalidAudioError(
-                    f"audio-separator produced an empty {name} output"
-                )
-            if output_info.samplerate != REQUIRED_SAMPLE_RATE:
-                raise InvalidAudioError(
-                    f"audio-separator {name} output is {output_info.samplerate} Hz, "
-                    f"expected {REQUIRED_SAMPLE_RATE} Hz"
-                )
+        _check_stem_audio("audio-separator", speech, music)
         return speech, music
     except SeparationError:
         raise
@@ -356,49 +386,381 @@ def _run_audio_separator(
             logger.warning("Could not empty the CUDA cache after separation: %s", exc)
 
 
+def _check_stem_audio(backend: str, speech: Path, music: Path) -> None:
+    """Reject a stem that is empty, unreadable, or at the wrong rate."""
+
+    for name, output in (("speech/vocals", speech), ("music/instrumental", music)):
+        if output.stat().st_size == 0:
+            raise InvalidAudioError(
+                f"{backend} produced a zero-byte {name} file: {output}"
+            )
+        try:
+            output_info = sf.info(str(output))
+        except (OSError, RuntimeError) as exc:
+            raise InvalidAudioError(
+                f"could not read {backend} {name} output {output}: {exc}"
+            ) from exc
+        if output_info.frames <= 0 or output_info.channels <= 0:
+            raise InvalidAudioError(f"{backend} produced an empty {name} output")
+        if output_info.samplerate != REQUIRED_SAMPLE_RATE:
+            raise InvalidAudioError(
+                f"{backend} {name} output is {output_info.samplerate} Hz, "
+                f"expected {REQUIRED_SAMPLE_RATE} Hz"
+            )
+
+
+def _mean_power(path: Path, spans: Sequence[tuple[float, float]]) -> float:
+    """Return the mean power of ``path`` over the given ``(start, end)`` seconds."""
+
+    total = 0.0
+    count = 0
+    with sf.SoundFile(str(path)) as handle:
+        rate = handle.samplerate
+        for start, end in spans:
+            first = max(0, min(handle.frames, int(round(start * rate))))
+            last = max(first, min(handle.frames, int(round(end * rate))))
+            if last <= first:
+                continue
+            handle.seek(first)
+            block = np.asarray(
+                handle.read(last - first, dtype="float32", always_2d=True),
+                dtype=np.float64,
+            )
+            if not np.all(np.isfinite(block)):
+                raise InvalidAudioError(f"the separated stem {path} contains NaN/inf")
+            total += float(np.mean(np.square(block)))
+            count += 1
+    return total / count if count else 0.0
+
+
+def _probe_stem_energy(source: Path, speech: Path, music: Path) -> None:
+    """Prove the two stems together still carry the film's audio.
+
+    A separator can return a quiet, hollow or silent stem instead of failing - a model
+    unstable in half precision, or a checkpoint that loaded wrong. Nothing downstream
+    would notice: the mixer would simply produce a dub with the music missing, and the
+    bleed check would pass because the original dialogue really is absent. A handful of
+    windows is enough to catch it and costs seconds.
+    """
+
+    try:
+        info = sf.info(str(source))
+    except (OSError, RuntimeError):  # pragma: no cover - checked before separation
+        return
+    if info.frames <= 0:
+        return
+    duration = info.frames / info.samplerate
+    window = min(ENERGY_PROBE_SECONDS, duration)
+    if window <= 0:
+        return
+    # Spread the probes across the film rather than clustering at the start, so a
+    # separator that only got the first minute right is still caught.
+    step = duration / (ENERGY_PROBE_WINDOWS + 1)
+    spans = [
+        (start, min(duration, start + window))
+        for start in (step * (index + 1) for index in range(ENERGY_PROBE_WINDOWS))
+    ]
+
+    source_power = _mean_power(source, spans)
+    if source_power <= 0.0:
+        return
+    stem_power = _mean_power(speech, spans) + _mean_power(music, spans)
+    share = stem_power / source_power
+    if share < MIN_ENERGY_SHARE:
+        raise InvalidAudioError(
+            "the separated stems carry only "
+            f"{share * 100:.0f}% of the original audio's energy; the split lost most "
+            "of the signal. Turn SEPARATION_AUTOCAST off if it is on, or switch "
+            "SEPARATION_BACKEND, and delete the stems to separate again."
+        )
+    logger.info("Separation energy check: stems carry %.0f%% of the source", share * 100)
+
+
+def _run_demucs(
+    source: Path,
+    destination: Path,
+    settings: Settings,
+    *,
+    on_progress: Callable[[str], None] | None,
+) -> tuple[Path, Path]:
+    """Separate with htdemucs, writing the dialogue and the combined bed at 48 kHz.
+
+    demucs is the lighter of the two model families: a four-stem model whose vocal
+    stem is a little less clean than BS-Roformer's, at a fraction of the compute. The
+    bed is the sum of the other three stems, which is what the mixer replaces the
+    original dialogue with.
+
+    ``demucs.pretrained.get_model`` + ``demucs.apply.apply_model`` are used rather
+    than ``demucs.api``: the latter only exists in demucs 4.1 and later, and
+    ``pip install demucs`` still resolves to 4.0.1.
+    """
+
+    torch = _require_cuda()
+    try:
+        from demucs.apply import apply_model
+        from demucs.pretrained import get_model
+        from torchaudio.functional import resample
+    except ImportError as exc:
+        raise SeparationInferenceError(
+            "the demucs backend needs the demucs package, which is not installed "
+            f"({exc}). Install it on the worker (pip install demucs) or use "
+            "SEPARATION_BACKEND=roformer"
+        ) from exc
+
+    model_name = settings.separation_demucs_model or DEFAULT_SEPARATION_DEMUCS_MODEL
+    if on_progress is not None:
+        on_progress(f"  separation CUDA available; loading demucs {model_name}")
+
+    speech_path = destination / f"{source.stem}_speech.wav"
+    music_path = destination / f"{source.stem}_music.wav"
+    model: Any | None = None
+    try:
+        device = _demucs_device(torch, settings.device)
+        try:
+            model = get_model(name=model_name)
+        except Exception as exc:
+            raise SeparationInferenceError(
+                f"could not load the demucs model {model_name!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        model.to(device)
+        model.eval()
+        rate = int(getattr(model, "samplerate", 44_100))
+        if on_progress is not None:
+            on_progress(
+                f"  separation inference started on {device} "
+                f"(demucs {model_name} at {rate} Hz)"
+            )
+
+        mix = _demucs_input(
+            source, channels=int(getattr(model, "audio_channels", 2))
+        )
+        if rate != REQUIRED_SAMPLE_RATE:
+            mix = _to_numpy(resample(torch.as_tensor(mix), REQUIRED_SAMPLE_RATE, rate))
+        # demucs normalises the mixture by its own mono reference and undoes it
+        # afterwards; skipping that yields quietly clipped stems.
+        reference = mix.mean(axis=0)
+        deviation = float(reference.std()) or 1.0
+        normalised = (mix - float(reference.mean())) / deviation
+
+        separated = apply_model(
+            model,
+            torch.as_tensor(normalised)[None],
+            device=device,
+            progress=False,
+            num_workers=0,
+        )
+        separated = _to_numpy(separated)[0] * deviation
+        separated = separated + float(reference.mean())
+
+        names = list(getattr(model, "sources", []))
+        if "vocals" not in names:
+            raise MissingStemError(
+                f"the demucs model {model_name!r} has no vocals stem; it returns "
+                f"{names or 'no stems'}"
+            )
+        vocals = separated[names.index("vocals")]
+        bed = None
+        for index, name in enumerate(names):
+            if name == "vocals":
+                continue
+            bed = separated[index] if bed is None else bed + separated[index]
+        if bed is None:
+            raise MissingStemError("the demucs model returned no non-vocal stems")
+
+        _write_track(speech_path, _to_48k(torch, resample, vocals, rate))
+        _write_track(music_path, _to_48k(torch, resample, bed, rate))
+        _check_stem_audio("demucs", speech_path, music_path)
+        return speech_path, music_path
+    except SeparationError:
+        raise
+    except Exception as exc:
+        raise SeparationInferenceError(f"demucs inference failed: {exc}") from exc
+    finally:
+        model = None
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except RuntimeError as exc:
+            logger.warning("Could not empty the CUDA cache after separation: %s", exc)
+
+
+def _demucs_input(source: Path, *, channels: int) -> np.ndarray:
+    """Read ``source`` as the ``(channels, samples)`` float32 array demucs expects."""
+
+    try:
+        audio, _rate = sf.read(str(source), dtype="float32", always_2d=True)
+    except (OSError, RuntimeError) as exc:
+        raise InvalidAudioError(f"could not read {source} for demucs: {exc}") from exc
+    mix = np.ascontiguousarray(audio.T, dtype=np.float32)
+    if mix.shape[0] > channels:
+        mix = mix.mean(axis=0, keepdims=True)
+    if mix.shape[0] < channels:
+        mix = np.repeat(mix[:1], channels, axis=0)
+    return mix
+
+
+def _to_48k(torch: Any, resample: Any, track: Any, rate: int) -> Any:
+    """Return ``track`` at the pipeline's 48 kHz."""
+
+    if rate == REQUIRED_SAMPLE_RATE:
+        return track
+    return resample(torch.as_tensor(track), rate, REQUIRED_SAMPLE_RATE)
+
+
+def _demucs_device(torch: Any, requested: str) -> str:
+    """Return the CUDA device string demucs should use, refusing a silent fallback."""
+
+    if not str(requested).lower().startswith("cuda"):
+        raise SeparationInferenceError(
+            f"DEVICE={requested!r} does not select CUDA; separation refuses to fall "
+            "back to the CPU on a paid worker"
+        )
+    if not torch.cuda.is_available():
+        raise SeparationInferenceError(
+            "CUDA is not available, so separation cannot run on the GPU"
+        )
+    index = 0
+    if ":" in str(requested):
+        index = int(str(requested).split(":", 1)[1])
+    if index >= torch.cuda.device_count():
+        raise SeparationInferenceError(
+            f"DEVICE={requested} selects GPU {index}, but this machine has "
+            f"{torch.cuda.device_count()}"
+        )
+    return f"cuda:{index}"
+
+
+def _to_numpy(value: Any) -> np.ndarray:
+    """Return ``value`` as a numpy array, from a tensor on any device."""
+
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value, dtype=np.float32)
+
+
+def _write_track(path: Path, track: Any) -> None:
+    """Write a ``(channels, samples)`` torch tensor as a 48 kHz WAV file."""
+
+    array = _to_numpy(track)
+    if array.ndim == 1:
+        array = array[np.newaxis, :]
+    try:
+        sf.write(
+            str(path),
+            np.ascontiguousarray(array.T, dtype=np.float32),
+            REQUIRED_SAMPLE_RATE,
+            subtype="FLOAT",
+        )
+    except (OSError, RuntimeError) as exc:
+        raise InvalidAudioError(f"could not write the separated stem {path}: {exc}") from exc
+
+
+def _separate_into(
+    source: Path,
+    destination: Path,
+    settings: Settings,
+    *,
+    on_progress: Callable[[str], None] | None,
+) -> tuple[Path, Path]:
+    """Run the configured separator and return ``(speech, music)``."""
+
+    backend = (settings.separation_backend or DEFAULT_SEPARATION_BACKEND).strip().lower()
+    if backend == "demucs":
+        return _run_demucs(source, destination, settings, on_progress=on_progress)
+    if backend != "roformer":
+        raise SeparationInferenceError(
+            f"unknown SEPARATION_BACKEND {backend!r}; expected one of "
+            + ", ".join(SEPARATION_BACKENDS)
+        )
+    return _run_roformer(source, destination, settings, on_progress=on_progress)
+
+
+def _stem_record(source: Path, destination: Path) -> Path:
+    """Path of the sidecar naming the backend that produced a run's stems."""
+
+    return destination / f"{source.stem}_stems.json"
+
+
+def _remember_stems(source: Path, destination: Path, backend: str) -> None:
+    """Record which separator produced these stems, so a switch is not ignored."""
+
+    record = _stem_record(source, destination)
+    try:
+        record.write_text(
+            json.dumps({"backend": backend, "source": source.name}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:  # not worth failing a finished separation over
+        logger.warning("Could not record the stem backend in %s: %s", record, exc)
+
+
+def _stems_were_made_by(source: Path, destination: Path, backend: str) -> bool:
+    """``True`` when the stored stems came from ``backend``.
+
+    A missing record means the stems predate this file. Those are RoFormer's, since
+    that was the only backend, so they are accepted for RoFormer only.
+    """
+
+    record = _stem_record(source, destination)
+    try:
+        stored = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return backend == DEFAULT_SEPARATION_BACKEND
+    if not isinstance(stored, dict):
+        return backend == DEFAULT_SEPARATION_BACKEND
+    return str(stored.get("backend", "")).strip().lower() == backend
+
+
 def _reusable_stems(
     source: Path,
     destination: Path,
     info: Any,
     *,
+    settings: Settings,
     on_progress: Callable[[str], None] | None,
 ) -> StemPaths | None:
     """Return the stems already sitting beside ``source``, or ``None`` to separate.
 
     Separation is deterministic and costs about 1.3x real time, so re-running it for
     the same audio is pure waste - and a run that dies in a later stage would pay it
-    again. Stems are reused only when both exist, were written after the source, and
-    describe the same audio; anything else means separating for real.
+    again. The stems are compared with the source by length and rate rather than by
+    timestamp: the pipeline re-extracts the audio on every run, so the source is
+    always newer than the stems it was separated into, and a timestamp rule would
+    never fire. A stem of a different length is a different film, so it is redone.
     """
 
+    backend = (settings.separation_backend or DEFAULT_SEPARATION_BACKEND).strip().lower()
     speech = destination / f"{source.stem}_speech.wav"
     music = destination / f"{source.stem}_music.wav"
     effects = destination / f"{source.stem}_effects.wav"
-    try:
-        source_mtime = source.stat().st_mtime
-    except OSError:
+    if not _stems_were_made_by(source, destination, backend):
         return None
     for path in (speech, music):
         try:
-            stat = path.stat()
-            if stat.st_size == 0 or stat.st_mtime < source_mtime:
+            if path.stat().st_size == 0:
                 return None
             stem_info = sf.info(str(path))
         except (OSError, RuntimeError):
             return None
         if stem_info.samplerate != info.samplerate:
             return None
-        # One second of slack: a writer may pad or trim the tail, but a stem of a
-        # different length is a different film.
-        if abs(stem_info.frames - info.frames) > info.samplerate:
+        # A writer may land a few milliseconds short; anything beyond that is a
+        # different cut of the audio. Erring towards separating again is the safe
+        # direction - a wrong bed is audible, a repeated hour is only slow.
+        if abs(stem_info.frames - info.frames) > int(round(0.05 * info.samplerate)):
             return None
 
     if not effects.is_file() or effects.stat().st_size == 0:
         _write_silence(effects, info)
     if on_progress is not None:
         on_progress(
-            f"  separation reused the stems already in {destination} "
-            "(delete them to separate again)"
+            f"  separation reused the {backend} stems already in {destination} "
+            "(delete them, or change SEPARATION_BACKEND, to separate again)"
         )
     return StemPaths(speech=speech, music=music, effects=effects)
 
@@ -438,14 +800,18 @@ def separate_stems(
             f"{info.channels} channel(s))"
         )
 
-    reused = _reusable_stems(source, destination, info, on_progress=on_progress)
+    reused = _reusable_stems(
+        source, destination, info, settings=resolved, on_progress=on_progress
+    )
     if reused is not None:
         return reused
 
     started = time.perf_counter()
-    speech, music = _run_audio_separator(
+    speech, music = _separate_into(
         source, destination, resolved, on_progress=on_progress
     )
+    _probe_stem_energy(source, speech, music)
+    _remember_stems(source, destination, resolved.separation_backend)
     effects = destination / f"{source.stem}_effects.wav"
     _write_silence(effects, info)
     if on_progress is not None:

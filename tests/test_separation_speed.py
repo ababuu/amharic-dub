@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import dataclasses
 import gc
+import json
 import sys
 import types
 import weakref
@@ -143,14 +144,16 @@ def fake_separator(
     return cuda, tmp_path
 
 
-def _settings(root: Path) -> Settings:
-    return Settings(
-        input_dir=root,
-        work_dir=root / "work",
-        output_dir=root / "out",
-        model_cache_dir=root / "models",
-        device="cuda",
-    )
+def _settings(root: Path, **overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "input_dir": root,
+        "work_dir": root / "work",
+        "output_dir": root / "out",
+        "model_cache_dir": root / "models",
+        "device": "cuda",
+    }
+    values.update(overrides)
+    return Settings(**values)  # type: ignore[arg-type]
 
 
 def _write_audio(path: Path, sample_rate: int = REQUIRED_SAMPLE_RATE) -> Path:
@@ -226,12 +229,57 @@ def test_stems_already_beside_the_source_are_reused_instead_of_separated_again(
     assert FakeSeparator.instances == []
 
 
-def test_a_stem_older_than_the_source_is_separated_again(
+def test_stems_from_a_different_backend_are_not_reused(
     fake_separator: tuple[FakeCuda, Path],
 ) -> None:
-    """A stem that predates the audio may belong to a different cut of the film."""
+    """Switching SEPARATION_BACKEND must take effect, not silently reuse old stems."""
 
-    import os
+    _, root = fake_separator
+    source = _write_audio(root / "clip.wav")
+    out = root / "out"
+    separate_stems(source, out, settings=_settings(root))
+
+    record = json.loads((out / "clip_stems.json").read_text(encoding="utf-8"))
+    info = sf.info(str(source))
+    demucs = separation._reusable_stems(
+        source,
+        out,
+        info,
+        settings=_settings(root, separation_backend="demucs"),
+        on_progress=None,
+    )
+
+    assert record["backend"] == "roformer"
+    assert demucs is None
+
+
+def test_stems_without_a_record_are_reused_by_the_default_backend(
+    fake_separator: tuple[FakeCuda, Path],
+) -> None:
+    """Stems made before the record existed are RoFormer's, so they are still reusable."""
+
+    _, root = fake_separator
+    source = _write_audio(root / "clip.wav")
+    out = root / "out"
+    first = separate_stems(source, out, settings=_settings(root))
+    (out / "clip_stems.json").unlink()
+
+    second = separation._reusable_stems(
+        source,
+        out,
+        sf.info(str(source)),
+        settings=_settings(root, separation_backend="roformer"),
+        on_progress=None,
+    )
+
+    assert second is not None
+    assert second.speech == first.speech
+
+
+def test_a_stem_of_the_wrong_length_is_separated_again(
+    fake_separator: tuple[FakeCuda, Path],
+) -> None:
+    """A stem whose length does not match the audio belongs to a different cut."""
 
     _, root = fake_separator
     source = _write_audio(root / "clip.wav")
@@ -239,9 +287,13 @@ def test_a_stem_older_than_the_source_is_separated_again(
     separate_stems(source, out, settings=_settings(root))
     FakeSeparator.instances.clear()
 
-    # The source is replaced by a newer file of the same length.
-    later = source.stat().st_mtime + 60
-    os.utime(source, (later, later))
+    # Same name, half the audio: the stored stems no longer describe it.
+    sf.write(
+        source,
+        np.zeros((REQUIRED_SAMPLE_RATE // 2, 2), dtype=np.float32),
+        REQUIRED_SAMPLE_RATE,
+        subtype="FLOAT",
+    )
     separate_stems(source, out, settings=_settings(root))
 
     assert FakeSeparator.instances != []

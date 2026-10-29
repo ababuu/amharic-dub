@@ -153,6 +153,24 @@ DEFAULT_CROSSTALK_SEPARATION = False
 #: the registers the pipeline already measured.
 DEFAULT_CROSSTALK_SEPARATION_BACKEND = "pyannote"
 
+#: Which model family separates the film into dialogue and a music/effects bed.
+#:
+#: ``roformer`` is BS-RoFormer, the most accurate of the two and the default; it costs
+#: roughly 1.3x real time on a small workstation GPU, so an hour and a quarter for a
+#: feature-length episode. ``demucs`` is htdemucs, a lighter four-stem model: usually
+#: faster, somewhat less clean at pulling a voice out of a music bed.
+DEFAULT_SEPARATION_BACKEND = "roformer"
+SEPARATION_BACKENDS = ("roformer", "demucs")
+
+#: htdemucs checkpoint used by the ``demucs`` backend.
+DEFAULT_SEPARATION_DEMUCS_MODEL = "htdemucs"
+
+#: Whether the separator runs its forward passes in half precision. Halves the memory
+#: traffic and is typically 1.5-2x faster, but a model that is unstable in fp16 returns
+#: a quiet or hollow stem instead of failing, so it stays off until it has been
+#: measured on the hardware in use.
+DEFAULT_SEPARATION_AUTOCAST = False
+
 #: Gated PixIT checkpoint for the ``pyannote`` backend. The token's account must have
 #: accepted the model's conditions on Hugging Face.
 DEFAULT_CROSSTALK_SEPARATION_MODEL = "pyannote/speech-separation-ami-1.0"
@@ -892,6 +910,12 @@ class Settings:
     crosstalk_separation_context_seconds: float = (
         DEFAULT_CROSSTALK_SEPARATION_CONTEXT_SECONDS
     )
+    #: How the film is split into dialogue and a music/effects bed. See
+    #: :mod:`app.pipeline.separation`. ``roformer`` is the accurate default;
+    #: ``demucs`` is the lighter alternative.
+    separation_backend: str = DEFAULT_SEPARATION_BACKEND
+    separation_demucs_model: str = DEFAULT_SEPARATION_DEMUCS_MODEL
+    separation_autocast: bool = DEFAULT_SEPARATION_AUTOCAST
     #: Round-trip every delivered clip through an Amharic ASR model and report the
     #: character error rate against the text that was synthesized. Off by default
     #: because it loads a second model and transcribes every clip.
@@ -1048,6 +1072,17 @@ class Settings:
             crosstalk_separation_context_seconds=_read_float(
                 "CROSSTALK_SEPARATION_CONTEXT_SECONDS",
                 DEFAULT_CROSSTALK_SEPARATION_CONTEXT_SECONDS,
+            ),
+            separation_backend=(
+                _read_env("SEPARATION_BACKEND", DEFAULT_SEPARATION_BACKEND)
+                or DEFAULT_SEPARATION_BACKEND
+            ).strip().lower(),
+            separation_demucs_model=(
+                _read_env("SEPARATION_DEMUCS_MODEL", DEFAULT_SEPARATION_DEMUCS_MODEL)
+                or DEFAULT_SEPARATION_DEMUCS_MODEL
+            ),
+            separation_autocast=_read_bool(
+                "SEPARATION_AUTOCAST", DEFAULT_SEPARATION_AUTOCAST
             ),
             transcription_language=(
                 (_read_env("TRANSCRIPTION_LANGUAGE") or "").lower() or None
@@ -1336,6 +1371,9 @@ class Settings:
             "crosstalk_separation_context_seconds": (
                 self.crosstalk_separation_context_seconds
             ),
+            "separation_backend": self.separation_backend,
+            "separation_demucs_model": self.separation_demucs_model,
+            "separation_autocast": self.separation_autocast,
             "transcription_language": self.transcription_language,
             "translation_backend": self.translation_backend,
             "translation_provider": self.translation_provider,
