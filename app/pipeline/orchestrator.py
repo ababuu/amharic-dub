@@ -62,6 +62,7 @@ from app.pipeline import (
     diarization,
     evaluation,
     mixing,
+    plan_align,
     qc,
     register,
     script_reconciliation,
@@ -465,6 +466,15 @@ def _audio_seconds(path: str | Path) -> float | None:
     return float(info.duration) if info.frames else None
 
 
+def _keep_inside(cues: Sequence[Any], audio_duration: float | None) -> tuple[Any, ...]:
+    """Return the cues that fall inside ``audio_duration``, in order."""
+
+    if audio_duration is None:
+        return tuple(cues)
+    limit = audio_duration + 0.25
+    return tuple(cue for cue in cues if cue.start < limit and cue.end <= limit)
+
+
 def _plan_profile_turns(
     scope: dialogue_plan.PlanScope, casting: dialogue_plan.PlanCasting
 ) -> list[SpeakerSegment]:
@@ -789,6 +799,7 @@ def run_pipeline(
     plan_keep_timing: bool = False,
     progress: Callable[[str], None] | None = None,
     cache_stems_on_drive: bool = True,
+    from_plan: bool = False,
 ) -> PipelineResult:
     """Run every implemented stage on ``source`` and return what they produced.
 
@@ -814,6 +825,11 @@ def run_pipeline(
         Keep the plan's own timings instead of taking each line's timing from the
         transcribed speech. Only useful when the plan was timed against this exact
         video; otherwise the video is the source of truth for when a line is spoken.
+    from_plan:
+        Dub from the plan alone. Diarization and transcription are skipped and the
+        plan is aligned against the dialogue stem's energy envelope instead, so the
+        plan is the only source of truth for the lines, the speakers and their timing,
+        and each character's reference is cut from their own authored windows.
     progress:
         Callable receiving one line per stage. Defaults to printing.
 
@@ -875,118 +891,11 @@ def run_pipeline(
         cache_on_drive=cache_stems_on_drive,
     )
 
-    diarized = _stage(
-        "diarization",
-        seconds,
-        report,
-        diarization.diarize_detailed,
-        stems.speech,
-        settings=resolved,
-    )
-    turns = tuple(diarized.turns)
-    if not turns:
-        raise EmptyStageError(
-            f"diarization found no speech in {stems.speech}; nothing downstream can run"
-        )
-    crosstalk = tuple(diarized.crosstalk)
-    speaker_corrections = tuple(diarized.corrections)
-    if speaker_corrections:
-        report(
-            f"  speaker verification: corrected {len(speaker_corrections)} "
-            "high-confidence turn attribution(s)"
-        )
-    if diarized.verified:
-        # Said out loud because it changes what a later stage may do: these labels
-        # were compared with the model's own speaker embeddings, so no pitch
-        # measurement is allowed to overturn them.
-        report(
-            f"  speaker verification: {len(diarized.verified)} turn(s) settled by "
-            "the speaker embeddings"
-        )
-    if crosstalk:
-        report(
-            f"  crosstalk: {len(crosstalk)} region(s), "
-            f"{diarized.crosstalk_seconds:.2f}s of simultaneous speech"
-        )
-
-    # Which voice belongs to which cluster, measured before any text exists. Needs the
-    # stem and nothing else, so it is available to the transcription stage - which must
-    # check that a recovered crosstalk line actually sounds like the character it is
-    # about to be credited to. Never fatal: without it the structural checks still run.
-    speaker_registers: dict[str, float] = {}
-    try:
-        speaker_registers = register.measure_registers(turns, stems.speech)
-    except register.RegisterError as exc:
-        report(
-            f"  register: unmeasured before transcription ({exc}); crosstalk "
-            "recovery will rely on timing alone"
-        )
-    else:
-        if speaker_registers:
-            report(
-                "  registers: "
-                + ", ".join(
-                    f"{speaker_id} {median:.0f} Hz"
-                    for speaker_id, median in sorted(speaker_registers.items())
-                )
-            )
-
-    transcription_result = _stage(
-        "transcription",
-        seconds,
-        report,
-        transcription.transcribe_detailed,
-        stems.speech,
-        turns,
-        settings=resolved,
-        # Simultaneous speech is re-listened to for the speaker the exclusive
-        # turn list had to drop: without this, a two-character argument is
-        # transcribed as one character talking and the dub follows it.
-        crosstalk=crosstalk,
-        overlap_turns=diarized.overlap_turns,
-        # Which voice is which, measured from the diarized turns before any text
-        # exists. A crosstalk can only be heard by decoding a mixture, and the
-        # decode returns whichever voice dominates it - so a recovered line has to
-        # be checked against the register of the character it is about to be given
-        # to, or the other character ends up saying it in the wrong voice.
-        registers=speaker_registers,
-        # Target-speaker extraction prints what it did (or why it could not run)
-        # through the same reporter as every other stage.
-        report=report,
-    )
-    lines = tuple(transcription_result.lines)
-    separation_report = transcription_result.separation
-    if not lines:
-        raise EmptyStageError("transcription produced no lines; nothing to adapt")
-    if crosstalk:
-        # Two voices in the film and one in the transcript is the defect that makes a
-        # dub sound like a monologue, so what matters is not how many lines touch a
-        # crosstalk region but how many *characters* it now has.
-        doubled = sum(
-            1
-            for region in crosstalk
-            if len(
-                {
-                    line.speaker_id
-                    for line in lines
-                    if line.start < region.end and line.end > region.start
-                }
-            )
-            >= 2
-        )
-        report(
-            f"  simultaneous speech: {doubled}/{len(crosstalk)} crosstalk region(s) "
-            "now carry lines for both characters (the exclusive view keeps one "
-            "speaker per instant, so the other is recovered from the overlap-aware "
-            "diarization)"
-        )
-
-    # An authored plan already contains the sentences, their speakers and the
-    # Amharic, so it replaces the sentence and translation stages outright. What it
-    # cannot contain is which measured voice each character has: that is a property
-    # of the audio and is cast from the diarization below.
+    # The plan is read *before* diarization, because it decides whether diarization
+    # runs at all. An authored plan already states who speaks and when, so a plan run
+    # can align itself against the dialogue stem in seconds - no diarization model, no
+    # transcription model - and skip both stages entirely.
     plan: dialogue_plan.DialoguePlan | None = None
-    plan_scope = dialogue_plan.PlanScope()
     joined = (
         Path(plan_file)
         if plan_file is not None
@@ -999,34 +908,179 @@ def run_pipeline(
             report(f"  plan: ignored {joined.name} ({exc})")
             plan = None
         else:
-            plan_scope = dialogue_plan.scope_plan(
-                plan,
-                transcript=lines,
-                audio_duration=_audio_seconds(stems.speech),
-                retime=not plan_keep_timing,
+            report(f"  plan: {joined.name}: {len(plan)} authored line(s)")
+
+    plan_only = plan is not None and from_plan
+    alignment: plan_align.PlanAlignment | None = None
+    plan_scope = dialogue_plan.PlanScope()
+    if plan_only:
+        # Measured from the stem itself: the plan is a speech mask, so shifting it
+        # against the stem's energy envelope answers "is this plan on this audio's
+        # clock" for the cost of one FFT - no diarization model, no transcription.
+        audio_seconds = _audio_seconds(stems.speech)
+        try:
+            aligned_cues, alignment = plan_align.align_plan(
+                plan.cues,
+                stems.speech,
+                max_offset_seconds=resolved.plan_align_max_offset_seconds,
+            )
+        except (plan_align.PlanAlignError, dialogue_plan.PlanError) as exc:
+            report(f"  plan: could not align it to the audio ({exc})")
+            aligned_cues, alignment = plan.cues, None
+        kept = _keep_inside(aligned_cues, audio_seconds)
+        plan_scope = dialogue_plan.PlanScope(
+            cues=kept,
+            offset=0.0 if alignment is None else alignment.offset,
+            matched=0,
+            dropped_outside=max(0, len(aligned_cues) - len(kept)),
+            method=(
+                "as authored, aligned against the dialogue stem"
+                if alignment is None
+                else alignment.reason
+            ),
+        )
+        report(
+            f"  plan: {len(plan_scope)} of {len(plan)} line(s) fall inside this "
+            f"audio ({plan_scope.method})"
+        )
+        if alignment is not None and alignment.placed < 0.5:
+            report(
+                "  plan alignment: WARNING under half of the plan lands on speech in "
+                "this stem; the plan's timings or the video are wrong"
+            )
+
+    if plan_only:
+        diarized = diarization.DiarizationResult(turns=())
+        turns: tuple[SpeakerSegment, ...] = ()
+        crosstalk: tuple[Any, ...] = ()
+        speaker_corrections: tuple[Any, ...] = ()
+        transcription_result = None
+        lines: tuple[TranscriptSegment, ...] = ()
+        separation_report = None
+        speaker_registers: dict[str, float] = {}
+        report("  diarization: skipped (the plan states who speaks and when)")
+        report("  transcription: skipped (the plan carries the dialogue)")
+        seconds["diarization"] = 0.0
+        seconds["transcription"] = 0.0
+        attribution = None
+    else:
+        diarized = _stage(
+            "diarization",
+            seconds,
+            report,
+            diarization.diarize_detailed,
+            stems.speech,
+            settings=resolved,
+        )
+        turns = tuple(diarized.turns)
+        if not turns:
+            raise EmptyStageError(
+                f"diarization found no speech in {stems.speech}; nothing downstream "
+                "can run. Pass --from-plan to dub from the plan without diarizing"
+            )
+        crosstalk = tuple(diarized.crosstalk)
+        speaker_corrections = tuple(diarized.corrections)
+        if speaker_corrections:
+            report(
+                f"  speaker verification: corrected {len(speaker_corrections)} "
+                "high-confidence turn attribution(s)"
+            )
+        if diarized.verified:
+            # Said out loud because it changes what a later stage may do: these labels
+            # were compared with the model's own speaker embeddings, so no pitch
+            # measurement is allowed to overturn them.
+            report(
+                f"  speaker verification: {len(diarized.verified)} turn(s) settled by "
+                "the speaker embeddings"
+            )
+        if crosstalk:
+            report(
+                f"  crosstalk: {len(crosstalk)} region(s), "
+                f"{diarized.crosstalk_seconds:.2f}s of simultaneous speech"
+            )
+
+        # Which voice belongs to which cluster, measured before any text exists.
+        speaker_registers = {}
+        try:
+            speaker_registers = register.measure_registers(turns, stems.speech)
+        except register.RegisterError as exc:
+            report(
+                f"  register: unmeasured before transcription ({exc}); crosstalk "
+                "recovery will rely on timing alone"
+            )
+        else:
+            if speaker_registers:
+                report(
+                    "  registers: "
+                    + ", ".join(
+                        f"{speaker_id} {median:.0f} Hz"
+                        for speaker_id, median in sorted(speaker_registers.items())
+                    )
+                )
+
+        transcription_result = _stage(
+            "transcription",
+            seconds,
+            report,
+            transcription.transcribe_detailed,
+            stems.speech,
+            turns,
+            settings=resolved,
+            crosstalk=crosstalk,
+            overlap_turns=diarized.overlap_turns,
+            registers=speaker_registers,
+            report=report,
+        )
+        lines = tuple(transcription_result.lines)
+        separation_report = transcription_result.separation
+        if not lines:
+            raise EmptyStageError("transcription produced no lines; nothing to adapt")
+        if crosstalk:
+            doubled = sum(
+                1
+                for region in crosstalk
+                if len(
+                    {
+                        line.speaker_id
+                        for line in lines
+                        if line.start < region.end and line.end > region.start
+                    }
+                )
+                >= 2
             )
             report(
-                f"  plan: {joined.name}: {len(plan)} authored line(s), "
-                f"{len(plan_scope)} in this audio ({plan_scope.method})"
+                f"  simultaneous speech: {doubled}/{len(crosstalk)} crosstalk region(s) "
+                "now carry lines for both characters (the exclusive view keeps one "
+                "speaker per instant, so the other is recovered from the overlap-aware "
+                "diarization)"
             )
-            if plan_scope.dropped_outside:
-                report(
-                    f"  plan: {plan_scope.dropped_outside} line(s) fall outside this "
-                    "audio and belong to another part of the episode"
-                )
-            if plan_scope.dropped_unmatched:
-                report(
-                    f"  plan: {plan_scope.dropped_unmatched} line(s) have no matching "
-                    "speech in this audio"
-                )
-            if not plan_scope.cues:
-                report("  plan: nothing in it applies to this audio; ignoring it")
-                plan = None
-    if plan is not None and plan_scope.interpolated:
-        report(
-            f"  plan: {plan_scope.interpolated} line(s) the transcript did not "
-            "recognise were placed between their neighbours"
+
+    if plan is not None and not plan_only:
+        # The normal path: the plan is scoped against the transcript the run already
+        # has, which is what decides whether the plan's own clock can be trusted.
+        plan_scope = dialogue_plan.scope_plan(
+            plan,
+            transcript=lines,
+            audio_duration=_audio_seconds(stems.speech),
+            retime=not plan_keep_timing,
         )
+        report(
+            f"  plan: {len(plan_scope)} of {len(plan)} line(s) in this audio "
+            f"({plan_scope.method})"
+        )
+        if plan_scope.dropped_outside:
+            report(
+                f"  plan: {plan_scope.dropped_outside} line(s) fall outside this "
+                "audio and belong to another part of the episode"
+            )
+        if plan_scope.interpolated:
+            report(
+                f"  plan: {plan_scope.interpolated} line(s) the transcript did not "
+                "recognise were placed between their neighbours"
+            )
+        if not plan_scope.cues:
+            report("  plan: nothing in it applies to this audio; ignoring it")
+            plan = None
 
     # With a plan the run owes a model nothing: the Amharic is already written and
     # every character's name is already stated. Research stays available for its
@@ -1261,16 +1315,19 @@ def run_pipeline(
     plan_casting: dialogue_plan.PlanCasting | None = None
     bible: dialogue_context.CharacterBible | None = None
     if plan is not None:
-        plan_casting = dialogue_plan.cast_plan(
-            plan,
-            plan_scope.cues,
-            turns=turns,
-            registers=(
-                attribution.after if attribution is not None else speaker_registers
-            ),
-            crosstalk=crosstalk,
-            verified=diarized.verified,
-        )
+        if plan_only:
+            plan_casting = dialogue_plan.cast_from_plan(plan, plan_scope.cues)
+        else:
+            plan_casting = dialogue_plan.cast_plan(
+                plan,
+                plan_scope.cues,
+                turns=turns,
+                registers=(
+                    attribution.after if attribution is not None else speaker_registers
+                ),
+                crosstalk=crosstalk,
+                verified=diarized.verified,
+            )
         if plan_casting.skipped:
             report(f"  casting: {plan_casting.skipped}")
         if plan_casting.unassigned:
@@ -1771,9 +1828,15 @@ def run_pipeline(
         elapsed_seconds=time.perf_counter() - started,
         synthesized_lines=len(clips),
         separation=separation_report,
-        separated_lines=transcription_result.separated_lines,
-        legacy_separated_lines=transcription_result.legacy_lines,
-        refused_recoveries=transcription_result.refused_recoveries,
+        separated_lines=(
+            0 if transcription_result is None else transcription_result.separated_lines
+        ),
+        legacy_separated_lines=(
+            0 if transcription_result is None else transcription_result.legacy_lines
+        ),
+        refused_recoveries=(
+            () if transcription_result is None else transcription_result.refused_recoveries
+        ),
         character_guide=guide,
         episode_script=script,
         script_reconciliation=script_review,
@@ -2182,6 +2245,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--from-plan",
+        action="store_true",
+        help=(
+            "dub from the plan alone: diarization and transcription are skipped, and "
+            "the plan is aligned against the dialogue stem's energy instead. The plan "
+            "is then the source of truth for the lines, the speakers, the English and "
+            "the Amharic, and each character's reference is cut from their own "
+            "authored windows. Saves the two most expensive text stages and removes "
+            "the failure mode where a misaligned transcript poisons the casting. "
+            "Needs a plan; ignored without one."
+        ),
+    )
+    parser.add_argument(
         "--cast-from-bank",
         nargs="?",
         const="",
@@ -2235,6 +2311,7 @@ def main(argv: list[str] | None = None) -> int:
             plan_file=args.plan,
             plan_keep_timing=args.plan_keep_timing,
             cache_stems_on_drive=not args.no_stem_cache,
+            from_plan=args.from_plan,
         )
     except OrchestrationError as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)

@@ -628,6 +628,64 @@ def test_every_stage_runs_once_in_order(
     assert stages.order == list(STAGE_ORDER)
 
 
+def test_from_plan_skips_diarization_and_transcription(
+    tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The plan states who speaks and when, so both text-model stages are redundant.
+
+    They are also where the last episode failed: a transcript that could not recognise
+    the plan's lines produced invented timings and a casting that handed the lead
+    character a bank voice. Skipping them removes ~21 minutes and that failure mode.
+    """
+
+    monkeypatch.setattr(
+        orchestrator.diarization,
+        "diarize_detailed",
+        lambda *a, **k: pytest.fail("diarization ran with --from-plan"),
+    )
+    monkeypatch.setattr(
+        orchestrator.transcription,
+        "transcribe_detailed",
+        lambda *a, **k: pytest.fail("transcription ran with --from-plan"),
+    )
+    plan_path = tmp_path / "movie.plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "characters": [{"name": "Walter", "gender": "masculine"}],
+                "dialogue": [
+                    {
+                        "speaker": "Walter",
+                        "start": 1.0,
+                        "end": 3.0,
+                        "source_text": "Say my name.",
+                        "amharic": "ስሜ ጥራኝ።",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_pipeline(
+        _source(tmp_path),
+        settings=_settings(tmp_path),
+        plan_file=plan_path,
+        from_plan=True,
+    )
+
+    assert "diarization" not in stages.order
+    assert "transcription" not in stages.order
+    assert stages.order[0] == "extract"
+    assert result.final_video is not None
+    # The character is still voiced, and from the film rather than from a bank.
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    (cast,) = manifest["run"]["plan"]["casting"]["cast"]
+    assert cast["character"] == "Walter"
+    assert cast["speaker_id"] == "FILM_WALTER"
+    assert cast["source"] == "film"
+
+
 def test_each_stage_receives_the_previous_stage_output(
     tmp_path: Path, stages: Stages
 ) -> None:

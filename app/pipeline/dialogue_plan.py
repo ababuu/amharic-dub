@@ -221,6 +221,24 @@ class PlanCue:
             "amharic": self.amharic,
         }
 
+    def moved_to(self, start: float, end: float) -> "PlanCue":
+        """Return this cue with a new span, keeping everything the plan supplied."""
+
+        return PlanCue(
+            index=self.index,
+            cue=self.cue,
+            speaker=self.speaker,
+            start=max(0.0, start),
+            end=max(0.0, end),
+            source_text=self.source_text,
+            amharic=self.amharic,
+            emotion=self.emotion,
+            intensity=self.intensity,
+            delivery=self.delivery,
+            pause_before=self.pause_before,
+            pause_after=self.pause_after,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class DialoguePlan:
@@ -700,6 +718,7 @@ def scope_plan(
     audio_duration: float | None = None,
     retime: bool = True,
     min_match_fraction: float = MIN_MATCH_FRACTION,
+    offset: float | None = None,
 ) -> PlanScope:
     """Put the plan onto this audio file's timeline and drop what is not in it.
 
@@ -715,7 +734,29 @@ def scope_plan(
     * ``retime=False`` uses the authored timings as written. It is the escape hatch
       for a plan whose timing was already measured against this exact video, and the
       measured whole-plan shift is still applied when one is clearly present.
+    * ``offset`` overrides the shift that is worked out from the transcript. It is how
+      a plan aligned against the dialogue stem - no transcript needed, see
+      :mod:`app.pipeline.plan_align` - is handed in already placed.
     """
+
+    if not plan.cues:
+        return PlanScope(method="empty plan")
+
+    if offset is not None:
+        # Somebody has already measured where this plan sits on this audio. Trust it:
+        # the whole point of that measurement is that it needs no transcript, and
+        # re-deriving a shift from one would undo it.
+        shifted = [cue.shifted(offset) for cue in plan.cues]
+        kept = _inside_audio(shifted, audio_duration)
+        detail = "as authored" if not offset else f"shifted {offset:+.2f}s"
+        detail += ", measured against the dialogue stem"
+        return PlanScope(
+            cues=kept,
+            offset=offset,
+            matched=0,
+            dropped_outside=max(0, len(shifted) - len(kept)),
+            method=detail,
+        )
 
     if not plan.cues:
         return PlanScope(method="empty plan")
@@ -924,6 +965,43 @@ class PlanCasting:
             "mapping": self.mapping,
             "skipped": self.skipped,
         }
+
+
+def cast_from_plan(plan: DialoguePlan, cues: Sequence[PlanCue]) -> PlanCasting:
+    """Give every plan character a film identity, with no diarization involved.
+
+    A plan states who speaks each line, so the character *is* the identity: there is
+    nothing to match against a cluster. Their reference is then cut from their own
+    authored windows - which is the actor's voice, the thing a dub exists to keep -
+    and the voice bank is reached only if those windows hold no clean speech.
+    """
+
+    seconds: dict[str, float] = {}
+    for cue in cues:
+        seconds[cue.speaker] = seconds.get(cue.speaker, 0.0) + max(0.0, cue.duration)
+
+    casts: list[CharacterCast] = []
+    for character in plan.speakers:
+        gender = plan.gender_of(character)
+        spoken = seconds.get(character, 0.0)
+        casts.append(
+            CharacterCast(
+                character=character,
+                speaker_id=film_speaker_id(character),
+                gender=gender,
+                speaker_gender=gender,
+                share=1.0 if spoken > 0 else 0.0,
+                seconds=spoken,
+                runner_up=None,
+                reason=(
+                    "the plan states this character's lines, so their reference is cut "
+                    "from those windows; the voice bank is used only if they hold no "
+                    "clean speech"
+                ),
+                source="film",
+            )
+        )
+    return PlanCasting(casts=tuple(casts))
 
 
 def _presentation(value: object) -> str:
@@ -1370,6 +1448,7 @@ __all__ = [
     "assign_bank_voices",
     "assign_film_identities",
     "bank_speaker_id",
+    "cast_from_plan",
     "cast_plan",
     "discover_plan",
     "dropped_cues",

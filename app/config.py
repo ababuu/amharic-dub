@@ -585,6 +585,11 @@ DEFAULT_TIMING_TRIM_TO_FIT = False
 #: followed by silence, which is what the picture already has.
 DEFAULT_TIMING_ALLOW_SLOWDOWN = False
 
+#: How far an authored plan may be out of step with the audio before alignment gives
+#: up, in seconds. A plan written for this episode is at most a few seconds out; a plan
+#: for a different cut can be minutes out, and past this the shift stops being credible.
+DEFAULT_PLAN_ALIGN_MAX_OFFSET_SECONDS = 300.0
+
 #: Level of the dubbed dialogue in the final mix, in dB relative to the clips the
 #: TTS stage produced. Never a boost by default: the dialogue was generated at a
 #: consistent level, so raising it here would only invite clipping.
@@ -1029,6 +1034,8 @@ class Settings:
     #: Whether a line shorter than its window may be slowed down to fill it. Off by
     #: default: silence after a short line is correct, a dragged delivery is not.
     timing_allow_slowdown: bool = DEFAULT_TIMING_ALLOW_SLOWDOWN
+    #: How far a plan may be out of step with the audio before alignment gives up.
+    plan_align_max_offset_seconds: float = DEFAULT_PLAN_ALIGN_MAX_OFFSET_SECONDS
     #: Mix settings for :mod:`app.pipeline.mixing`: the dialogue level and how far
     #: the music and effects are ducked under it.
     mix_dialogue_gain_db: float = DEFAULT_MIX_DIALOGUE_GAIN_DB
@@ -1272,6 +1279,10 @@ class Settings:
             timing_allow_slowdown=_read_bool(
                 "TIMING_ALLOW_SLOWDOWN", DEFAULT_TIMING_ALLOW_SLOWDOWN
             ),
+            plan_align_max_offset_seconds=_read_float(
+                "PLAN_ALIGN_MAX_OFFSET_SECONDS",
+                DEFAULT_PLAN_ALIGN_MAX_OFFSET_SECONDS,
+            ),
             mix_dialogue_gain_db=_read_signed_float(
                 "MIX_DIALOGUE_GAIN_DB", DEFAULT_MIX_DIALOGUE_GAIN_DB
             ),
@@ -1465,6 +1476,7 @@ class Settings:
             "timing_min_line_gap": self.timing_min_line_gap,
             "timing_trim_to_fit": self.timing_trim_to_fit,
             "timing_allow_slowdown": self.timing_allow_slowdown,
+            "plan_align_max_offset_seconds": self.plan_align_max_offset_seconds,
             "mix_dialogue_gain_db": self.mix_dialogue_gain_db,
             "mix_duck_db": self.mix_duck_db,
         }
@@ -1545,6 +1557,7 @@ __all__ = [
     "DEFAULT_TIMING_MIN_LINE_GAP",
     "DEFAULT_TIMING_TRIM_TO_FIT",
     "DEFAULT_TIMING_ALLOW_SLOWDOWN",
+    "DEFAULT_PLAN_ALIGN_MAX_OFFSET_SECONDS",
     "DEFAULT_TIMING_MIN_TEMPO",
     "DEFAULT_VOICE_PROFILE_DIR",
     "DEFAULT_VOICE_REFERENCE_MAX_DURATION",
